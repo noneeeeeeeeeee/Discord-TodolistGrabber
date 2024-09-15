@@ -8,8 +8,8 @@ class NoticeBoard(commands.Cog):
     @commands.command()
     async def setNoticeBoard(self, ctx):
         embed = discord.Embed(
-            title="Help",
-            description="Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
+            title="Noticeboard Configuration",
+            description="Below are the current configurations for the noticeboard.",
             color=discord.Color.blue()
         )
         
