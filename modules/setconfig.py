@@ -6,7 +6,7 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
     os.makedirs(config_dir, exist_ok=True)
     
     config_data = {
-        "Default Admin": default_admin_role_id,
+        "DefaultAdmin": default_admin_role_id,
         "NoticeBoardChannelId": "Default",
         "NoticeBoardUpdateInterval": None,
 
@@ -39,5 +39,31 @@ def edit_noticeboard_config(noticeboard_channelid, noticeboard_updateinterval, g
     with open(config_file_path, 'w') as config_file:
         json.dump(config_data, config_file, indent=4)
 
+def check_guild_config_available(guild_id):
+    config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
+    config_file_path = os.path.join(config_dir, f"{guild_id}.json")
+    return os.path.exists(config_file_path)
 
+def check_admin_role(guild_id, user_roles):
+    config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
+    config_file_path = os.path.join(config_dir, f"{guild_id}.json")
+    
+    if not os.path.exists(config_file_path):
+        return False
+    
+    with open(config_file_path, 'r') as config_file:
+        config_data = json.load(config_file)
+        default_admin_role_id = config_data["DefaultAdmin"]
+        
+        # Check if any of the user's roles match the default admin role
+        return any(role_id == default_admin_role_id for role_id in user_roles)
+
+
+def json_get(guild_id):
+    config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
+    config_file_path = os.path.join(config_dir, f"{guild_id}.json")
+    
+    with open(config_file_path, 'r') as config_file:
+        return json.load(config_file)
+    
 

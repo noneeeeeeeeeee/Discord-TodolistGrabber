@@ -197,6 +197,10 @@ class Setup(commands.Cog):
 
             create_default_config(ctx.guild.id, admin_role.id, default_role.id, ping_role.id)
             await ctx.send("Setup complete! The bot is now ready to use.")
+
+            # Disable the cancel button after setup is complete
+            cancel_button.disabled = True
+            await message.edit(view=view)
         except asyncio.TimeoutError:
             await ctx.send("You took too long to respond. Please try the setup command again.")
             return
