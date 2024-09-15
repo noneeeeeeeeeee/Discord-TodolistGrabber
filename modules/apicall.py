@@ -1,7 +1,7 @@
 import requests
 import json
 import os
-from enviromentfilegenerator import check_and_load_env_file
+from .enviromentfilegenerator import check_and_load_env_file
 
 def fetch_api_data(week = None, status = False):
     check_and_load_env_file()
@@ -31,6 +31,4 @@ def fetch_api_data(week = None, status = False):
     else:
         return response.text
         
-
-print(fetch_api_data())
 

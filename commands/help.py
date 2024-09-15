@@ -1,26 +1,27 @@
 import discord
 from discord.ext import commands
-import time
+from modules.readversion import read_current_version
 
-class Ping(commands.Cog):
+class Help(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
     @commands.command()
     async def help(self, ctx):
         embed = discord.Embed(
-            title="Help",
-            description="Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
+            title="Help Menu",
+            description="Help menu.",
             color=discord.Color.blue()
         )
         
-        embed.add_field(name="Command 1", value="Description for command 1", inline=False)
-        embed.add_field(name="Command 2", value="Description for command 2", inline=False)
-        embed.add_field(name="Command 3", value="Description for command 3", inline=False)
-        
-        message = await ctx.send(embed=embed)
+        embed.add_field(name="Help", value="This Command", inline=False)
+        embed.add_field(name="Ping", value="Response time from the bot to discord", inline=False)
+        embed.add_field(name="Status", value="Check if the API is up", inline=False)
+        embed.add_field(name="NoticeBoard", value="Setup the notice board [channel] [pingrole]", inline=False)
+        embed.set_footer(text="Bot Version: " + read_current_version())
+        message = await ctx.reply(embed=embed)
         
         await message.edit(content=None, embed=embed)
 
 async def setup(bot):
-    await bot.add_cog(Ping(bot))
+    await bot.add_cog(Help(bot))

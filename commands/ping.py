@@ -9,7 +9,7 @@ class Ping(commands.Cog):
     @commands.command()
     async def ping(self, ctx):
         start_time = time.time()
-        message = await ctx.send("Pinging...")
+        message = await ctx.reply("Pinging...")
         end_time = time.time()
         
         latency = (end_time - start_time) * 1000  # Convert to milliseconds
