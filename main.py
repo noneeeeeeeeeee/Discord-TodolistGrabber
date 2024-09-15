@@ -15,9 +15,9 @@ class MyBot(commands.Bot):
         super().__init__(*args, **kwargs)
 
     async def setup_hook(self):
-        # Sync the slash commands with Discord
+        """Load cogs and sync commands."""
         await load_commands()
-        await self.tree.sync()
+        await self.tree.sync()  # Sync the slash commands with Discord
 
     def is_guild_setup(self, guild_id):
         """Check if the guild is already set up by checking for a config file."""

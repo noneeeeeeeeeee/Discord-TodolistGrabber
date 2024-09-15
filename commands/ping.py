@@ -1,13 +1,14 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import time
 
 class Ping(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command()
-    async def ping(self, ctx):
+    @commands.hybrid_command(name='ping', description='Check the bot\'s latency.')
+    async def ping(self, ctx: commands.Context):
         start_time = time.time()
         message = await ctx.reply("Pinging...")
         end_time = time.time()
