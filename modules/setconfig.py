@@ -12,6 +12,8 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
 
         "DefaultRoleId": default_role_id,
         "PingRoleId": default_ping_role_id,
+        "PingDailyTime": "15:00",
+        "Timezone": "GMT+7",
 
         "MusicEnabled": False,
         "MusicDJRole": "Default",
@@ -26,16 +28,25 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
         json.dump(config_data, config_file, indent=4)
 
 
-def edit_noticeboard_config(noticeboard_channelid, noticeboard_updateinterval, guild_id):
+def edit_noticeboard_config(guild_id, noticeboard_channelid=None, noticeboard_updateinterval=None, PingDailyTime = None):
     config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
-    os.makedirs(config_dir, exist_ok=True)
-    
-    config_data = {
-        "NoticeBoardChannelId": noticeboard_channelid,
-        "NoticeBoardUpdateInterval": noticeboard_updateinterval,
-    }
-    
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")
+    
+    if not os.path.exists(config_file_path):
+        raise FileNotFoundError(f"Config file for guild_id {guild_id} does not exist.")
+    
+    with open(config_file_path, 'r') as config_file:
+        config_data = json.load(config_file)
+    
+    if noticeboard_channelid is not None:
+        config_data["NoticeBoardChannelId"] = noticeboard_channelid
+    
+    if noticeboard_updateinterval is not None:
+        config_data["NoticeBoardUpdateInterval"] = noticeboard_updateinterval
+    
+    if PingDailyTime is not None:
+        config_data["PingDailyTime"] = PingDailyTime
+    
     with open(config_file_path, 'w') as config_file:
         json.dump(config_data, config_file, indent=4)
 
