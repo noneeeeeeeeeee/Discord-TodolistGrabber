@@ -53,7 +53,7 @@ class AskGemini(commands.Cog):
         except Exception as e:
             answer = f"An error occurred while contacting the Gemini API: {str(e)}"
 
-        if len(answer) > 6000:
+        if len(answer) > 4000:
             await initial_message.edit(content=f"# Gemini Response\n{answer}")
         else:
             embed = discord.Embed(
