@@ -156,9 +156,9 @@ class NoticeAutoUpdate(commands.Cog):
     
     def add_task_fields(self, embed, tasks):
         for idx, task in enumerate(tasks, start=1):
-            task_type = "Exam/Practicum/Project" if task["taskType"] == "1" else "Exercise/Homework"
+            # task_type = "Exam/Practicum/Project" if task["taskType"] == "1" else "Exercise/Homework"
             embed.add_field(
-                name=f"{task['subject']} [{task_type}] ({task['task']})",
+                name=f"{task['subject']} [{task['task']}] ",
                 value=f"{task['description']}",
                 inline=False
             )
@@ -172,8 +172,8 @@ class NoticeAutoUpdate(commands.Cog):
             formatted_date = self.format_discord_time(date)
             task_list = []
             for idx, task in enumerate(tasks, start=1):
-                task_type = "Exam/Practicum/Project" if task["taskType"] == "1" else "Exercise/Homework"
-                task_list.append(f"{idx}. {task['subject']} [{task_type}] ({task['task']}) - {task['description']}")
+            #    task_type = "Exam/Practicum/Project" if task["taskType"] == "1" else "Exercise/Homework"
+                 task_list.append(f"{idx}. {task['subject']} [{task['task']}] - {task['description']}")
             embed.add_field(name=formatted_date, value="\n".join(task_list), inline=False)
         embed.set_footer(text=f"Bot Version: {version}")
         return embed
@@ -193,8 +193,8 @@ class NoticeAutoUpdate(commands.Cog):
                 formatted_date = self.format_discord_time(date)
                 task_list = []
                 for idx, task in enumerate(tasks, start=1):
-                    task_type = "Exam/Practicum/Project" if task["taskType"] == "1" else "Exercise/Homework"
-                    task_list.append(f"{idx}. {task['subject']} [{task_type}] ({task['task']}) - {task['description']}")
+                    #task_type = "Exam/Practicum/Project" if task["taskType"] == "1" else "Exercise/Homework"
+                    task_list.append(f"{idx}. {task['subject']} [{task['task']}] - {task['description']}")
                 embed.add_field(name=formatted_date, value="\n".join(task_list), inline=False)
                 tasks_found = True
         if not tasks_found:
