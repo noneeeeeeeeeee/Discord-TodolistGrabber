@@ -64,16 +64,19 @@ class AskGemini(commands.Cog):
             # Handle exceptions during API request
             answer = f"An error occurred while contacting the Gemini API: {str(e)}"
 
-        # Build the response embed
-        embed = discord.Embed(
-            title="Gemini Response",
-            description=answer,
-            color=discord.Color.green() if 'error' not in answer.lower() else discord.Color.red()
-        )
-
-        user_data['count'] += 1
-        embed.set_footer(text=f"Requests remaining: {5 - user_data['count']}/5")
-        await initial_message.edit(content=None, embed=embed)
+        # Check if the response exceeds the embed size limit
+        if len(answer) > 6000:
+            await initial_message.edit(content=f"# Gemini Response\n{answer}")
+        else:
+            # Build the response embed
+            embed = discord.Embed(
+                title="Gemini Response",
+                description=answer,
+                color=discord.Color.green() if 'error' not in answer.lower() else discord.Color.red()
+            )
+            user_data['count'] += 1
+            embed.set_footer(text=f"Requests remaining: {5 - user_data['count']}/5")
+            await initial_message.edit(content=None, embed=embed)
 
     @commands.Cog.listener()
     async def on_ready(self):
