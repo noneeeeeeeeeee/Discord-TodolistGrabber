@@ -3,21 +3,21 @@ import discord
 import json
 from datetime import datetime, timedelta
 from modules.setconfig import json_get, check_guild_config_available
-from modules.cache import cache_data, cache_read 
+from modules.cache import cache_data, cache_read, cachecleanup
 from modules.readversion import read_current_version
 
 class NoticeAutoUpdate(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.sent_message_ids = {}
-        self.first_start = True  # Flag to check if it's the bot's first start
+        self.first_start = True
         self.update_noticeboard.start()
 
 
     def cog_unload(self):
         self.update_noticeboard.cancel()
 
-    @tasks.loop(seconds=5)
+    @tasks.loop(seconds=30)
     async def update_noticeboard(self):
         today = datetime.now()
         for guild in self.bot.guilds:
@@ -28,11 +28,13 @@ class NoticeAutoUpdate(commands.Cog):
             config = json_get(guild_id)
             noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
             ping_daily_time = config.get("PingDailyTime", "15:00")
-            noticeboard_update_interval = config.get("NoticeBoardUpdateInterval", 3600)  # Interval in seconds (default 1 hour)
+            noticeboard_update_interval = config.get("NoticeBoardUpdateInterval", 3600) 
             timezone = config.get("Timezone", "UTC+7")
 
+            self.update_noticeboard.change_interval(seconds=noticeboard_update_interval)
+
             if noticeboard_channel_id == "Default":
-                continue  # Disable itself if no channel is set
+                continue 
 
             channel = guild.get_channel(int(noticeboard_channel_id))
             if channel is None:
@@ -42,11 +44,11 @@ class NoticeAutoUpdate(commands.Cog):
             next_update_time = self.get_next_update_time(noticeboard_update_interval)
             next_ping_time = self.get_next_ping_time(ping_daily_time, timezone)
 
-            print(f"Today: {today}")
-            print(f"Next Update Time: {next_update_time}")
-            print(f"Next Ping Time: {next_ping_time}")
+            # Check to cleanup cache
+            cachecleanup()
 
             # Handle embed updates
+            print("Fetching task data from cache...")
             cache_data("all")
             task_data_str = cache_read("all")
 
@@ -91,7 +93,6 @@ class NoticeAutoUpdate(commands.Cog):
                 await self.send_initial_messages(channel, notice_embed, this_week_embed, due_tomorrow_embed, guild_id)
 
             # Ping message handling
-            print("Handling the ping message.")
             ping_role = config.get("PingRoleId", "NotSet")
 
             try:
@@ -101,17 +102,14 @@ class NoticeAutoUpdate(commands.Cog):
 
                     # Only delete and resend if it's exactly the daily ping time
                     if today >= next_ping_time:
-                        print("Deleting old ping message.")
                         await ping_message.delete()
                         ping_message = await self.send_ping_message(channel, ping_role, today, next_update_time)
                         self.sent_message_ids[guild_id]['ping'] = ping_message.id
                     else:
-                        print("Editing the ping message with new refresh time.")
                         await ping_message.edit(
-                            content=f"# Daily Ping {ping_role}\n## Today's date: {today.strftime('%a, %d %b %Y')}\n## Next Refresh in: <t:{int(next_update_time.timestamp())}:R>"
+                            content=f"# Daily Ping <@&{ping_role}>\n- Today's date: {today.strftime('%a, %d %b %Y')}\n- Next Refresh in: <t:{int(next_update_time.timestamp())}:R>\n- Next Ping in: <t:{int(next_ping_time.timestamp())}:R> \n- Last API call: {api_call_time}"
                         )
                 else:
-                    print("Sending initial ping message.")
                     ping_message = await self.send_ping_message(channel, ping_role, today, next_update_time)
                     self.sent_message_ids[guild_id]['ping'] = ping_message.id
 
@@ -124,7 +122,7 @@ class NoticeAutoUpdate(commands.Cog):
 
     async def send_ping_message(self, channel, ping_role, today, next_update_time):
         ping_message = await channel.send(
-            f"# Daily Ping {ping_role}\n## Today's date: {today.strftime('%a, %d %b %Y')}\n## Next Refresh in: <t:{int(next_update_time.timestamp())}:R>"
+            f"# Daily Ping <@&{ping_role}>\n- Today's date: {today.strftime('%a, %d %b %Y')}\n- Next Refresh in: <t:{int(next_update_time.timestamp())}:R>"
         )
         print(f"Sent new ping message with ID {ping_message.id}.")
         return ping_message
