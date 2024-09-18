@@ -34,7 +34,7 @@ def cachecleanup():
     except Exception as e:
         print(f"Error: {e}")
         return
-    one_week_ago = datetime.datetime.now() - timedelta(weeks=1)
+    three_days_ago = datetime.datetime.now() - timedelta(days=3)
     
     removed_files_count = 0
     for file in os.listdir(cache_dir):
@@ -48,7 +48,7 @@ def cachecleanup():
                 date_str = date_str[:-5]
             
             file_date = datetime.datetime.strptime(date_str, "%d_%m_%Y")
-            if file_date < one_week_ago:
+            if file_date < three_days_ago:
                 os.remove(file_path)
                 print(f"Removed {file_path}")
                 removed_files_count += 1
