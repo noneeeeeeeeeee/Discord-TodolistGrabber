@@ -8,6 +8,7 @@ class Ping(commands.Cog):
         self.bot = bot
 
     @commands.hybrid_command(name='ping', description='Check the bot\'s latency.')
+    @commands.cooldown(1, 60, commands.BucketType.user)  # 1 command per minute per user
     async def ping(self, ctx: commands.Context):
         start_time = time.time()
         message = await ctx.reply("Pinging...")
@@ -30,6 +31,15 @@ class Ping(commands.Cog):
         )
         
         await message.edit(content=None, embed=embed)
+
+    # Error handler to catch the cooldown error
+    @ping.error
+    async def ping_error(self, ctx, error):
+        if isinstance(error, commands.CommandOnCooldown):
+            retry_after = round(error.retry_after, 1)
+            await ctx.send(f":hourglass: Please wait {retry_after} seconds before using the `ping` command again.")
+        else:
+            await ctx.send(":x: An unexpected error occurred.")
 
 async def setup(bot):
     await bot.add_cog(Ping(bot))
