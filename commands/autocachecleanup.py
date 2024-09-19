@@ -10,8 +10,7 @@ class AutoCacheCleanup:
         self.bot = bot
 
     async def start_cache_cleanup(self):
-        config_data = json_get()
-        ping_daily_time = config_data.get('PingDailyTime', '12:00')
+        ping_daily_time = "12:00"
         ping_time = datetime.strptime(ping_daily_time, "%H:%M")
         while True:
             current_time = datetime.now() + timedelta(hours=7)
