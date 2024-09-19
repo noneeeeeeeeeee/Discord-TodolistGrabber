@@ -3,7 +3,7 @@ import discord
 import json
 from datetime import datetime, timedelta
 from modules.setconfig import json_get, check_guild_config_available
-from modules.cache import cache_data, cache_read, cachecleanup
+from modules.cache import cache_data, cache_read
 from modules.readversion import read_current_version
 
 class NoticeAutoUpdate(commands.Cog):
@@ -43,9 +43,6 @@ class NoticeAutoUpdate(commands.Cog):
 
             next_update_time = self.get_next_update_time(noticeboard_update_interval)
             next_ping_time = self.get_next_ping_time(ping_daily_time, timezone)
-
-            # Check to cleanup cache
-            cachecleanup()
 
             # Handle embed updates
             print("Fetching task data from cache...")

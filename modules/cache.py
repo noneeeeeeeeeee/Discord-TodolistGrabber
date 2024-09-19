@@ -3,8 +3,9 @@ from datetime import timedelta
 from .apicall import fetch_api_data
 import os
 import json
+import re
 
-def cache_data(weekSelect = None):
+def cache_data(weekSelect=None):
     data = fetch_api_data(weekSelect, True)
     
     cache_dir = os.path.join(os.path.dirname(__file__), '..', 'cache')
@@ -15,10 +16,13 @@ def cache_data(weekSelect = None):
     # Get the time of the API call
     apicalltime = data_dict["Status"][0]["apicalltime"]
     apicalltime_dt = datetime.datetime.strptime(apicalltime, "%a, %d %b %Y %H:%M:%S %Z")
-    formatted_time = apicalltime_dt.strftime("%m-%H_%d_%m_%Y")
+
+    # Convert to GMT+7
+    gmt7_time = apicalltime_dt + timedelta(hours=7)
+    formatted_time = gmt7_time.strftime("%m-%H_%d_%m_%Y")
 
     # Get the weeks
-    if weekSelect != None:
+    if weekSelect is not None:
         formatted_time += f'_week_{weekSelect}'
 
     cache_file = os.path.join(cache_dir, f'cache_{formatted_time}.json')
@@ -34,7 +38,7 @@ def cachecleanup():
     except Exception as e:
         print(f"Error: {e}")
         return
-    three_days_ago = datetime.datetime.now() - timedelta(days=3)
+    weeks = datetime.datetime.now() - timedelta(weeks=1)
     
     removed_files_count = 0
     for file in os.listdir(cache_dir):
@@ -48,7 +52,7 @@ def cachecleanup():
                 date_str = date_str[:-5]
             
             file_date = datetime.datetime.strptime(date_str, "%d_%m_%Y")
-            if file_date < three_days_ago:
+            if file_date < weeks:
                 os.remove(file_path)
                 print(f"Removed {file_path}")
                 removed_files_count += 1
@@ -57,6 +61,48 @@ def cachecleanup():
         return "No files to remove"
     else:
         return f"Removed {removed_files_count} file(s)"
+
+
+
+
+def delete_redundant_cache_files():
+    cache_dir = os.path.join(os.path.dirname(__file__), '..', 'cache')
+    cache_file_pattern = re.compile(r'cache_(\d{2})-(\d{2})_(\d{2})_(\d{2})_(\d{4})_week_all')
+    latest_files = {}
+
+    for filename in os.listdir(cache_dir):
+        match = cache_file_pattern.match(filename)
+        if match:
+            minute = match.group(1)
+            hour = match.group(2)
+            day = match.group(3)
+            month = match.group(4)
+            year = match.group(5)
+            time_obj = datetime.datetime.strptime(f'{hour}:{minute}', '%H:%M')
+            date_obj = datetime.datetime.strptime(f'{day}_{month}_{year}', '%d_%m_%Y')
+            if date_obj not in latest_files:
+                latest_files[date_obj] = (time_obj, filename)
+            else:
+                if time_obj > latest_files[date_obj][0]:
+                    latest_files[date_obj] = (time_obj, filename)
+
+    for filename in os.listdir(cache_dir):
+        match = cache_file_pattern.match(filename)
+        if match:
+            minute = match.group(1)
+            hour = match.group(2)
+            day = match.group(3)
+            month = match.group(4)
+            year = match.group(5)
+            time_obj = datetime.datetime.strptime(f'{hour}:{minute}', '%H:%M')
+            date_obj = datetime.datetime.strptime(f'{day}_{month}_{year}', '%d_%m_%Y')
+            if filename != latest_files[date_obj][1]:
+                file_path = os.path.join(cache_dir, filename)
+                os.remove(file_path)
+                print(f"Deleted old cache file: {filename}")
+
+
+
 
 
 def truncate_cache():
@@ -112,3 +158,4 @@ def cache_read(weekSelect=None):
             return f.read()
     else:
         return None
+    
