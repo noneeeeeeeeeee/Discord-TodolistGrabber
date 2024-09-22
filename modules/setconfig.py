@@ -13,7 +13,6 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
         "DefaultRoleId": default_role_id,
         "PingRoleId": default_ping_role_id,
         "PingDailyTime": "15:00",
-        "Timezone": "GMT+7",
 
         "MusicEnabled": False,
         "MusicDJRole": "Default",

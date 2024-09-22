@@ -12,6 +12,7 @@ class NoticeAutoUpdate(commands.Cog):
         self.sent_message_ids = {}
         self.first_start = True
         self.update_noticeboard.start()
+        self.send_ping_message_loop.start()
 
 
     def cog_unload(self):
@@ -29,7 +30,6 @@ class NoticeAutoUpdate(commands.Cog):
             noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
             ping_daily_time = config.get("PingDailyTime", "15:00")
             noticeboard_update_interval = config.get("NoticeBoardUpdateInterval", 3600) 
-            timezone = config.get("Timezone", "UTC+7")
 
             self.update_noticeboard.change_interval(seconds=noticeboard_update_interval)
 
@@ -42,7 +42,7 @@ class NoticeAutoUpdate(commands.Cog):
                 continue
 
             next_update_time = self.get_next_update_time(noticeboard_update_interval)
-            next_ping_time = self.get_next_ping_time(ping_daily_time, timezone)
+            next_ping_time = self.get_next_ping_time(ping_daily_time)
 
             # Handle embed updates
             print("Fetching task data from cache...")
@@ -69,7 +69,7 @@ class NoticeAutoUpdate(commands.Cog):
 
             notice_embed = self.create_notice_embed(task_data, version)
             this_week_embed = self.create_weekly_embed(task_data, version, api_call_time)
-            due_tomorrow_embed = self.create_due_tomorrow_embed(task_data, version, api_call_time, next_update_time)
+            due_tomorrow_embed = self.create_due_tomorrow_embed(task_data, version)
 
             # Ensure the embeds are properly created before sending them
             if guild_id in self.sent_message_ids:
@@ -117,6 +117,40 @@ class NoticeAutoUpdate(commands.Cog):
             except Exception as e:
                 print(f"An unexpected error occurred while handling the ping message: {e}")
 
+
+    @tasks.loop(minutes=1)
+    async def send_ping_message_loop(self):
+        today = datetime.now()
+        for guild in self.bot.guilds:
+            guild_id = guild.id
+            config = json_get(guild_id)
+            ping_daily_time = config.get("PingDailyTime", "15:00")
+            noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
+
+            if noticeboard_channel_id == "Default":
+                continue
+
+            channel = guild.get_channel(int(noticeboard_channel_id))
+            next_ping_time = self.get_next_ping_time(ping_daily_time)
+
+            if today >= next_ping_time:
+                ping_role = config.get("PingRoleId", "NotSet")
+                if guild_id in self.sent_message_ids and 'ping' in self.sent_message_ids[guild_id]:
+                    try:
+                        ping_message_id = self.sent_message_ids[guild_id]['ping']
+                        ping_message = await channel.fetch_message(ping_message_id)
+                        await ping_message.delete()
+                    except discord.NotFound:
+                        pass
+
+                ping_message = await self.send_ping_message(channel, ping_role, today, next_ping_time)
+                self.sent_message_ids[guild_id]['ping'] = ping_message.id
+
+    @send_ping_message_loop.before_loop
+    async def before_send_ping_message_loop(self):
+        await self.bot.wait_until_ready()
+
+
     async def send_ping_message(self, channel, ping_role, today, next_update_time):
         ping_message = await channel.send(
             f"# Daily Ping <@&{ping_role}>\n- Today's date: {today.strftime('%a, %d %b %Y')}\n- Next Refresh in: <t:{int(next_update_time.timestamp())}:R>"
@@ -141,15 +175,14 @@ class NoticeAutoUpdate(commands.Cog):
         next_update = current_time + timedelta(seconds=interval_seconds)
         return next_update
 
-    def get_next_ping_time(self, ping_daily_time, timezone):
+    def get_next_ping_time(self, ping_daily_time):
         today = datetime.now()
-        timezone_offset = int(timezone.split("UTC")[1])
         target_time_str = f"{today.strftime('%Y-%m-%d')} {ping_daily_time}"
         next_ping_time = datetime.strptime(target_time_str, "%Y-%m-%d %H:%M")
-        next_ping_time += timedelta(hours=timezone_offset)
         if next_ping_time < today:
             next_ping_time += timedelta(days=1)
         return next_ping_time
+
     
     def add_task_fields(self, embed, tasks):
         for idx, task in enumerate(tasks, start=1):
@@ -164,16 +197,22 @@ class NoticeAutoUpdate(commands.Cog):
     def create_notice_embed(self, task_data, version):
         embed = discord.Embed(title="Notice Board", description="Tasks you have to do", color=discord.Color.blue())
         for date, tasks in task_data.items():
-            if date == "Status":
+            if date == "Status" or not self.is_valid_date(date):  # Skip invalid date entries
                 continue
             formatted_date = self.format_discord_time(date)
             task_list = []
             for idx, task in enumerate(tasks, start=1):
-            #    task_type = "Exam/Practicum/Project" if task["taskType"] == "1" else "Exercise/Homework"
-                 task_list.append(f"{idx}. {task['subject']} [{task['task']}] - {task['description']}")
+                task_list.append(f"{idx}. {task['subject']} [{task['task']}] - {task['description']}")
             embed.add_field(name=formatted_date, value="\n".join(task_list), inline=False)
         embed.set_footer(text=f"Bot Version: {version}")
         return embed
+
+    def is_valid_date(self, date_str):
+        try:
+            datetime.strptime(date_str, "%A, %d-%m-%Y")
+            return True
+        except ValueError:
+            return False
 
     def create_weekly_embed(self, task_data, version, api_call_time):
         today = datetime.now()
@@ -182,54 +221,80 @@ class NoticeAutoUpdate(commands.Cog):
         embed = discord.Embed(title="This Week's Assignments", color=discord.Color.green())
         embed.set_author(name=f"{week_start.strftime('%a, %d %b %Y')} to {week_end.strftime('%a, %d %b %Y')}")
         tasks_found = False
+
         for date, tasks in task_data.items():
-            if date == "Status":
+            if date == "Status" or not self.is_valid_date(date):  # Skip invalid date entries
                 continue
             task_date = datetime.strptime(date, "%A, %d-%m-%Y")
             if week_start <= task_date <= week_end:
                 formatted_date = self.format_discord_time(date)
                 task_list = []
                 for idx, task in enumerate(tasks, start=1):
-                    #task_type = "Exam/Practicum/Project" if task["taskType"] == "1" else "Exercise/Homework"
                     task_list.append(f"{idx}. {task['subject']} [{task['task']}] - {task['description']}")
                 embed.add_field(name=formatted_date, value="\n".join(task_list), inline=False)
                 tasks_found = True
+
         if not tasks_found:
-            embed.description = "No Assignments this week! 🎉"  # Fixed here
+            embed.description = "No Assignments this week! 🎉"
+        embed.set_footer(text=f"Bot Version: {version}")
+        return embed
+
+    def create_notice_embed(self, task_data, version):
+        embed = discord.Embed(title="Notice Board", description="Tasks you have to do", color=discord.Color.blue())
+        for date, tasks in task_data.items():
+            if date == "Status" or not self.is_valid_date(date):  # Skip invalid date entries
+                continue
+            formatted_date = self.format_discord_time(date)
+            task_list = []
+            for idx, task in enumerate(tasks, start=1):
+                task_list.append(f"{idx}. {task['subject']} [{task['task']}] - {task['description']}")
+            embed.add_field(name=formatted_date, value="\n".join(task_list), inline=False)
         embed.set_footer(text=f"Bot Version: {version}")
         return embed
 
 
-    
-    def create_due_tomorrow_embed(self, task_data, version, api_call_time, next_update_time):
+
+
+    def create_due_tomorrow_embed(self, task_data, version):
         today = datetime.now()
         tomorrow = today + timedelta(days=1)
         next_due = None
         embed = discord.Embed(title="Assignments Due Tomorrow", color=discord.Color.orange())
-
+    
         for date, tasks in task_data.items():
-            if date == "Status":
+            # Skip non-date keys like "Status" or invalid date formats
+            if date == "Status" or date == "api-version":
                 continue
-            task_date = datetime.strptime(date, "%A, %d-%m-%Y")
-            if task_date == tomorrow:
+            try:
+                # Parse the date from the format in the JSON
+                task_date = datetime.strptime(date, "%A, %d-%m-%Y")
+            except ValueError:
+                print(f"Skipping invalid date format: {date}")
+                continue
+            
+            # If the task date matches tomorrow, add it to the embed
+            if task_date.date() == tomorrow.date():
                 embed.set_author(name=f"Due on {tomorrow.strftime('%a, %d %b %Y')}")
                 self.add_task_fields(embed, tasks)
                 break
             elif task_date > tomorrow and next_due is None:
                 next_due = task_date, tasks
-
-        if not embed.fields:
+    
+        if not embed.fields:  # If no tasks for tomorrow are found
             if next_due:
                 next_due_date, next_due_tasks = next_due
                 embed.title = f"Assignments Due <t:{int(next_due_date.timestamp())}:R>"
-                embed.description = "**No assignments due tomorrow.** Just a heads up here's the assignments that are coming up:"
+                embed.description = "**No assignments due tomorrow.** Here's what's coming up next:"
                 self.add_task_fields(embed, next_due_tasks)
             else:
-                embed.description = "Nice! No assignments due tomorrow!"
-
+                embed.description = "Nice! There are no assignments due tomorrow!"
+    
         # Set the footer with the bot version only
         embed.set_footer(text=f"Bot Version: {version}")
         return embed
+    
+    
+
 
     def format_discord_time(self, date_str):
         date_obj = datetime.strptime(date_str, "%A, %d-%m-%Y")

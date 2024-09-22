@@ -7,28 +7,22 @@ import re
 
 def cache_data(weekSelect=None):
     data = fetch_api_data(weekSelect, True)
-    
     cache_dir = os.path.join(os.path.dirname(__file__), '..', 'cache')
     os.makedirs(cache_dir, exist_ok=True)
-    
     data_dict = json.loads(data)
-
-    # Get the time of the API call
     apicalltime = data_dict["Status"][0]["apicalltime"]
-    apicalltime_dt = datetime.datetime.strptime(apicalltime, "%a, %d %b %Y %H:%M:%S %Z")
 
-    # Convert to GMT+7
-    gmt7_time = apicalltime_dt + timedelta(hours=7)
-    formatted_time = gmt7_time.strftime("%m-%H_%d_%m_%Y")
+    if 'GMT+7' in apicalltime:
+        apicalltime = apicalltime.replace('GMT+7', '+0700')
 
-    # Get the weeks
+    apicalltime_dt = datetime.datetime.strptime(apicalltime, "%a, %d %b %Y %H:%M:%S %z")
+    formatted_time = apicalltime_dt.strftime("%M-%H_%d_%m_%Y")
     if weekSelect is not None:
         formatted_time += f'_week_{weekSelect}'
 
     cache_file = os.path.join(cache_dir, f'cache_{formatted_time}.json')
     with open(cache_file, 'w') as f:
         f.write(data)
-
 
 def cachecleanup():
     try:
