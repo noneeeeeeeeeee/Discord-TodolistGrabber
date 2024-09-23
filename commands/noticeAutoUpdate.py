@@ -11,14 +11,12 @@ class NoticeAutoUpdate(commands.Cog):
         self.bot = bot
         self.sent_message_ids = {}
         self.first_start = True
+        self.ping_sent_today = {}
+        self.guild_update_info = {}
         self.update_noticeboard.start()
         self.send_ping_message_loop.start()
 
-
-    def cog_unload(self):
-        self.update_noticeboard.cancel()
-
-    @tasks.loop(seconds=30)
+    @tasks.loop(hours=1)
     async def update_noticeboard(self):
         today = datetime.now()
         for guild in self.bot.guilds:
@@ -28,13 +26,12 @@ class NoticeAutoUpdate(commands.Cog):
 
             config = json_get(guild_id)
             noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
-            ping_daily_time = config.get("PingDailyTime", "15:00")
-            noticeboard_update_interval = config.get("NoticeBoardUpdateInterval", 3600) 
+            noticeboard_update_interval = config.get("NoticeBoardUpdateInterval", 3600)
 
             self.update_noticeboard.change_interval(seconds=noticeboard_update_interval)
 
             if noticeboard_channel_id == "Default":
-                continue 
+                continue
 
             channel = guild.get_channel(int(noticeboard_channel_id))
             if channel is None:
@@ -42,9 +39,8 @@ class NoticeAutoUpdate(commands.Cog):
                 continue
 
             next_update_time = self.get_next_update_time(noticeboard_update_interval)
-            next_ping_time = self.get_next_ping_time(ping_daily_time)
+            self.guild_update_info[guild_id] = {'next_update_time': next_update_time}
 
-            # Handle embed updates
             print("Fetching task data from cache...")
             cache_data("all")
             task_data_str = cache_read("all")
@@ -63,15 +59,14 @@ class NoticeAutoUpdate(commands.Cog):
                 await channel.send(f"Error: Expected task data to be a dictionary but got {type(task_data)}. Raw data: {task_data_str}")
                 continue
 
-            # Generate embeds
-            version = read_current_version()
             api_call_time = task_data.get("Status", [{}])[0].get("apicalltime", "Unknown")
+            self.guild_update_info[guild_id]['api_call_time'] = api_call_time
 
+            version = read_current_version()
             notice_embed = self.create_notice_embed(task_data, version)
             this_week_embed = self.create_weekly_embed(task_data, version, api_call_time)
             due_tomorrow_embed = self.create_due_tomorrow_embed(task_data, version)
 
-            # Ensure the embeds are properly created before sending them
             if guild_id in self.sent_message_ids:
                 try:
                     message_ids = self.sent_message_ids[guild_id]
@@ -89,38 +84,36 @@ class NoticeAutoUpdate(commands.Cog):
             else:
                 await self.send_initial_messages(channel, notice_embed, this_week_embed, due_tomorrow_embed, guild_id)
 
-            # Ping message handling
+            # Handle ping message
             ping_role = config.get("PingRoleId", "NotSet")
+            next_ping_time = self.get_next_ping_time(config.get("PingDailyTime", "15:00"))
 
-            try:
-                if guild_id in self.sent_message_ids and 'ping' in self.sent_message_ids[guild_id]:
-                    ping_message_id = self.sent_message_ids[guild_id]['ping']
-                    ping_message = await channel.fetch_message(ping_message_id)
-
-                    # Only delete and resend if it's exactly the daily ping time
-                    if today >= next_ping_time:
-                        await ping_message.delete()
-                        ping_message = await self.send_ping_message(channel, ping_role, today, next_update_time)
-                        self.sent_message_ids[guild_id]['ping'] = ping_message.id
-                    else:
-                        await ping_message.edit(
-                            content=f"# Daily Ping <@&{ping_role}>\n- Today's date: {today.strftime('%a, %d %b %Y')}\n- Next Refresh in: <t:{int(next_update_time.timestamp())}:R>\n- Next Ping in: <t:{int(next_ping_time.timestamp())}:R> \n- Last API call: {api_call_time}"
-                        )
-                else:
-                    ping_message = await self.send_ping_message(channel, ping_role, today, next_update_time)
-                    self.sent_message_ids[guild_id]['ping'] = ping_message.id
-
-            except discord.Forbidden:
-                print(f"Bot does not have permission to send ping message in channel {channel.id}.")
-            except discord.HTTPException as e:
-                print(f"HTTP Exception occurred while sending or editing ping message: {e}")
-            except Exception as e:
-                print(f"An unexpected error occurred while handling the ping message: {e}")
+            if self.first_start:
+                self.first_start = False
+                # Initial ping message
+                api_call_time = self.guild_update_info.get(guild_id, {}).get('api_call_time', 'Unknown')
+                ping_message = await self.send_ping_message(channel, ping_role, today, next_ping_time, next_update_time, api_call_time)
+                self.sent_message_ids[guild_id]['ping'] = ping_message.id
+                self.ping_sent_today[guild_id] = today.date()
+            else:
+                # Update the existing ping message
+                ping_message_id = self.sent_message_ids[guild_id].get('ping')
+                if ping_message_id:
+                    try:
+                        ping_message = await channel.fetch_message(ping_message_id)
+                        # Update the next update time in the ping message
+                        await ping_message.edit(content=f"# Daily Ping <@&{ping_role}>\n"
+                                                         f"- Today's date: {today.strftime('%a, %d %b %Y')}\n"
+                                                         f"- Next Refresh in: <t:{int(next_update_time.timestamp())}:R>\n"
+                                                         f"- Next Ping in: <t:{int(next_ping_time.timestamp())}:R>\n"
+                                                         f"- Last API call: {api_call_time}")
+                    except discord.NotFound:
+                        print(f"Ping message with ID {ping_message_id} not found. It may have been deleted.")
 
 
-    @tasks.loop(minutes=1)
+    @tasks.loop(minutes=10)
     async def send_ping_message_loop(self):
-        today = datetime.now()
+        today = datetime.now().date()
         for guild in self.bot.guilds:
             guild_id = guild.id
             config = json_get(guild_id)
@@ -128,47 +121,62 @@ class NoticeAutoUpdate(commands.Cog):
             noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
 
             if noticeboard_channel_id == "Default":
+                print(f"Channel ID for guild {guild_id} is default; skipping...")
                 continue
 
             channel = guild.get_channel(int(noticeboard_channel_id))
             next_ping_time = self.get_next_ping_time(ping_daily_time)
+            next_update_time = self.guild_update_info.get(guild_id, {}).get('next_update_time', datetime.now() + timedelta(hours=1))
 
-            if today >= next_ping_time:
+            # Create a 10-minute window around the next_ping_time (5 minutes before and after)
+            current_time = datetime.now()
+            ping_window_start = next_ping_time - timedelta(minutes=5)
+            ping_window_end = next_ping_time + timedelta(minutes=5)
+
+
+            # Check if the ping has already been sent today
+            if guild_id in self.ping_sent_today and self.ping_sent_today[guild_id] == today:
+                continue
+
+            if ping_window_start <= current_time <= ping_window_end:
+                print(f"Sending ping message in guild {guild_id}...")
                 ping_role = config.get("PingRoleId", "NotSet")
+
+                # Delete the old ping message if it exists
                 if guild_id in self.sent_message_ids and 'ping' in self.sent_message_ids[guild_id]:
+                    ping_message_id = self.sent_message_ids[guild_id]['ping']
                     try:
-                        ping_message_id = self.sent_message_ids[guild_id]['ping']
                         ping_message = await channel.fetch_message(ping_message_id)
                         await ping_message.delete()
+                        print(f"Deleted old ping message with ID {ping_message_id}")
                     except discord.NotFound:
-                        pass
+                        print("Ping message not found, likely already deleted.")
+                    except discord.Forbidden:
+                        print("Bot does not have permission to delete the message.")
+                    except Exception as e:
+                        print(f"An unexpected error occurred while deleting the message: {e}")
 
-                ping_message = await self.send_ping_message(channel, ping_role, today, next_ping_time)
+                # Send the new ping message
+                ping_message = await self.send_ping_message(channel, ping_role, today, next_ping_time, next_update_time, api_call_time="Unknown")
                 self.sent_message_ids[guild_id]['ping'] = ping_message.id
-
-    @send_ping_message_loop.before_loop
-    async def before_send_ping_message_loop(self):
-        await self.bot.wait_until_ready()
+                self.ping_sent_today[guild_id] = today  # Mark ping as sent for today
 
 
-    async def send_ping_message(self, channel, ping_role, today, next_update_time):
+
+
+
+
+    async def send_ping_message(self, channel, ping_role, today, next_ping_time, next_update_time, api_call_time):
+        next_update_timestamp = int(next_update_time.timestamp()) if isinstance(next_update_time, datetime) else "N/A"
         ping_message = await channel.send(
-            f"# Daily Ping <@&{ping_role}>\n- Today's date: {today.strftime('%a, %d %b %Y')}\n- Next Refresh in: <t:{int(next_update_time.timestamp())}:R>"
+            f"# Daily Ping <@&{ping_role}>\n- Today's date: {today.strftime('%a, %d %b %Y')}\n- Next Refresh in: <t:{next_update_timestamp}:R>\n- Next Ping in: <t:{int(next_ping_time.timestamp())}:R> \n- Last API call: {api_call_time}"
         )
-        print(f"Sent new ping message with ID {ping_message.id}.")
         return ping_message
-
-
-
-
-
-
 
     @update_noticeboard.before_loop
     async def before_update_noticeboard(self):
         await self.bot.wait_until_ready()
         print("Bot is ready and before_loop is complete.")
-
 
     def get_next_update_time(self, interval_seconds):
         current_time = datetime.now()
@@ -183,29 +191,13 @@ class NoticeAutoUpdate(commands.Cog):
             next_ping_time += timedelta(days=1)
         return next_ping_time
 
-    
     def add_task_fields(self, embed, tasks):
         for idx, task in enumerate(tasks, start=1):
-            # task_type = "Exam/Practicum/Project" if task["taskType"] == "1" else "Exercise/Homework"
             embed.add_field(
                 name=f"{task['subject']} [{task['task']}] ",
                 value=f"{task['description']}",
                 inline=False
             )
-
-
-    def create_notice_embed(self, task_data, version):
-        embed = discord.Embed(title="Notice Board", description="Tasks you have to do", color=discord.Color.blue())
-        for date, tasks in task_data.items():
-            if date == "Status" or not self.is_valid_date(date):  # Skip invalid date entries
-                continue
-            formatted_date = self.format_discord_time(date)
-            task_list = []
-            for idx, task in enumerate(tasks, start=1):
-                task_list.append(f"{idx}. {task['subject']} [{task['task']}] - {task['description']}")
-            embed.add_field(name=formatted_date, value="\n".join(task_list), inline=False)
-        embed.set_footer(text=f"Bot Version: {version}")
-        return embed
 
     def is_valid_date(self, date_str):
         try:
@@ -223,7 +215,7 @@ class NoticeAutoUpdate(commands.Cog):
         tasks_found = False
 
         for date, tasks in task_data.items():
-            if date == "Status" or not self.is_valid_date(date):  # Skip invalid date entries
+            if date == "Status" or not self.is_valid_date(date):
                 continue
             task_date = datetime.strptime(date, "%A, %d-%m-%Y")
             if week_start <= task_date <= week_end:
@@ -242,7 +234,7 @@ class NoticeAutoUpdate(commands.Cog):
     def create_notice_embed(self, task_data, version):
         embed = discord.Embed(title="Notice Board", description="Tasks you have to do", color=discord.Color.blue())
         for date, tasks in task_data.items():
-            if date == "Status" or not self.is_valid_date(date):  # Skip invalid date entries
+            if date == "Status" or not self.is_valid_date(date):
                 continue
             formatted_date = self.format_discord_time(date)
             task_list = []
@@ -252,9 +244,6 @@ class NoticeAutoUpdate(commands.Cog):
         embed.set_footer(text=f"Bot Version: {version}")
         return embed
 
-
-
-
     def create_due_tomorrow_embed(self, task_data, version):
         today = datetime.now()
         tomorrow = today + timedelta(days=1)
@@ -262,17 +251,14 @@ class NoticeAutoUpdate(commands.Cog):
         embed = discord.Embed(title="Assignments Due Tomorrow", color=discord.Color.orange())
     
         for date, tasks in task_data.items():
-            # Skip non-date keys like "Status" or invalid date formats
             if date == "Status" or date == "api-version":
                 continue
             try:
-                # Parse the date from the format in the JSON
                 task_date = datetime.strptime(date, "%A, %d-%m-%Y")
             except ValueError:
                 print(f"Skipping invalid date format: {date}")
                 continue
             
-            # If the task date matches tomorrow, add it to the embed
             if task_date.date() == tomorrow.date():
                 embed.set_author(name=f"Due on {tomorrow.strftime('%a, %d %b %Y')}")
                 self.add_task_fields(embed, tasks)
@@ -280,7 +266,7 @@ class NoticeAutoUpdate(commands.Cog):
             elif task_date > tomorrow and next_due is None:
                 next_due = task_date, tasks
     
-        if not embed.fields:  # If no tasks for tomorrow are found
+        if not embed.fields:
             if next_due:
                 next_due_date, next_due_tasks = next_due
                 embed.title = f"Assignments Due <t:{int(next_due_date.timestamp())}:R>"
@@ -289,13 +275,9 @@ class NoticeAutoUpdate(commands.Cog):
             else:
                 embed.description = "Nice! There are no assignments due tomorrow!"
     
-        # Set the footer with the bot version only
         embed.set_footer(text=f"Bot Version: {version}")
         return embed
     
-    
-
-
     def format_discord_time(self, date_str):
         date_obj = datetime.strptime(date_str, "%A, %d-%m-%Y")
         return date_obj.strftime("%d %b %Y")
@@ -321,4 +303,3 @@ class NoticeAutoUpdate(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(NoticeAutoUpdate(bot))
-
