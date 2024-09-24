@@ -21,6 +21,8 @@ class Help(commands.Cog):
         embed.add_field(name="!ping (hybrid)", value="Response time from the bot to discord", inline=False)
         embed.add_field(name="!apistatus", value="Check if the API is up", inline=False)
         embed.add_field(name="!noticeboard", value="Open the NoticeBoard setup menu", inline=False)
+        embed.add_field(name="!askgemini(hybrid)", value="Ask Gemini!", inline=False)
+        embed.add_field(name="!settings (soon)", value="Opens the Settings Menu", inline=False)
         embed.add_field(name="!setup", value="Open the Setup Wizard", inline=False)
         embed.set_footer(text="Bot Version: " + read_current_version())
         
