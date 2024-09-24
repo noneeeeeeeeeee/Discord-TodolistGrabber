@@ -2,6 +2,7 @@ from discord.ext import commands, tasks
 import discord
 import json
 from datetime import datetime, timedelta
+import asyncio
 from modules.setconfig import json_get, check_guild_config_available
 from modules.cache import cache_data, cache_read
 from modules.readversion import read_current_version
@@ -35,13 +36,11 @@ class NoticeAutoUpdate(commands.Cog):
 
             channel = guild.get_channel(int(noticeboard_channel_id))
             if channel is None:
-                print(f"Channel with ID {noticeboard_channel_id} not found in guild {guild_id}.")
                 continue
 
             next_update_time = self.get_next_update_time(noticeboard_update_interval)
             self.guild_update_info[guild_id] = {'next_update_time': next_update_time}
 
-            print("Fetching task data from cache...")
             cache_data("all")
             task_data_str = cache_read("all")
 
@@ -72,9 +71,17 @@ class NoticeAutoUpdate(commands.Cog):
                     message_ids = self.sent_message_ids[guild_id]
                     messages = [await channel.fetch_message(msg_id) for msg_id in message_ids.values()]
                     if len(messages) >= 3:
-                        await messages[0].edit(embed=notice_embed)
-                        await messages[1].edit(embed=this_week_embed)
-                        await messages[2].edit(embed=due_tomorrow_embed)
+                        for message, embed in zip(messages[:3], [notice_embed, this_week_embed, due_tomorrow_embed]):
+                            try:
+                                await message.edit(embed=embed)
+                                await asyncio.sleep(2)
+                            except discord.HTTPException as e:
+                                if e.status == 429:
+                                    retry_after = e.retry_after or 5
+                                    await asyncio.sleep(retry_after)
+                                    await message.edit(embed=embed)
+                                else:
+                                    print(f"Failed to edit message ID {message.id}: {e}")
                     else:
                         self.sent_message_ids.pop(guild_id)
                         await self.send_initial_messages(channel, notice_embed, this_week_embed, due_tomorrow_embed, guild_id)
@@ -84,24 +91,20 @@ class NoticeAutoUpdate(commands.Cog):
             else:
                 await self.send_initial_messages(channel, notice_embed, this_week_embed, due_tomorrow_embed, guild_id)
 
-            # Handle ping message
             ping_role = config.get("PingRoleId", "NotSet")
             next_ping_time = self.get_next_ping_time(config.get("PingDailyTime", "15:00"))
 
             if self.first_start:
                 self.first_start = False
-                # Initial ping message
                 api_call_time = self.guild_update_info.get(guild_id, {}).get('api_call_time', 'Unknown')
                 ping_message = await self.send_ping_message(channel, ping_role, today, next_ping_time, next_update_time, api_call_time)
                 self.sent_message_ids[guild_id]['ping'] = ping_message.id
-                self.ping_sent_today[guild_id] = today.date()
+                self.ping_sent_today[guild_id] = (today - timedelta(days=1)).date()
             else:
-                # Update the existing ping message
                 ping_message_id = self.sent_message_ids[guild_id].get('ping')
                 if ping_message_id:
                     try:
                         ping_message = await channel.fetch_message(ping_message_id)
-                        # Update the next update time in the ping message
                         await ping_message.edit(content=f"# Daily Ping <@&{ping_role}>\n"
                                                          f"- Today's date: {today.strftime('%a, %d %b %Y')}\n"
                                                          f"- Next Refresh in: <t:{int(next_update_time.timestamp())}:R>\n"
@@ -109,7 +112,6 @@ class NoticeAutoUpdate(commands.Cog):
                                                          f"- Last API call: {api_call_time}")
                     except discord.NotFound:
                         print(f"Ping message with ID {ping_message_id} not found. It may have been deleted.")
-
 
     @tasks.loop(minutes=10)
     async def send_ping_message_loop(self):
@@ -119,48 +121,59 @@ class NoticeAutoUpdate(commands.Cog):
             config = json_get(guild_id)
             ping_daily_time = config.get("PingDailyTime", "15:00")
             noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
-
+    
             if noticeboard_channel_id == "Default":
-                print(f"Channel ID for guild {guild_id} is default; skipping...")
                 continue
-
+            
             channel = guild.get_channel(int(noticeboard_channel_id))
             next_ping_time = self.get_next_ping_time(ping_daily_time)
+    
+            api_call_time = self.guild_update_info.get(guild_id, {}).get('api_call_time', "Unknown")
             next_update_time = self.guild_update_info.get(guild_id, {}).get('next_update_time', datetime.now() + timedelta(hours=1))
-
-            # Create a 10-minute window around the next_ping_time (5 minutes before and after)
+    
             current_time = datetime.now()
             ping_window_start = next_ping_time - timedelta(minutes=5)
             ping_window_end = next_ping_time + timedelta(minutes=5)
-
-
-            # Check if the ping has already been sent today
+    
             if guild_id in self.ping_sent_today and self.ping_sent_today[guild_id] == today:
                 continue
-
+            
             if ping_window_start <= current_time <= ping_window_end:
-                print(f"Sending ping message in guild {guild_id}...")
                 ping_role = config.get("PingRoleId", "NotSet")
-
-                # Delete the old ping message if it exists
+    
                 if guild_id in self.sent_message_ids and 'ping' in self.sent_message_ids[guild_id]:
                     ping_message_id = self.sent_message_ids[guild_id]['ping']
                     try:
                         ping_message = await channel.fetch_message(ping_message_id)
                         await ping_message.delete()
-                        print(f"Deleted old ping message with ID {ping_message_id}")
                     except discord.NotFound:
                         print("Ping message not found, likely already deleted.")
                     except discord.Forbidden:
                         print("Bot does not have permission to delete the message.")
                     except Exception as e:
                         print(f"An unexpected error occurred while deleting the message: {e}")
-
-                # Send the new ping message
-                ping_message = await self.send_ping_message(channel, ping_role, today, next_ping_time, next_update_time, api_call_time="Unknown")
-                self.sent_message_ids[guild_id]['ping'] = ping_message.id
-                self.ping_sent_today[guild_id] = today  # Mark ping as sent for today
-
+    
+                max_retries = 5
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        ping_message = await self.send_ping_message(channel, ping_role, today, next_ping_time, next_update_time, api_call_time)
+                        self.sent_message_ids[guild_id]['ping'] = ping_message.id
+                        self.ping_sent_today[guild_id] = today  
+                        break
+                    except discord.HTTPException as e:
+                        if e.status == 429:
+                            retry_after = e.retry_after or 60
+                            await asyncio.sleep(retry_after)
+                        else:
+                            break
+                    except discord.Forbidden:
+                        break
+                    except discord.NotFound:
+                        break
+                    except Exception as e:
+                        break
+            else:
+                print(f"Not within the ping window for guild {guild_id}.")
 
 
 
