@@ -2,3 +2,5 @@ discord.py
 python-dotenv
 requests
 google-generativeai
+youtube_dl
+PyNaCl

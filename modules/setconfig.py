@@ -1,7 +1,7 @@
 import os
 import json
 
-def create_default_config(guild_id, default_admin_role_id, default_role_id, default_ping_role_id):
+def create_default_config(guild_id, default_admin_role_id, default_role_id, default_ping_role_id, music_dj_role):
     config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
     os.makedirs(config_dir, exist_ok=True)
     
@@ -15,11 +15,12 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
         "PingDailyTime": "15:00",
 
         "MusicEnabled": False,
-        "MusicDJRole": "Default",
-        "MusicDJRoleRequired": False,
+        "MusicDJRole": music_dj_role,
+        "MusicDJRoleRequired": True,
         "MusicVolume": 0.5,
         "MusicQueueLimit": 10,
-        "MusicQueueLimitEnabled": False,
+        "MusicQueueLimitEnabled": True,
+        "MusicPlayerStick": True,
     }
     
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")

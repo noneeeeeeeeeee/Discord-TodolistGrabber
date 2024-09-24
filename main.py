@@ -19,15 +19,10 @@ class MyBot(commands.Bot):
         await load_commands()
         await self.tree.sync()  # Sync the slash commands with Discord
 
-    def is_guild_setup(self, guild_id):
-        """Check if the guild is already set up by checking for a config file."""
-        guild_config_path = os.path.join(CONFIG_DIR, f"{guild_id}.json")
-        return os.path.exists(guild_config_path)
-
     async def on_message(self, message):
         """Override on_message to check if commands are enabled for the guild."""
         if message.author == self.user:
-            return  # Ignore messages from the bot itself
+            return 
 
         guild_id = message.guild.id
         config_path = os.path.join(CONFIG_DIR, f"{guild_id}.json")
@@ -61,20 +56,23 @@ async def load_commands():
         print(f"Commands directory '{commands_dir}' does not exist.")
         return
 
-    for filename in os.listdir(commands_dir):
-        if filename.endswith('.py'):
-            cog_name = f'commands.{filename[:-3]}'
+    for root, dirs, files in os.walk(commands_dir):
+        for filename in files:
+            if filename.endswith('.py'):
+                # Construct the module name based on the folder structure
+                module_path = os.path.relpath(os.path.join(root, filename), start=commands_dir)
+                cog_name = f'commands.{module_path[:-3].replace(os.path.sep, ".")}'  # Replace path separators with dots
 
-            if cog_name in bot.extensions:
-                print(f"Unloading previously loaded cog: {cog_name}")
-                await bot.unload_extension(cog_name)
+                if cog_name in bot.extensions:
+                    print(f"Unloading previously loaded cog: {cog_name}")
+                    await bot.unload_extension(cog_name)
 
-            try:
-                await bot.load_extension(cog_name)
-                print(f"Successfully loaded extension {filename}")
-            except Exception as e:
-                print(f"Failed to load extension {filename}: {e}")
-
+                try:
+                    await bot.load_extension(cog_name)
+                    print(f"Successfully loaded extension {filename}")
+                except Exception as e:
+                    print(f"Failed to load extension {filename}: {e}")
+    
 bot = MyBot(command_prefix='!', intents=intents, help_command=None)
 
 @bot.event
