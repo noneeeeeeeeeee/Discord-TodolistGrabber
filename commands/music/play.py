@@ -1,3 +1,4 @@
+import os
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -5,7 +6,7 @@ from discord.ui import Button, View
 import yt_dlp as youtube_dl
 from typing import List
 from modules.setconfig import check_guild_config_available, json_get
-from modules.enviromentfilegenerator import get_enviroment_variable
+from modules.enviromentfilegenerator import check_and_load_env_file
 import asyncio
 
 class MusicPlayer(commands.Cog):
@@ -126,7 +127,8 @@ class MusicPlayer(commands.Cog):
             else:
                 vc = ctx.guild.voice_client
 
-            ffmpeg_path = get_enviroment_variable("FFMPEG_PATH")
+            check_and_load_env_file()
+            ffmpeg_path = os.getenv('FFMPEG_PATH')
 
             FFMPEG_OPTIONS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5','options': '-vn'}
             vc.play(discord.FFmpegPCMAudio(source=url, executable=ffmpeg_path, **FFMPEG_OPTIONS), after=lambda e: self.bot.loop.create_task(self.play_next_in_queue(ctx, voice_channel, config)))
