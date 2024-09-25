@@ -8,7 +8,7 @@ class Ping(commands.Cog):
         self.bot = bot
 
     @commands.hybrid_command(name='ping', description='Check the bot\'s latency.')
-    @commands.cooldown(1, 60, commands.BucketType.user)  # 1 command per minute per user
+    @commands.cooldown(1, 60, commands.BucketType.user) 
     async def ping(self, ctx: commands.Context):
         start_time = time.time()
         message = await ctx.reply("Pinging...")
