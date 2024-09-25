@@ -21,6 +21,7 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
         "MusicQueueLimit": 10,
         "MusicQueueLimitEnabled": True,
         "MusicPlayerStick": True,
+        "TrackMaxDuration": 600,
     }
     
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")
