@@ -88,5 +88,7 @@ bot_token = os.getenv('DiscordBotToken')
 if not bot_token:
     print("Error: Discord bot token is missing. Please set it in the .env file.")
 else:
-    # Run the bot
-    bot.run(bot_token)
+    try:
+        bot.run(bot_token)
+    except:
+        print("The bot token is invalid. Please check the token in the .env file.")

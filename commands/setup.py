@@ -14,25 +14,15 @@ class Setup(commands.Cog):
         if not ctx.author.guild_permissions.administrator:
             embed = discord.Embed(
                 title=":x: Insufficient Permissions",
-                description="This bot hasn't been setup by the administrator, please try again later.",
+                description="This bot hasn't been setup by the administrator, please try again later." if not os.path.exists(f"./config/{ctx.guild.id}.json") else "You have insufficient permissions to run this command.",
                 color=discord.Color.red()
             )
             await ctx.send(embed=embed)
             return
 
-        guild_id = ctx.guild.id
-        config_path = f"./config/{guild_id}.json"
+        config_path = f"./config/{ctx.guild.id}.json"
         
         if os.path.exists(config_path):
-            if not ctx.author.guild_permissions.administrator:
-                embed = discord.Embed(
-                    title=":x: Insufficient Permissions",
-                    description="You have insufficient permissions to run this command.",
-                    color=discord.Color.red()
-                )
-                await ctx.send(embed=embed)
-                return
-
             embed = discord.Embed(
                 title="Setup Wizard",
                 description="A configuration for this server already exists. Do you want to resetup?",
@@ -74,15 +64,22 @@ class Setup(commands.Cog):
         if message is None:
             message = await ctx.send("Starting Setup...")
     
+        setup_steps = [
+            {"name": "Admin Role", "prompt": "Please mention the role that you would like to be the admin role or provide the RoleID."},
+            {"name": "Default Role", "prompt": "Please mention the role that you would like to be the default role or provide the RoleID."},
+            {"name": "Ping Role", "prompt": "Please mention the role that you would like to be the ping role or provide the RoleID."},
+            {"name": "Dj Role", "prompt": "Please mention the role that you would like to be the DJ role or provide the RoleID."}
+        ]
+    
         embed = discord.Embed(
             title="Setup Wizard",
             description="This will guide you through the basic setup for the discord bot to work properly.",
             color=discord.Color.blue()
         )
-        embed.add_field(name=":arrow_right: Step 1: Admin Role", value="Please mention the role that you would like to be the admin role or provide the RoleID.")
-        embed.add_field(name=":hourglass: Step 2: Default Role", value="Please mention the role that you would like to be the default role or provide the RoleID.")
-        embed.add_field(name=":hourglass: Step 3: Ping Role", value="Please mention the role that you would like to be the ping role or provide the RoleID.")
-        
+    
+        for step in setup_steps:
+            embed.add_field(name=f":hourglass: Step: {step['name']}", value=step['prompt'], inline=False)
+    
         view = View(timeout=300)
         cancel_button = Button(label="Cancel", style=discord.ButtonStyle.red)
     
@@ -95,122 +92,69 @@ class Setup(commands.Cog):
     
         await message.edit(content=None, embed=embed, view=view)
     
-        # --- Step 1: Admin Role ---
-        prompt_msg = await ctx.send("Please mention the role that you would like to be the admin role or provide the RoleID.")
-        
-        while True:
-            def check_admin_role(m):
-                return m.author == ctx.author and (m.role_mentions or m.content.isdigit())
+        # Store role IDs
+        admin_role_id = None
+        default_role_id = None
+        ping_role_id = None
+        dj_role_id = None
     
-            try:
-                admin_msg = await self.bot.wait_for('message', check=check_admin_role, timeout=300.0)
+        for i, step in enumerate(setup_steps):
+            prompt_msg = await ctx.send(step['prompt'])
     
-                if admin_msg.role_mentions:
-                    admin_role = admin_msg.role_mentions[0]
-                else:
-                    try:
-                        admin_role = ctx.guild.get_role(int(admin_msg.content))
-                    except ValueError:
-                        admin_role = None
+            while True:
+                def check_role(m):
+                    return m.author == ctx.author and (m.role_mentions or m.content.isdigit())
     
-                if admin_role is None:
-                    await prompt_msg.delete()  # Delete the old prompt message
-                    prompt_msg = await ctx.send("Please mention the role that you would like to be the admin role or provide the RoleID.")  # Send a new prompt message
-                    await ctx.send("Invalid role ID provided. Please try again.", delete_after=10)
-                    await admin_msg.delete()
-                else:
-                    await prompt_msg.delete()  # Delete the prompt message once a valid role is provided
-                    await admin_msg.delete()
-                    break
-                
-            except asyncio.TimeoutError:
-                await ctx.send("You took too long to respond. Please try the setup command again.")
-                return
+                try:
+                    role_msg = await self.bot.wait_for('message', check=check_role, timeout=300.0)
     
-        embed.set_field_at(0, name=":white_check_mark: Step 1: Admin Role", value=f"Admin Role set to {admin_role.mention}")
-        embed.set_field_at(1, name=":arrow_right: Step 2: Default Role", value="Please mention the role that you would like to be the default role or provide the RoleID.")
-        await message.edit(content=None, embed=embed, view=view)
+                    if role_msg.role_mentions:
+                        role = role_msg.role_mentions[0]
+                    else:
+                        try:
+                            role = ctx.guild.get_role(int(role_msg.content))
+                        except ValueError:
+                            role = None
     
-        # --- Step 2: Default Role ---
-        prompt_msg = await ctx.send("Please mention the role that you would like to be the default role or provide the RoleID.")
-        
-        while True:
-            def check_default_role(m):
-                return m.author == ctx.author and (m.role_mentions or m.content.isdigit())
+                    if role is None:
+                        await prompt_msg.delete()
+                        prompt_msg = await ctx.send(step['prompt'])
+                        await ctx.send("Invalid role ID provided. Please try again.", delete_after=10)
+                        await role_msg.delete()
+                    else:
+                        await prompt_msg.delete()
+                        await role_msg.delete()
     
-            try:
-                role_msg = await self.bot.wait_for('message', check=check_default_role, timeout=300.0)
+                        # Assign role ID to corresponding variable
+                        if step['name'] == "Admin Role":
+                            admin_role_id = role.id
+                        elif step['name'] == "Default Role":
+                            default_role_id = role.id
+                        elif step['name'] == "Ping Role":
+                            ping_role_id = role.id
+                        elif step['name'] == "Dj Role":
+                            dj_role_id = role.id
     
-                if role_msg.role_mentions:
-                    default_role = role_msg.role_mentions[0]
-                else:
-                    try:
-                        default_role = ctx.guild.get_role(int(role_msg.content))
-                    except ValueError:
-                        default_role = None
+                        embed.set_field_at(
+                            i,
+                            name=f":white_check_mark: Step {i+1}: {step['name']}",
+                            value=f"{step['name']} set to {role.mention}",
+                            inline=False
+                        )
+                        await message.edit(content=None, embed=embed, view=view)
+                        break
+                    
+                except asyncio.TimeoutError:
+                    await ctx.send("You took too long to respond. Please try the setup command again.")
+                    return
     
-                if default_role is None:
-                    await prompt_msg.delete()  # Delete the old prompt message
-                    prompt_msg = await ctx.send("Please mention the role that you would like to be the default role or provide the RoleID.")  # Send a new prompt message
-                    await ctx.send("Invalid role ID provided. Please try again.", delete_after=10)
-                    await role_msg.delete()
-                else:
-                    await prompt_msg.delete()  # Delete the prompt message once a valid role is provided
-                    await role_msg.delete()
-                    break
-                
-            except asyncio.TimeoutError:
-                await ctx.send("You took too long to respond. Please try the setup command again.")
-                return
-    
-        embed.set_field_at(1, name=":white_check_mark: Step 2: Default Role", value=f"Default Role set to {default_role.mention}")
-        embed.set_field_at(2, name=":arrow_right: Step 3: Ping Role", value="Please mention the role that you would like to be the ping role or provide the RoleID.")
-        await message.edit(content=None, embed=embed, view=view)
-    
-        # --- Step 3: Ping Role ---
-        prompt_msg = await ctx.send("Please mention the role that you would like to be the ping role or provide the RoleID.")
-        
-        while True:
-            def check_ping_role(m):
-                return m.author == ctx.author and (m.role_mentions or m.content.isdigit())
-    
-            try:
-                role_msg = await self.bot.wait_for('message', check=check_ping_role, timeout=300.0)
-    
-                if role_msg.role_mentions:
-                    ping_role = role_msg.role_mentions[0]
-                else:
-                    try:
-                        ping_role = ctx.guild.get_role(int(role_msg.content))
-                    except ValueError:
-                        ping_role = None
-    
-                if ping_role is None:
-                    await prompt_msg.delete()  # Delete the old prompt message
-                    prompt_msg = await ctx.send("Please mention the role that you would like to be the ping role or provide the RoleID.")  # Send a new prompt message
-                    await ctx.send("Invalid role ID provided. Please try again.", delete_after=10)
-                    await role_msg.delete()
-                else:
-                    await prompt_msg.delete()  # Delete the prompt message once a valid role is provided
-                    await role_msg.delete()
-                    break
-                
-            except asyncio.TimeoutError:
-                await ctx.send("You took too long to respond. Please try the setup command again.")
-                return
-    
-        embed.set_field_at(2, name=":white_check_mark: Step 3: Ping Role", value=f"Ping Role set to {ping_role.mention}")
-        await message.edit(content=None, embed=embed, view=view)
-    
-        # Save the configuration after completing all steps
-        create_default_config(ctx.guild.id, admin_role.id, default_role.id, ping_role.id)
+        # Call create_default_config with positional arguments (role IDs)
+        create_default_config(ctx.guild.id, admin_role_id, default_role_id, ping_role_id, dj_role_id)
         await ctx.send("Setup complete! The bot is now ready to use.")
     
-        # Disable the cancel button after setup is complete
         cancel_button.disabled = True
         await message.edit(view=view)
     
-
 
 async def setup(bot):
     await bot.add_cog(Setup(bot))

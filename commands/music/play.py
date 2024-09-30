@@ -9,6 +9,9 @@ from modules.setconfig import check_guild_config_available, json_get
 from modules.enviromentfilegenerator import check_and_load_env_file
 import asyncio
 from typing import List
+from .disconnect import intentional_disconnect
+
+
 
 class MusicPlayer(commands.Cog):
     def __init__(self, bot):
@@ -94,14 +97,13 @@ class MusicPlayer(commands.Cog):
                 return
 
         try:
-            with youtube_dl.YoutubeDL(self.youtube_dl_options) as ydl:
-                info = ydl.extract_info(link, download=False)
+            info = await asyncio.to_thread(self.extract_info_from_ytdlp, link)
 
-                url = next((f['url'] for f in info['formats'] if f.get('acodec') and f['acodec'] != 'none'), None)
-                if url is None:
-                    url = next((f['url'] for f in info['formats'] if 'audio' in f['ext']), None)
+            url = next((f['url'] for f in info['formats'] if f.get('acodec') and f['acodec'] != 'none'), None)
+            if url is None:
+                url = next((f['url'] for f in info['formats'] if 'audio' in f['ext']), None)
 
-                title = info.get("title", "Unknown Song")
+            title = info.get("title", "Unknown Song")
 
             if url is None:
                 await self.send_message(ctx, "Could not find a playable audio format.")
@@ -116,6 +118,10 @@ class MusicPlayer(commands.Cog):
             await self.send_message(ctx, f"An error occurred while trying to play the song: {str(e)}")
             print(f"Error: {e}")
 
+
+    def extract_info_from_ytdlp(self, link):
+        with youtube_dl.YoutubeDL(self.youtube_dl_options) as ydl:
+            return ydl.extract_info(link, download=False)
 
 
 
@@ -136,6 +142,11 @@ class MusicPlayer(commands.Cog):
     async def play_next_in_queue(self, ctx, voice_channel, config):
         guild_id = ctx.guild.id
 
+        global intentional_disconnect
+        if intentional_disconnect:
+            return
+
+        # Check if the music queue is empty
         if guild_id not in self.music_queue or not self.music_queue[guild_id]:
             await self.send_message(ctx, "The queue is empty.")
             self.now_playing[guild_id] = None
@@ -152,10 +163,15 @@ class MusicPlayer(commands.Cog):
             check_and_load_env_file()
             ffmpeg_path = os.getenv('FFMPEG_PATH')
 
-            FFMPEG_OPTIONS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5','options': '-vn'}
-            vc.play(discord.FFmpegPCMAudio(source=url, executable=ffmpeg_path, **FFMPEG_OPTIONS), after=lambda e: self.bot.loop.create_task(self.play_next_in_queue(ctx, voice_channel, config)))
+            FFMPEG_OPTIONS = {
+                'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                'options': '-vn'
+            }
 
-            await self.send_message(ctx, f"Now playing: {title}")  # Use the updated send_message method
+            vc.play(discord.FFmpegPCMAudio(source=url, executable=ffmpeg_path, **FFMPEG_OPTIONS),
+                    after=lambda e: self.bot.loop.create_task(self.play_next_in_queue(ctx, voice_channel, config)))
+
+            await self.send_message(ctx, f"Now playing: {title}")
             self.now_playing[guild_id] = title
         except Exception as e:
             await self.send_message(ctx, f"An error occurred while trying to play the next song: {str(e)}")
@@ -163,15 +179,23 @@ class MusicPlayer(commands.Cog):
             await self.handle_playback_error(ctx, voice_channel, config)
 
 
+
+
     async def handle_playback_error(self, ctx, voice_channel, config):
-        guild_id = ctx.guild.id
+        global intentional_disconnect 
+
+        # Check if the disconnect was intentional
+        if intentional_disconnect:
+            intentional_disconnect = False
+            return  
+
         await ctx.send("An error occurred during playback. Attempting to play the next song...")
-        
+
         if ctx.guild.voice_client:
             await ctx.guild.voice_client.disconnect()
-        
+
         await asyncio.sleep(2)
-        
+
         try:
             await voice_channel.connect()
         except Exception as e:
@@ -179,6 +203,7 @@ class MusicPlayer(commands.Cog):
             return
 
         await self.play_next_in_queue(ctx, voice_channel, config)
+
 
     async def handle_playlist(self, ctx, voice_channel, link, config):
         guild_id = ctx.guild.id

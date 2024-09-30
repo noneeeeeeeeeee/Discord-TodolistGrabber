@@ -7,13 +7,17 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
     
     config_data = {
         "DefaultAdmin": default_admin_role_id,
+        " ": None,
+        " ": "NoticeboardUpdateConfig",
+        " ": None,
+        "DefaultRoleId": default_role_id,
         "NoticeBoardChannelId": "Default",
         "NoticeBoardUpdateInterval": None,
-
-        "DefaultRoleId": default_role_id,
         "PingRoleId": default_ping_role_id,
         "PingDailyTime": "15:00",
-
+        " ": None,
+        " ": "MusicConfig",
+        " ": None,
         "MusicEnabled": False,
         "MusicDJRole": music_dj_role,
         "MusicDJRoleRequired": True,
@@ -22,6 +26,13 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
         "MusicQueueLimitEnabled": True,
         "MusicPlayerStick": True,
         "TrackMaxDuration": 600,
+        "AutoRemoveNonSongs": True,
+        " ": None,
+        " ": "Google Classroom Config",
+        " ": None,
+        "GoogleClassroomEnabled": False,
+        "DefaultChannelId": "Default",
+        " ": None,
     }
     
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")

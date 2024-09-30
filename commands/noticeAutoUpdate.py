@@ -136,11 +136,12 @@ class NoticeAutoUpdate(commands.Cog):
             ping_window_end = next_ping_time + timedelta(minutes=5)
     
             if guild_id in self.ping_sent_today and self.ping_sent_today[guild_id] == today:
+                print(f"Already sent ping message today for guild {guild_id}.")
                 continue
             
             if ping_window_start <= current_time <= ping_window_end:
                 ping_role = config.get("PingRoleId", "NotSet")
-    
+                print(f"Sending ping message for guild {guild_id}.")
                 if guild_id in self.sent_message_ids and 'ping' in self.sent_message_ids[guild_id]:
                     ping_message_id = self.sent_message_ids[guild_id]['ping']
                     try:
