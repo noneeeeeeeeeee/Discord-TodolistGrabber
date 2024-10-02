@@ -12,20 +12,18 @@ class Seek(commands.Cog):
         voice_client = ctx.guild.voice_client
         music_player = self.bot.get_cog("MusicPlayer")
 
+        # Check if something is playing and song info exists
         if voice_client and voice_client.is_playing() and music_player and music_player.now_playing.get(ctx.guild.id):
             try:
-                # Access the current song info directly from now_playing
+                # Get the current song's info
                 current_song_info = music_player.now_playing[ctx.guild.id]
-                print(f"Current song info: {current_song_info}")  # Debugging line
-
-                # Validate the structure (this check might be redundant now)
                 if len(current_song_info) != 3:
                     await ctx.send(":x: Unable to get current song information. Invalid structure.")
                     return
 
                 song_url, song_title, song_duration = current_song_info
 
-                # Parse the time string
+                # Parse the time string for HH:MM:SS or MM:SS formats
                 if match := re.match(r"(?:(\d+):)?(\d+):(\d+)", time):
                     hours, minutes, seconds = match.groups()
                     hours = int(hours) if hours else 0
@@ -33,19 +31,31 @@ class Seek(commands.Cog):
                     seconds = int(seconds)
                     new_time = hours * 3600 + minutes * 60 + seconds
 
-                    # Check if the new time is within the song's duration
+                    # Check if the seek time is valid within the song's duration
                     if 0 <= new_time <= song_duration:
-                        voice_client.source.pause()  # Pause while seeking
-                        voice_client.source.seek(new_time)
-                        voice_client.source.resume()
-                        await ctx.send(f":fast_forward: Seeked to {time}.")
+                        # Pause the current song to prevent skipping
+                        voice_client.pause()
+
+                        # Use FFmpeg to seek to the new time
+                        ffmpeg_options = {
+                            'before_options': f'-ss {new_time} -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                            'options': '-vn'
+                        }
+
+                        # Restart the current song from the new seek time
+                        source = discord.FFmpegPCMAudio(song_url, **ffmpeg_options)
+
+                        # Clear the after callback to prevent skipping to the next song in the queue
+                        voice_client.play(source, after=None)
+
+                        await ctx.send(f":fast_forward: Seeked to {time} in **{song_title}**.")
                     else:
                         await ctx.send(":x: Invalid seek time. It's outside the song's duration.")
                 else:
                     await ctx.send(":x: Invalid time format. Use HH:MM:SS or MM:SS")
 
             except Exception as e:
-                await ctx.send(":x: Unable to get current song information. Please try again.")
+                await ctx.send(":x: Unable to seek in the current song. Please try again.")
                 print(f"Seek error: {str(e)}")
         else:
             await ctx.send(":x: Nothing is currently playing.")
