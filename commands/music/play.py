@@ -130,11 +130,20 @@ class MusicPlayer(commands.Cog):
                     return
     
             self.music_queue[guild_id].append((url, title, duration))
-            await self.send_message(ctx_or_interaction, f"Added {title} to the queue.")
+            await self.send_message(ctx_or_interaction, f"Added **{title}** to the queue.")
     
             if not guild.voice_client.is_playing():
-                source = FFmpegPCMAudio(url)
-                guild.voice_client.play(source, after=lambda e: print(f"Player error: {e}") if e else None)
+                guild.voice_client.play(
+                    FFmpegPCMAudio(url, executable=config.get("FFmpegPath", "ffmpeg")),
+                    after=lambda e: print(f"Player error: {e}") if e else None
+                )
+                embed = discord.Embed(
+                    title="Now Playing",
+                    description=f"[{title}]({url})",
+                    color=discord.Color.green()
+                )
+                embed.set_footer(text=f"Requested by {author.display_name}", icon_url=author.avatar.url)
+                await self.send_message(ctx_or_interaction, embed=embed)
     
         except youtube_dl.utils.DownloadError as e:
             await self.send_message(ctx_or_interaction, f"Could not download the song: {e}")
@@ -143,8 +152,6 @@ class MusicPlayer(commands.Cog):
             await self.send_message(ctx_or_interaction, f"An error occurred: {e}")
             print(f"General error in play_song_or_link: {e}")
     
-
-
 
 
     async def play_link(self, interaction, voice_channel, link, config):
@@ -160,7 +167,7 @@ class MusicPlayer(commands.Cog):
                 await ctx_or_interaction.send(embed=embed)
             else:
                 await ctx_or_interaction.send(message)
-        else:  # For discord.Interaction
+        else:
             if not ctx_or_interaction.response.is_done():
                 if embed:
                     await ctx_or_interaction.response.send_message(embed=embed)
@@ -179,12 +186,9 @@ class MusicPlayer(commands.Cog):
         with youtube_dl.YoutubeDL(self.youtube_dl_options) as ydl:
             info = ydl.extract_info(url, download=False)
 
-            # Ensure info contains formats
             if 'formats' not in info:
-                return None  # or handle this case as needed
-
-            return info  # This should return the full info dictionary
-
+                return None 
+            return info
 
     
     
@@ -194,23 +198,19 @@ class MusicPlayer(commands.Cog):
     async def play_next_in_queue(self, ctx, voice_channel, config):
         guild_id = ctx.guild.id
 
-        # Check if there are songs in the queue
         if guild_id not in self.music_queue or not self.music_queue[guild_id]:
             await self.send_message(ctx, "The queue is empty.")
             self.now_playing.pop(guild_id, None)
             return
 
-        # Get the next song from the queue
         url, title, duration = self.music_queue[guild_id].pop(0)
 
         try:
-            # Connect to the voice channel if not already connected
             if ctx.voice_client is None:
                 await voice_channel.connect()
             else:
                 await ctx.voice_client.move_to(voice_channel)
 
-            # Play the next song using play_song_or_link
             await self.play_song_or_link(ctx, voice_channel, url, config)
 
         except Exception as e:
@@ -252,7 +252,6 @@ class MusicPlayer(commands.Cog):
                 break
 
             try:
-                # Skip private/unavailable videos
                 if entry is None or entry.get("title") in ["[Private video]", "[Deleted video]"]:
                     skipped_videos += 1
                     continue
@@ -273,7 +272,6 @@ class MusicPlayer(commands.Cog):
                     print(f"Skipped video with no URL: {entry}")
 
             except Exception as e:
-                # Log the error but continue to the next entry
                 print(f"Error adding video to queue: {e}")
                 skipped_videos += 1
                 continue
