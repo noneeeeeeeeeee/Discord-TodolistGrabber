@@ -37,7 +37,7 @@ class Ping(commands.Cog):
     async def ping_error(self, ctx, error):
         if isinstance(error, commands.CommandOnCooldown):
             retry_after = round(error.retry_after, 1)
-            await ctx.send(f":hourglass: Please wait {retry_after} seconds before using the `ping` command again.")
+            await ctx.send(f":hourglass: Please wait {retry_after} seconds before using the `ping` command again.", time=5)
         else:
             await ctx.send(":x: An unexpected error occurred.")
 

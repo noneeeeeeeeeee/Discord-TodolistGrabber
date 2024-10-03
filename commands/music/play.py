@@ -8,6 +8,7 @@ import yt_dlp as youtube_dl
 from googleapiclient.discovery import build
 from modules.setconfig import check_guild_config_available, json_get
 from modules.enviromentfilegenerator import check_and_load_env_file
+from modules.readversion import read_current_version
 import asyncio
 from typing import List
 from .disconnect_state import DisconnectState
@@ -18,12 +19,12 @@ from .disconnect_state import DisconnectState
 class MusicPlayer(commands.Cog):
     def __init__(self, bot, disconnect_state: DisconnectState):
         self.bot = bot
-        self.disconnect_state = disconnect_state  
+        self.disconnect_state = disconnect_state
         self.music_queue = {}
         self.now_playing = {}
+        self.seek_flag = {} 
 
-        # Define yt-dlp options
-        self.youtube_dl_options = {
+        self.youtube_dl_options = { # type: ignore
             'format': 'bestaudio/best',
             'quiet': True,
             'postprocessors': [{
@@ -33,15 +34,9 @@ class MusicPlayer(commands.Cog):
             }]
         }
 
-
-
-
-
-        # Load YouTube Data API key from environment file
         check_and_load_env_file()
         self.youtube_api_key = os.getenv("YOUTUBE_API_KEY")
 
-        # Initialize YouTube Data API client
         self.youtube_service = build("youtube", "v3", developerKey=self.youtube_api_key)
 
     @commands.hybrid_command(name="play", aliases=["p"], description="Play a song or add to queue")
@@ -117,40 +112,54 @@ class MusicPlayer(commands.Cog):
             title = info.get("title", "Unknown Song")
             duration = info.get("duration", 0)
     
-            # Add to the music queue
+            # Set now_playing for the current guild
             guild_id = guild.id
+    
+            # Ensure the music queue is initialized for this guild
             if guild_id not in self.music_queue:
-                self.music_queue[guild_id] = []
+                self.music_queue[guild_id] = []  # Initialize the queue if it doesn't exist
     
-            if config.get("MusicQueueLimitEnabled", False) and len(self.music_queue[guild_id]) >= config["MusicQueueLimit"]:
-                if any(role.id == config["DefaultAdmin"] for role in author.roles):
-                    await self.send_message(ctx_or_interaction, "Bypassing queue limit as admin.")
-                else:
-                    await self.send_message(ctx_or_interaction, f"Queue limit reached! Only {config['MusicQueueLimit']} songs allowed.")
-                    return
+            # Check if a song is already playing
+            if guild.voice_client.is_playing():
+                # Add the song to the queue instead of playing it immediately
+                self.music_queue[guild_id].append((url, title, duration))
+                await self.send_message(ctx_or_interaction, f"Added **{title}** to the queue.")
+            else:
+                # If no song is playing, play this song
+                self.now_playing[guild_id] = (url, title, duration)
+                self.seek_flag[guild_id] = False  # Reset the seek flag
+                
+                def after_playing(error):
+                    if error:
+                        print(f"Player error: {error}")
+                    # Move to the next song if the seek flag is not set
+                    if not self.seek_flag.get(guild_id, False):
+                        asyncio.run_coroutine_threadsafe(self.play_next_in_queue(ctx_or_interaction, voice_channel, config), self.bot.loop)
     
-            self.music_queue[guild_id].append((url, title, duration))
-            await self.send_message(ctx_or_interaction, f"Added **{title}** to the queue.")
-    
-            if not guild.voice_client.is_playing():
                 guild.voice_client.play(
-                    FFmpegPCMAudio(url, executable=config.get("FFmpegPath", "ffmpeg")),
-                    after=lambda e: print(f"Player error: {e}") if e else None
+                    discord.FFmpegPCMAudio(url, executable=config.get("FFmpegPath", "ffmpeg")),
+                    after=after_playing
                 )
                 embed = discord.Embed(
                     title="Now Playing",
                     description=f"[{title}]({url})",
                     color=discord.Color.green()
                 )
-                embed.set_footer(text=f"Requested by {author.display_name}", icon_url=author.avatar.url)
+                embed.set_author(name=f"Requested by {author.display_name}", icon_url=author.avatar.url)
+                embed.set_footer(text=f"Bot Version: {read_current_version()}")
                 await self.send_message(ctx_or_interaction, embed=embed)
     
         except youtube_dl.utils.DownloadError as e:
             await self.send_message(ctx_or_interaction, f"Could not download the song: {e}")
             print(f"Download error: {e}")
         except Exception as e:
-            await self.send_message(ctx_or_interaction, f"An error occurred: {e}")
-            print(f"General error in play_song_or_link: {e}")
+            import traceback
+            error_trace = traceback.format_exc()
+            print(f"General error in play_song_or_link: {error_trace}")
+            await self.send_message(ctx_or_interaction, f"An error occurred: {str(e)}\nFull Traceback: ```{error_trace}```")
+    
+
+
     
 
 
@@ -198,24 +207,47 @@ class MusicPlayer(commands.Cog):
     async def play_next_in_queue(self, ctx, voice_channel, config):
         guild_id = ctx.guild.id
 
+        # Check if there are songs in the queue
         if guild_id not in self.music_queue or not self.music_queue[guild_id]:
             await self.send_message(ctx, "The queue is empty.")
             self.now_playing.pop(guild_id, None)
             return
 
+        # Get the next song from the queue
         url, title, duration = self.music_queue[guild_id].pop(0)
+        self.now_playing[guild_id] = (url, title, duration)  # Set now_playing
+
+        def after_playing(error):
+            if error:
+                print(f"Player error: {error}")
+            # Move to the next song after current finishes
+            asyncio.run_coroutine_threadsafe(self.play_next_in_queue(ctx, voice_channel, config), self.bot.loop)
 
         try:
+            # If not connected to a voice channel, connect
             if ctx.voice_client is None:
                 await voice_channel.connect()
             else:
                 await ctx.voice_client.move_to(voice_channel)
 
-            await self.play_song_or_link(ctx, voice_channel, url, config)
+            ctx.voice_client.play(
+                discord.FFmpegPCMAudio(url, executable=config.get("FFmpegPath", "ffmpeg")),
+                after=after_playing
+            )
+            embed = discord.Embed(
+                title="Now Playing",
+                description=f"[{title}]({url})",
+                color=discord.Color.green()
+            )
+            embed.set_footer(text=f"Now playing", icon_url=ctx.author.avatar.url)
+            await self.send_message(ctx, embed=embed)
 
         except Exception as e:
             await self.send_message(ctx, f"An error occurred while playing the song: {e}")
             print(f"Error in play_next_in_queue: {e}")
+
+    
+
 
 
 
@@ -247,6 +279,7 @@ class MusicPlayer(commands.Cog):
         playlist_add_limit = config.get("PlaylistAddLimit", 10)
 
         for entry in playlist_info["entries"]:
+            await ctx.send(f"Adding video: {entry.get('title', 'Unknown Title')}")
             if added_videos >= playlist_add_limit:
                 await ctx.reply(f"Playlist add limit reached. Only {playlist_add_limit} videos added.")
                 break
