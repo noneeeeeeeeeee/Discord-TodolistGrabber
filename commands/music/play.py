@@ -3,6 +3,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from discord.ui import Button, View
+from discord import FFmpegPCMAudio
 import yt_dlp as youtube_dl
 from googleapiclient.discovery import build
 from modules.setconfig import check_guild_config_available, json_get
@@ -24,13 +25,16 @@ class MusicPlayer(commands.Cog):
         # Define yt-dlp options
         self.youtube_dl_options = {
             'format': 'bestaudio/best',
+            'quiet': True,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3', 
+                'preferredcodec': 'mp3',  
                 'preferredquality': '192', 
-            }],
-            'quiet': True
+            }]
         }
+
+
+
 
 
         # Load YouTube Data API key from environment file
@@ -81,7 +85,6 @@ class MusicPlayer(commands.Cog):
         else:
             print(":x: Please provide a valid input. Example: !play <YouTube link, search query, or playlist> or !play search <search query>")
 
-
     async def play_song_or_link(self, ctx_or_interaction, voice_channel, link_or_url, config):
         if isinstance(ctx_or_interaction, commands.Context):
             guild = ctx_or_interaction.guild
@@ -89,85 +92,57 @@ class MusicPlayer(commands.Cog):
         else:
             guild = ctx_or_interaction.guild
             author = ctx_or_interaction.user
-
+    
         if guild.voice_client is None:
             await voice_channel.connect()
         else:
             await guild.voice_client.move_to(voice_channel)
-
+    
         try:
+            # Extract the info from yt-dlp
             info = await asyncio.to_thread(self.extract_info_from_ytdlp, link_or_url)
-
-            if info is None:
-                await self.send_message(ctx_or_interaction, "Failed to extract information.")
+    
+            if info is None or 'formats' not in info:
+                await self.send_message(ctx_or_interaction, "Failed to extract playable audio URL or no formats available.")
                 return
-
-            print(f"Extracted info: {info}") 
-
-            url = None
-            if 'formats' in info:
-                # 1. Prioritize formats with both audio and video codecs
-                url = next((f['url'] for f in info['formats'] 
-                            if f.get('acodec') and f.get('acodec') != 'none' 
-                            and f.get('vcodec') and f.get('vcodec') != 'none'), None)
-
-                if url is None:
-                    # 2. If no combined audio/video, try MP3
-                    url = next((f['url'] for f in info['formats'] if f.get('acodec') == 'mp3'), None)
-
-                if url is None:
-                    # 3. Try other common audio formats
-                    url = next((f['url'] for f in info['formats'] if f.get('ext') in ('m4a', 'webm', 'ogg', 'aac')), None)
-
-                if url is None:
-                    # 4. Fallback to any format with an audio codec
-                    url = next((f['url'] for f in info['formats'] if f.get('acodec') and f['acodec'] != 'none'), None)
-
-                if url is None: 
-                    # 5. Final fallback: Use the first available format
-                    url = info['formats'][0]['url']
-
-            # Check for common invalid URL patterns (refined)
-            if url is None or 'videoplayback' in url: 
-                await self.send_message(ctx_or_interaction, "Could not find a playable audio format or found an invalid format.")
+    
+            # Prioritize the highest quality audio format
+            url = next((f['url'] for f in sorted(info['formats'], key=lambda x: (x.get('abr') or 0), reverse=True)
+                         if f.get('acodec') and f['acodec'] != 'none'), None)
+    
+            if url is None:
+                await self.send_message(ctx_or_interaction, "Could not find a playable audio format.")
                 return
-
-
-            # Check for common invalid URL patterns
-            if url is None or 'videoplayback' in url:
-                await self.send_message(ctx_or_interaction, "Could not find a playable audio format or found an invalid format.")
-                return
-
+    
             title = info.get("title", "Unknown Song")
             duration = info.get("duration", 0)
-
+    
             # Add to the music queue
             guild_id = guild.id
             if guild_id not in self.music_queue:
                 self.music_queue[guild_id] = []
-
+    
             if config.get("MusicQueueLimitEnabled", False) and len(self.music_queue[guild_id]) >= config["MusicQueueLimit"]:
                 if any(role.id == config["DefaultAdmin"] for role in author.roles):
                     await self.send_message(ctx_or_interaction, "Bypassing queue limit as admin.")
                 else:
                     await self.send_message(ctx_or_interaction, f"Queue limit reached! Only {config['MusicQueueLimit']} songs allowed.")
                     return
-
+    
             self.music_queue[guild_id].append((url, title, duration))
             await self.send_message(ctx_or_interaction, f"Added {title} to the queue.")
-
+    
             if not guild.voice_client.is_playing():
-                await self.play_next_in_queue(ctx_or_interaction, voice_channel, config)
-
+                source = FFmpegPCMAudio(url)
+                guild.voice_client.play(source, after=lambda e: print(f"Player error: {e}") if e else None)
+    
         except youtube_dl.utils.DownloadError as e:
             await self.send_message(ctx_or_interaction, f"Could not download the song: {e}")
             print(f"Download error: {e}")
         except Exception as e:
             await self.send_message(ctx_or_interaction, f"An error occurred: {e}")
-            print(f"General error in play_song_or_link: {e}") 
+            print(f"General error in play_song_or_link: {e}")
     
-    
-
 
 
 
@@ -203,7 +178,17 @@ class MusicPlayer(commands.Cog):
     def extract_info_from_ytdlp(self, url):
         with youtube_dl.YoutubeDL(self.youtube_dl_options) as ydl:
             info = ydl.extract_info(url, download=False)
-            return info
+
+            # Ensure info contains formats
+            if 'formats' not in info:
+                return None  # or handle this case as needed
+
+            return info  # This should return the full info dictionary
+
+
+    
+    
+
 
 
     async def play_next_in_queue(self, ctx, voice_channel, config):
