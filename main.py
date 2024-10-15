@@ -17,7 +17,7 @@ class MyBot(commands.Bot):
     async def setup_hook(self):
         """Load cogs and sync commands."""
         await load_commands()
-        await self.tree.sync()  # Sync the slash commands with Discord
+        await self.tree.sync()
 
     async def on_message(self, message):
         """Override on_message to check if commands are enabled for the guild."""
@@ -41,13 +41,6 @@ class MyBot(commands.Bot):
                         return
 
         await self.process_commands(message)
-
-    async def enable_commands_for_guild(self, guild):
-        """Set a flag to enable commands for the guild after setup is complete."""
-        config_path = os.path.join(CONFIG_DIR, f"{guild.id}.json")
-        with open(config_path, 'w') as f:
-            json.dump({"commands_enabled": True}, f)
-        print(f"Commands enabled for guild {guild.id}")
 
 async def load_commands():
     """Load all cogs from the commands directory."""

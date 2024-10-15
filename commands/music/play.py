@@ -138,7 +138,7 @@ class MusicPlayer(commands.Cog):
             else:
                 # If no song is playing, play this song
                 self.now_playing[guild_id] = (url, title, duration)
-                self.seek_flag[guild_id] = False  # Reset the seek flag
+                self.seek_flag[guild_id] = False 
 
                 def after_playing(error):
                     if error:
@@ -223,22 +223,18 @@ class MusicPlayer(commands.Cog):
 
 
     async def play_next_in_queue(self, ctx, voice_channel, config):
-        global intentional_disconnect
-
-        if self.disconnect_state.is_intentional():
-            return
-    
         guild_id = ctx.guild.id
 
         # Check if the queue is empty
         if guild_id not in self.music_queue or not self.music_queue[guild_id]:
             await self.send_message(ctx, "The queue is empty.")
-            self.now_playing.pop(guild_id, None)
+            self.now_playing.pop(guild_id, None)  # Make sure to pop the now_playing variable
             return
 
         # Get the next song from the queue
         url, title, duration = self.music_queue[guild_id].pop(0)
         self.now_playing[guild_id] = (url, title, duration)
+        print(self.now_playing)
 
         def after_playing(error):
             if error:
@@ -248,25 +244,16 @@ class MusicPlayer(commands.Cog):
             asyncio.run_coroutine_threadsafe(self.play_next_in_queue(ctx, voice_channel, config), self.bot.loop)
 
         try:
-            # Connect to the voice channel if not already connected
             if ctx.voice_client is None:
                 await voice_channel.connect()
             else:
                 await ctx.voice_client.move_to(voice_channel)
 
-            # Optimized FFmpeg options for streaming
-            ffmpeg_options = {
-                'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-                'options': '-vn'  # Exclude video, only process audio
-            }
-
-            # Play the audio stream with FFmpeg options
             ctx.voice_client.play(
-                discord.FFmpegPCMAudio(url, **ffmpeg_options, executable=config.get("FFmpegPath", "ffmpeg")),
+                discord.FFmpegPCMAudio(url, executable=config.get("FFmpegPath", "ffmpeg")),
                 after=after_playing
             )
 
-            # Send now-playing embed message
             embed = discord.Embed(
                 title="Now Playing",
                 description=f"[{title}]({url})",
@@ -275,11 +262,11 @@ class MusicPlayer(commands.Cog):
             await self.send_message(ctx, embed=embed)
 
         except Exception as e:
-            # Handle exceptions, particularly if audio is already playing
             if str(e) == "Already playing audio.":
                 return
             await self.send_message(ctx, f"An error occurred while playing the song: {e}")
             print(f"Error in play_next_in_queue: {e}")
+
 
     
     

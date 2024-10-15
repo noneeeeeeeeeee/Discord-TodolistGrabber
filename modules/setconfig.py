@@ -8,15 +8,17 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
     config_data = {
         "DefaultAdmin": default_admin_role_id,
         " ": None,
-        " ": "NoticeboardUpdateConfig",
+        "_comment2": "Noticeboard Config",
         " ": None,
         "DefaultRoleId": default_role_id,
         "NoticeBoardChannelId": "Default",
         "NoticeBoardUpdateInterval": None,
         "PingRoleId": default_ping_role_id,
         "PingDailyTime": "15:00",
+        "noticeboardEditID": None,
+        "pingmessageEditID": None,
         " ": None,
-        " ": "MusicConfig",
+        "_comment1": "Music Config",
         " ": None,
         "MusicEnabled": False,
         "MusicDJRole": music_dj_role,
@@ -28,9 +30,7 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
         "TrackMaxDuration": 600,
         "RemoveNonSongsUsingSponsorBlock": True,
         "PlaylistAddLimit": 10,
-        " ": None,
-        " ": "Google Classroom Config",
-        " ": None,
+        "_comment1": "Google Classroom Config",
         "GoogleClassroomEnabled": False,
         "DefaultChannelId": "Default",
         " ": None,
@@ -59,6 +59,24 @@ def edit_noticeboard_config(guild_id, noticeboard_channelid=None, noticeboard_up
     
     if PingDailyTime is not None:
         config_data["PingDailyTime"] = PingDailyTime
+    
+    with open(config_file_path, 'w') as config_file:
+        json.dump(config_data, config_file, indent=4)
+
+
+def edit_json_file(guild_id, key, value):
+    config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
+    config_file_path = os.path.join(config_dir, f"{guild_id}.json")
+    
+    if not os.path.exists(config_file_path):
+        raise FileNotFoundError(f"Config file for guild_id {guild_id} does not exist.")
+    
+    with open(config_file_path, 'r') as config_file:
+        config_data = json.load(config_file)
+    try:
+        config_data[key] = value
+    except KeyError:
+        raise KeyError(f"Key {key} does not exist in the config file.")
     
     with open(config_file_path, 'w') as config_file:
         json.dump(config_data, config_file, indent=4)

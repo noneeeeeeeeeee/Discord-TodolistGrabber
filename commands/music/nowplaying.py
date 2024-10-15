@@ -15,7 +15,16 @@ class NowPlaying(commands.Cog):
         if music_player:
             current_song = music_player.now_playing.get(guild_id)
             if current_song:
-                embed = discord.Embed(title="Now Playing", description=current_song, color=discord.Color.blue())
+                url, title, duration = current_song  # Unpack the tuple
+                
+
+                formatted_duration = f"{duration // 60}:{duration % 60:02d}"
+                
+                embed = discord.Embed(
+                    title="Now Playing",
+                    description=f"**Title:** {title}\n**Duration:** {formatted_duration}\n**URL:** {url}",
+                    color=discord.Color.blue()
+                )
                 embed.set_author(name="Media Player")
                 embed.set_footer(text=f"Bot version: {version}")
                 await ctx.send(embed=embed)
