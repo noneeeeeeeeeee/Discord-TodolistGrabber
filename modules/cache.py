@@ -9,7 +9,15 @@ def cache_data(weekSelect=None):
     data = fetch_api_data(weekSelect, True)
     cache_dir = os.path.join(os.path.dirname(__file__), '..', 'cache')
     os.makedirs(cache_dir, exist_ok=True)
-    data_dict = json.loads(data)
+    retry_count = 0
+    while retry_count < 3:
+        try:
+            data_dict = json.loads(data)
+            break
+        except json.JSONDecodeError:
+            retry_count += 1
+            if retry_count == 3:
+                raise
     apicalltime = data_dict["Status"][0]["apicalltime"]
 
     if 'GMT+7' in apicalltime:

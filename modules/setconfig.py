@@ -15,7 +15,7 @@ def create_default_config(guild_id, default_admin_role_id, default_role_id, defa
         "NoticeBoardUpdateInterval": None,
         "PingRoleId": default_ping_role_id,
         "PingDailyTime": "15:00",
-        "noticeboardEditID": None,
+        "noticeboardEditID": [],
         "pingmessageEditID": None,
         " ": None,
         "_comment1": "Music Config",
