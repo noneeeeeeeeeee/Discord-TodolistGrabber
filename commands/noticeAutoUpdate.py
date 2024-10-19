@@ -9,14 +9,17 @@ from modules.readversion import read_current_version
 
 class NoticeAutoUpdate(commands.Cog):
     def __init__(self, bot):
-           self.bot = bot
-           self.sent_message_ids = {}
-           self.first_start = True
-           self.ping_sent_today = {}
-           self.guild_update_info = {}
-           self.startup_ping_sent = {}  
-           self.update_noticeboard.start()
-           self.send_ping_message_loop.start()
+        self.bot = bot
+        self.sent_message_ids = {}
+        self.first_start = True
+        self.ping_sent_today = {}
+        self.guild_update_info = {}
+        self.startup_ping_sent = {}
+        self.ping_message_being_updated = {} 
+        self.ping_message_lock = asyncio.Lock() 
+        self.update_noticeboard.start()
+        self.send_ping_message_loop.start()
+
 
 
     @tasks.loop(hours=1)
@@ -28,10 +31,8 @@ class NoticeAutoUpdate(commands.Cog):
                 continue
 
             config = json_get(guild_id)
-            noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
-            noticeboard_update_interval = config.get("NoticeBoardUpdateInterval", 3600)
-            noticeboard_edit_id = config.get("noticeboardEditID", None)
             pingmessage_edit_id = config.get("pingmessageEditID", None)
+            noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
 
             if noticeboard_channel_id == "Default":
                 continue
@@ -40,76 +41,26 @@ class NoticeAutoUpdate(commands.Cog):
             if channel is None:
                 continue
 
-            # Adjust update interval
-            self.update_noticeboard.change_interval(seconds=noticeboard_update_interval)
-
-            next_update_time = self.get_next_update_time(noticeboard_update_interval)
-            next_ping_time = self.get_next_ping_time(config.get("PingDailyTime", "15:00"))
-            self.guild_update_info[guild_id] = {'next_update_time': next_update_time}
-
-            cache_data("all")
-            task_data_str = cache_read("all")
-
-            if not task_data_str:
-                await channel.send("Error: No task data found in the cache.")
+            # Check if the ping message is currently being updated by send_ping_message_loop
+            if self.ping_message_being_updated.get(guild_id, False):
+                print(f"Ping message for guild {guild_id} is being updated. Skipping edit for now.")
                 continue
 
+            # Try to edit the existing ping message
             try:
-                task_data = json.loads(task_data_str)
-            except json.JSONDecodeError:
-                await channel.send(f"Error: Unable to decode cached data. Raw data: {task_data_str}")
-                continue
+                ping_message = await channel.fetch_message(pingmessage_edit_id)
+                next_update_time = self.get_next_update_time(3600)
+                next_ping_time = self.get_next_ping_time(config.get("PingDailyTime", "15:00"))
 
-            if not isinstance(task_data, dict):
-                await channel.send(f"Error: Expected task data to be a dictionary but got {type(task_data)}. Raw data: {task_data_str}")
-                continue
+                await self.edit_with_retries(ping_message, content=f"# Daily Ping <@&{config.get('PingRoleId', 'NotSet')}>\n"
+                                                                   f"- Today's date: {today.strftime('%a, %d %b %Y')}\n"
+                                                                   f"- Next Refresh in: <t:{int(next_update_time.timestamp())}:R>\n"
+                                                                   f"- Next Ping in: <t:{int(next_ping_time.timestamp())}:R>\n"
+                                                                   f"- Last API call: 'Unknown'")
 
-            api_call_time = task_data.get("Status", [{}])[0].get("apicalltime", "Unknown")
-            self.guild_update_info[guild_id]['api_call_time'] = api_call_time
+            except discord.NotFound:
+                print(f"Ping message not found for guild {guild_id}, but skipping sending a new one since send_ping_message_loop handles that.")
 
-            # Create embeds
-            version = read_current_version()
-            notice_embed = self.create_notice_embed(task_data, version)
-            this_week_embed = self.create_weekly_embed(task_data, version, api_call_time)
-            due_tomorrow_embed = self.create_due_tomorrow_embed(task_data, version)
-
-            # Update noticeboard messages using array of IDs
-            if isinstance(noticeboard_edit_id, list) and len(noticeboard_edit_id) == 3:
-                try:
-                    notice_message = await channel.fetch_message(noticeboard_edit_id[0])
-                    this_week_message = await channel.fetch_message(noticeboard_edit_id[1])
-                    due_tomorrow_message = await channel.fetch_message(noticeboard_edit_id[2])
-
-                    # Edit messages with retries
-                    await self.edit_with_retries(notice_message, embed=notice_embed)
-                    await self.edit_with_retries(this_week_message, embed=this_week_embed)
-                    await self.edit_with_retries(due_tomorrow_message, embed=due_tomorrow_embed)
-                except discord.NotFound:
-                    print(f"One of the noticeboard messages was not found. Sending new messages.")
-                    await self.send_initial_messages(channel, notice_embed, this_week_embed, due_tomorrow_embed, guild_id)
-            else:
-                await self.send_initial_messages(channel, notice_embed, this_week_embed, due_tomorrow_embed, guild_id)
-
-            # Handle ping message updates with rate limit handling
-            if pingmessage_edit_id:
-                try:
-                    ping_message = await channel.fetch_message(pingmessage_edit_id)
-                    next_update_timestamp = int(next_update_time.timestamp())
-                    next_ping_timestamp = int(next_ping_time.timestamp())
-
-                    await self.edit_with_retries(ping_message, content=f"# Daily Ping <@&{config.get('PingRoleId', 'NotSet')}>\n"
-                                                                       f"- Today's date: {today.strftime('%a, %d %b %Y')}\n"
-                                                                       f"- Next Refresh in: <t:{next_update_timestamp}:R>\n"
-                                                                       f"- Next Ping in: <t:{next_ping_timestamp}:R>\n"
-                                                                       f"- Last API call: {api_call_time}")
-                except discord.NotFound:
-                    print(f"Ping message not found for guild {guild_id}, sending a new one.")
-                    ping_role = config.get("PingRoleId", "NotSet")
-                    new_ping_message = await self.send_ping_message(channel, ping_role, today, next_ping_time, next_update_time, api_call_time)
-                    self.sent_message_ids[guild_id]['ping'] = new_ping_message.id
-                    edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
-                except Exception as e:
-                    print(f"An error occurred while updating the ping message: {e}")
 
 
 
@@ -145,26 +96,42 @@ class NoticeAutoUpdate(commands.Cog):
             if noticeboard_channel_id == "Default":
                 continue
             
-            # Skip sending the ping if it was already sent during startup
-            if self.startup_ping_sent.get(guild_id, False):
-                print(f"Skipping ping message for guild {guild_id} since it was already sent during startup.")
-                # Only reset if the date has changed (i.e., it's a new day)
-                if self.ping_sent_today.get(guild_id) != today:
-                    self.startup_ping_sent[guild_id] = False  # Reset the flag for future loops
-                continue
-            
+            # Retrieve the channel object
             channel = guild.get_channel(int(noticeboard_channel_id))
-            next_ping_time = self.get_next_ping_time(ping_daily_time)
-    
-            # Check if the ping message was already sent today
-            if guild_id in self.ping_sent_today and self.ping_sent_today[guild_id] == today:
-                print(f"Already sent ping message today for guild {guild_id}.")
+            if channel is None:
+                print(f"Channel not found for guild {guild_id}.")
                 continue
             
-            # Send the ping message and update records
-            await self.send_or_update_ping_message(channel, guild_id)
-            self.ping_sent_today[guild_id] = today  # Track that ping was sent today
-            self.startup_ping_sent[guild_id] = True  # Set flag to avoid duplicate pings
+            # Skip if already sent
+            if self.ping_sent_today.get(guild_id) == today:
+                continue
+            
+            # Use the lock to prevent interference with update_noticeboard
+            async with self.ping_message_lock:
+                self.ping_message_being_updated[guild_id] = True
+    
+                try:
+                    # Ensure the guild_id exists in sent_message_ids
+                    if guild_id not in self.sent_message_ids:
+                        self.sent_message_ids[guild_id] = {}
+    
+                    # Delete the old ping message if it exists
+                    await self.delete_message_with_retries(channel, config.get("pingmessageEditID"))
+    
+                    # Send a new ping message
+                    new_ping_message = await self.send_ping_message(channel, config.get("PingRoleId", "NotSet"), today, self.get_next_ping_time(ping_daily_time), datetime.now() + timedelta(hours=1), "Unknown")
+    
+                    # Store the new message ID
+                    self.sent_message_ids[guild_id]['ping'] = new_ping_message.id
+                    edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
+                    self.ping_sent_today[guild_id] = today
+                    print(f"New ping message sent for guild {guild_id}, ID: {new_ping_message.id}")
+    
+                finally:
+                    self.ping_message_being_updated[guild_id] = False
+    
+
+
     
 
 
@@ -200,54 +167,6 @@ class NoticeAutoUpdate(commands.Cog):
     @send_ping_message_loop.before_loop
     async def before_send_ping_message_loop(self):
         await self.bot.wait_until_ready()
-        await self.send_initial_ping_message_on_startup()
-
-
-
-    async def send_initial_ping_message_on_startup(self):
-        print("Starting initial ping process.")
-        today = datetime.now().date()
-        for guild in self.bot.guilds:
-            guild_id = guild.id
-            config = json_get(guild_id)
-            ping_daily_time = config.get("PingDailyTime", "15:00")
-            noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
-            pingmessage_edit_id = config.get("pingmessageEditID", None)
-
-            if noticeboard_channel_id == "Default":
-                continue
-
-            channel = guild.get_channel(int(noticeboard_channel_id))
-            next_ping_time = self.get_next_ping_time(ping_daily_time)
-            api_call_time = self.guild_update_info.get(guild_id, {}).get('api_call_time', "Unknown")
-            next_update_time = self.guild_update_info.get(guild_id, {}).get('next_update_time', datetime.now() + timedelta(hours=1))
-
-            if pingmessage_edit_id:
-                print(f"Attempting to delete old ping message ID: {pingmessage_edit_id} for guild {guild_id}")
-                await self.delete_message_with_retries(channel, pingmessage_edit_id)
-
-            await asyncio.sleep(2)  # Allow for some delay
-
-            if guild_id not in self.ping_sent_today or self.ping_sent_today[guild_id] != today:
-                ping_role = config.get("PingRoleId", "NotSet")
-                print(f"Sending initial startup ping message for guild {guild_id}.")
-
-                try:
-                    ping_message = await self.send_ping_message(channel, ping_role, today, next_ping_time, next_update_time, api_call_time)
-                    self.sent_message_ids[guild_id] = {'ping': ping_message.id}
-                    self.ping_sent_today[guild_id] = today
-                    self.startup_ping_sent[guild_id] = True
-
-                    edit_json_file(guild_id, "pingmessageEditID", ping_message.id)
-                except discord.Forbidden:
-                    print(f"Bot does not have permission to send messages in channel {channel.id}.")
-                except Exception as e:
-                    print(f"An unexpected error occurred while sending the initial ping message: {e}")
-
-
-
-
-
 
 
     async def send_ping_message(self, channel, ping_role, today, next_ping_time, next_update_time, api_call_time):
