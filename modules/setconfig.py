@@ -104,8 +104,10 @@ def check_admin_role(guild_id, user_roles):
 def json_get(guild_id):
     config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")
-    
+    print(f"Looking for config file at: {config_file_path}")
     with open(config_file_path, 'r') as config_file:
         return json.load(config_file)
+
+
     
 
