@@ -171,12 +171,11 @@ class NoticeAutoUpdate(commands.Cog):
                     break  # Break on any other error
 
 
-
-
-
     @tasks.loop(minutes=10)
     async def send_ping_message_loop(self):
-        today = datetime.now().date()
+        now = datetime.now()
+        today = now.date()
+
         for guild in self.bot.guilds:
             guild_id = guild.id
             config = json_get(guild_id)
@@ -195,7 +194,14 @@ class NoticeAutoUpdate(commands.Cog):
             if self.ping_sent_today.get(guild_id) == today:
                 continue
 
-            # Use the lock to prevent interference with update_noticeboard
+            ping_time = datetime.strptime(ping_daily_time, "%H:%M").time()
+            ping_datetime = datetime.combine(today, ping_time)
+
+            # Check if the current time is within the -10 to +10 minute window around the PingDailyTime
+            time_diff = abs((now - ping_datetime).total_seconds() / 60)
+            if time_diff > 10 or self.first_start is not True: 
+                continue
+
             async with self.ping_message_lock:
                 self.ping_message_being_updated[guild_id] = True
 
@@ -204,21 +210,29 @@ class NoticeAutoUpdate(commands.Cog):
                         self.sent_message_ids[guild_id] = {}
 
                     pingmessage_edit_id = config.get("pingmessageEditID", None)
-                    next_update_time = datetime.now() + timedelta(seconds=config.get("NoticeBoardUpdateInterval", 3600))
+                    next_update_time = now + timedelta(seconds=config.get("NoticeBoardUpdateInterval", 3600))
                     api_call_time = self.guild_update_info.get(guild_id, {}).get('api_call_time', "Unknown")
-                    new_ping_message = await self.send_ping_message(channel, config.get("PingRoleId", "NotSet"), today, self.get_next_ping_time(ping_daily_time), next_update_time, api_call_time)
+                    
+                    # Send new ping message
+                    new_ping_message = await self.send_ping_message(
+                        channel,
+                        config.get("PingRoleId", "NotSet"),
+                        today,
+                        self.get_next_ping_time(ping_daily_time),
+                        next_update_time,
+                        api_call_time
+                    )
+                    
                     await asyncio.sleep(1)
-                    # If pingmessage_edit_id is None, send a new ping message
+
                     if pingmessage_edit_id is None:
                         print(f"No ping message ID for guild {guild_id}. Sending a new ping message.")
-                        # Store the new message ID
                         self.sent_message_ids[guild_id]['ping'] = new_ping_message.id
                         edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
                         self.ping_sent_today[guild_id] = today
                         print(f"New ping message sent for guild {guild_id}, ID: {new_ping_message.id}")
-
                     else:
-                        # If the ping message exists, delete it and resend
+                        # Delete the old ping message and resend the new one
                         await self.delete_message_with_retries(channel, pingmessage_edit_id)
                         self.sent_message_ids[guild_id]['ping'] = new_ping_message.id
                         edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
@@ -227,6 +241,7 @@ class NoticeAutoUpdate(commands.Cog):
 
                 finally:
                     self.ping_message_being_updated[guild_id] = False
+
 
     
 
