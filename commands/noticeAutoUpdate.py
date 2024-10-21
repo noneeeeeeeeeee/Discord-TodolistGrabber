@@ -356,7 +356,6 @@ class NoticeAutoUpdate(commands.Cog):
             if date == "Status" or not self.is_valid_date(date):
                 continue
 
-            # Parse the task date and calculate the difference in days
             task_date = datetime.strptime(date, "%A, %d-%m-%Y").date()
             days_until_due = (task_date - today).days
 
@@ -433,23 +432,23 @@ class NoticeAutoUpdate(commands.Cog):
         tomorrow = today + timedelta(days=1)
         next_due = None
         embed = discord.Embed(title="Assignments Due Tomorrow", color=discord.Color.orange())
-    
+
         for date, tasks in task_data.items():
-            if date == "Status" or date == "api-version":
+            if date in ["Status", "api-version", "unknown-due"]: 
                 continue
             try:
                 task_date = datetime.strptime(date, "%A, %d-%m-%Y")
             except ValueError:
                 print(f"Skipping invalid date format: {date}")
                 continue
-            
+
             if task_date.date() == tomorrow.date():
                 embed.set_author(name=f"Due on {tomorrow.strftime('%a, %d %b %Y')}")
                 self.add_task_fields(embed, tasks)
                 break
             elif task_date > tomorrow and next_due is None:
                 next_due = task_date, tasks
-    
+
         if not embed.fields:
             if next_due:
                 next_due_date, next_due_tasks = next_due
@@ -458,13 +457,10 @@ class NoticeAutoUpdate(commands.Cog):
                 self.add_task_fields(embed, next_due_tasks)
             else:
                 embed.description = "Nice! There are no assignments due tomorrow!"
-    
+
         embed.set_footer(text=f"Bot Version: {version}")
         return embed
-    
-    def format_discord_time(self, date_str):
-        date_obj = datetime.strptime(date_str, "%A, %d-%m-%Y")
-        return date_obj.strftime("%d %b %Y")
+
 
     async def send_initial_messages(self, channel, guild_id):
         try:
