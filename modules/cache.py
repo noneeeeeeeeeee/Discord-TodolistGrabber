@@ -127,37 +127,48 @@ def truncate_cache():
             return f'Failed to delete {file_path}. Reason: {e}'
     return "Cache truncated"
 
-def cache_read(weekSelect=None):
+import os
+import datetime
+
+def cache_read_latest(weekSelect=None):
     cache_dir = os.path.join(os.path.dirname(__file__), '..', 'cache')
     if not os.path.isdir(cache_dir):
         raise NotADirectoryError(f"{cache_dir} is not a valid directory.")
     
     latest_file = None
     latest_time = None
-    
+    today = datetime.datetime.now()
+
     for file in os.listdir(cache_dir):
-        date_part = None
         if weekSelect is None:
             if file.startswith("cache_") and file.endswith(".json") and "_week_" not in file:
-                date_part = file.split('_')[1:5]
+                date_part = file.split('_')[1:6]  # To get minute, hour, day, month, year
         else:
-            if file.startswith(f"cache_") and file.endswith(f"_week_{weekSelect}.json"):
-                date_part = file.split('_')[1:5]
+            if file.startswith("cache_") and file.endswith(f"_week_{weekSelect}.json"):
+                date_part = file.split('_')[1:6]
         
         if date_part:
+            # Construct the full datetime string
             datetime_str = '_'.join(date_part)
-            date_str = '_'.join(datetime_str.split('_')[1:4])
-            if date_str.endswith('.json'):
-                date_str = date_str[:-5]
+            time_str, day_str, month_str, year_str = datetime_str.split('_')[0:4]
             
-            file_date = datetime.datetime.strptime(date_str, "%d_%m_%Y")
-            if latest_time is None or file_date > latest_time:
-                latest_time = file_date
-                latest_file = file
+            # Combine all parts to form a valid datetime
+            file_datetime_str = f"{day_str}_{month_str}_{year_str} {time_str.replace('-', ':')}"
+            try:
+                file_date = datetime.datetime.strptime(file_datetime_str, "%d_%m_%Y %H:%M")
+                
+                # Check if this file is from today and is the latest one
+                if file_date.date() == today.date() and (latest_time is None or file_date > latest_time):
+                    latest_time = file_date
+                    latest_file = file
+            except ValueError:
+                print(f"Skipping invalid file name format: {file}")
+                continue
     
     if latest_file:
         with open(os.path.join(cache_dir, latest_file), 'r') as f:
             return f.read()
     else:
         return None
+
     

@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta
 import asyncio
 from modules.setconfig import json_get, check_guild_config_available, edit_json_file
-from modules.cache import cache_data, cache_read
+from modules.cache import cache_data, cache_read_latest
 from modules.readversion import read_current_version
 
 class NoticeAutoUpdate(commands.Cog):
@@ -53,7 +53,7 @@ class NoticeAutoUpdate(commands.Cog):
 
             # Fetch task data from the cache or another source
             cache_data("all")
-            task_data_str = cache_read("all")
+            task_data_str = cache_read_latest("all")
 
             if not task_data_str:
                 print("Error: No task data found in the cache.")
@@ -494,7 +494,7 @@ class NoticeAutoUpdate(commands.Cog):
         try:
             # Create the embeds
             version = read_current_version()
-            task_data_str = cache_read("all")
+            task_data_str = cache_read_latest("all")
             task_data = json.loads(task_data_str)
             notice_embed = self.create_notice_embed(task_data, version)
             this_week_embed = self.create_weekly_embed(task_data, version, datetime.now().strftime("%Y-%m-%d"))
