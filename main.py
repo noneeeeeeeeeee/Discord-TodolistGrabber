@@ -19,29 +19,6 @@ class MyBot(commands.Bot):
         await load_commands()
         await self.tree.sync()
 
-    async def on_message(self, message):
-        """Override on_message to check if commands are enabled for the guild."""
-        if message.author == self.user:
-            return 
-
-        guild_id = message.guild.id
-        config_path = os.path.join(CONFIG_DIR, f"{guild_id}.json")
-
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                status = json.load(f)
-                if not status.get("commands_enabled", True):
-                    if message.content.startswith(self.command_prefix):
-                        embed = discord.Embed(
-                            title="Setup Required",
-                            description="The bot is not set up yet. Please run `!setup` to configure it.",
-                            color=discord.Color.red()
-                        )
-                        await message.channel.send(embed=embed)
-                        return
-
-        await self.process_commands(message)
-
 async def load_commands():
     """Load all cogs from the commands directory."""
     commands_dir = os.path.join(os.path.dirname(__file__), 'commands')

@@ -22,15 +22,17 @@ class NoticeAutoUpdate(commands.Cog):
 
 
 
-    @tasks.loop(seconds=3600)  # default to 1 hour, or use the NoticeBoardUpdateInterval
+    @tasks.loop(seconds=3600) 
     async def update_noticeboard(self):
         today = datetime.now()
         for guild in self.bot.guilds:
             guild_id = guild.id
             try:
+                # Code is fundamentally flawd when inviting to multiple discord servers, as it will fight for the loop interval for the config
+                # todo: Fix this by making the interval 1 hour by default and check each config for the interval/time.
                 config = json_get(guild_id)
-                interval = config.get("NoticeBoardUpdateInterval", 3600)  # Get the update interval
-                self.update_noticeboard.change_interval(seconds=interval)  # Change the loop interval
+                interval = config.get("NoticeBoardUpdateInterval", 3600) 
+                self.update_noticeboard.change_interval(seconds=interval)  
                 pingmessage_edit_id = config.get("pingmessageEditID", None)
                 ping_role = config.get("PingRoleId", None)
             except Exception as e:
@@ -171,7 +173,7 @@ class NoticeAutoUpdate(commands.Cog):
                     break  # Break on any other error
 
 
-    @tasks.loop(minutes=10)
+    @tasks.loop(seconds=10)
     async def send_ping_message_loop(self):
         now = datetime.now()
         today = now.date()
@@ -192,9 +194,9 @@ class NoticeAutoUpdate(commands.Cog):
 
             # Skip if already sent today
             if self.ping_sent_today.get(guild_id) == today:
+                print("Ping already sent today for guild", guild_id, " for date ", self.ping_sent_today.get(guild_id))
                 continue
 
-            # Convert PingDailyTime to a datetime object
             ping_time = datetime.strptime(ping_daily_time, "%H:%M").time()
             ping_datetime = datetime.combine(today, ping_time)
 
@@ -202,15 +204,15 @@ class NoticeAutoUpdate(commands.Cog):
             if self.first_start:
                 await asyncio.sleep(5)
                 await self.handle_ping_message(channel, guild_id, today, ping_daily_time, now)
-                self.first_start = False  # Set to False after first start to prevent duplicate on next checks
-                continue  # Skip the time window logic for the first run
+                self.first_start = False  
+                continue 
 
-            # Check if the current time is within the -10 to +10 minute window around the PingDailyTime
+
             time_diff = abs((now - ping_datetime).total_seconds() / 60)
-            if time_diff > 10:  # Skip if we're outside the 10-minute window
+            print("Ping is being sent with the time difference", guild_id, " for date ", self.ping_sent_today.get(guild_id))
+            if time_diff > 10:  
                 continue
 
-            # Proceed to send the ping if within the time window
             await self.handle_ping_message(channel, guild_id, today, ping_daily_time, now)
 
     async def handle_ping_message(self, channel, guild_id, today, ping_daily_time, now):
@@ -243,16 +245,14 @@ class NoticeAutoUpdate(commands.Cog):
                     print(f"No ping message ID for guild {guild_id}. Sending a new ping message.")
                     self.sent_message_ids[guild_id]['ping'] = new_ping_message.id
                     edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
-                    self.ping_sent_today[guild_id] = today
                     print(f"New ping message sent for guild {guild_id}, ID: {new_ping_message.id}")
                 else:
-                    # Delete the old ping message and resend the new one
                     await self.delete_message_with_retries(channel, pingmessage_edit_id)
                     self.sent_message_ids[guild_id]['ping'] = new_ping_message.id
                     edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
-                    self.ping_sent_today[guild_id] = today
                     print(f"New ping message sent for guild {guild_id}, ID: {new_ping_message.id}")
             finally:
+                self.ping_sent_today[guild_id] = today
                 self.ping_message_being_updated[guild_id] = False
 
 
