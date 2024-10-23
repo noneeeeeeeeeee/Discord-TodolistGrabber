@@ -6,7 +6,6 @@ import time
 from modules.enviromentfilegenerator import check_and_load_env_file
 
 check_and_load_env_file()
-genai.configure(api_key=os.getenv('GeminiApiKey'))
 
 class AskGemini(commands.Cog):
     def __init__(self, bot):
@@ -70,4 +69,9 @@ class AskGemini(commands.Cog):
         await self.bot.tree.sync()
 
 async def setup(bot):
-    await bot.add_cog(AskGemini(bot))
+    try:
+        genai.configure(api_key=os.getenv('GeminiApiKey'))
+        await bot.add_cog(AskGemini(bot))
+        print("AskGemini cog loaded successfully.")
+    except Exception as e:
+        print(f"Failed to load AskGemini cog: {str(e)}. It will now be disabled")

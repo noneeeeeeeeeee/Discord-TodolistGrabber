@@ -41,8 +41,12 @@ class NoticeAutoUpdate(commands.Cog):
 
             noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
             noticeboard_edit_ids = config.get("noticeboardEditID", [])
+            interval = config.get("NoticeBoardUpdateInterval", 3600)
 
             if noticeboard_channel_id == "Default":
+                continue
+
+            if interval == None:
                 continue
 
             channel = guild.get_channel(int(noticeboard_channel_id))
@@ -183,8 +187,12 @@ class NoticeAutoUpdate(commands.Cog):
             config = json_get(guild_id)
             ping_daily_time = config.get("PingDailyTime", "15:00")
             noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
-
+            interval = config.get("NoticeBoardUpdateInterval", 3600)
+        
             if noticeboard_channel_id == "Default":
+                continue
+
+            if interval == None:
                 continue
 
             channel = guild.get_channel(int(noticeboard_channel_id))
@@ -209,10 +217,12 @@ class NoticeAutoUpdate(commands.Cog):
 
 
             time_diff = abs((now - ping_datetime).total_seconds() / 60)
-            print("Ping is being sent with the time difference", guild_id, " for date ", self.ping_sent_today.get(guild_id))
+            print("Ping check with the time difference", guild_id, " for date ", self.ping_sent_today.get(guild_id))
             if time_diff > 10:  
+                print("It is not time to send the ping message yet for guild", guild_id)
                 continue
-
+            
+            print("Sending ping message for guild", guild_id)
             await self.handle_ping_message(channel, guild_id, today, ping_daily_time, now)
 
     async def handle_ping_message(self, channel, guild_id, today, ping_daily_time, now):
@@ -226,7 +236,8 @@ class NoticeAutoUpdate(commands.Cog):
                     self.sent_message_ids[guild_id] = {}
 
                 pingmessage_edit_id = config.get("pingmessageEditID", None)
-                next_update_time = now + timedelta(seconds=config.get("NoticeBoardUpdateInterval", 3600))
+                interval = config.get("NoticeBoardUpdateInterval", 3600)
+                next_update_time = now + timedelta(seconds=interval)
                 api_call_time = self.guild_update_info.get(guild_id, {}).get('api_call_time', "Unknown")
 
                 # Send new ping message
