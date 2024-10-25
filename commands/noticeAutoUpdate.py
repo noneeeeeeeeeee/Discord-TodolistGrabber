@@ -173,10 +173,10 @@ class NoticeAutoUpdate(commands.Cog):
                     break  # Break on any other error
 
 
-    @tasks.loop(seconds=10)
+    @tasks.loop(minutes=10)
     async def send_ping_message_loop(self):
         now = datetime.now()
-        today = now.date()
+        today = now.date() - timedelta(days=1)
 
         for guild in self.bot.guilds:
             guild_id = guild.id
@@ -194,7 +194,6 @@ class NoticeAutoUpdate(commands.Cog):
 
             # Skip if already sent today
             if self.ping_sent_today.get(guild_id) == today:
-                print("Ping already sent today for guild", guild_id, " for date ", self.ping_sent_today.get(guild_id))
                 continue
 
             ping_time = datetime.strptime(ping_daily_time, "%H:%M").time()
@@ -209,7 +208,6 @@ class NoticeAutoUpdate(commands.Cog):
 
 
             time_diff = abs((now - ping_datetime).total_seconds() / 60)
-            print("Ping is being sent with the time difference", guild_id, " for date ", self.ping_sent_today.get(guild_id))
             if time_diff > 10:  
                 continue
 
@@ -245,12 +243,10 @@ class NoticeAutoUpdate(commands.Cog):
                     print(f"No ping message ID for guild {guild_id}. Sending a new ping message.")
                     self.sent_message_ids[guild_id]['ping'] = new_ping_message.id
                     edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
-                    print(f"New ping message sent for guild {guild_id}, ID: {new_ping_message.id}")
                 else:
                     await self.delete_message_with_retries(channel, pingmessage_edit_id)
                     self.sent_message_ids[guild_id]['ping'] = new_ping_message.id
                     edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
-                    print(f"New ping message sent for guild {guild_id}, ID: {new_ping_message.id}")
             finally:
                 self.ping_sent_today[guild_id] = today
                 self.ping_message_being_updated[guild_id] = False
