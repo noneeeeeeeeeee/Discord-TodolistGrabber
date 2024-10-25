@@ -271,13 +271,13 @@ class NoticeAutoUpdate(commands.Cog):
                 message = await channel.fetch_message(message_id)
                 await message.delete()
                 print(f"Successfully deleted message ID {message_id}.")
-                return  # Exit if successful
+                return  
             except discord.NotFound:
                 print(f"Message ID {message_id} not found for deletion. It may have already been deleted.")
-                return  # Exit if the message was not found
+                return  
             except discord.Forbidden:
                 print(f"Bot does not have permission to delete message ID {message_id}.")
-                return  # Exit if permissions are insufficient
+                return  
             except discord.HTTPException as e:
                 if e.status == 429: 
                     retry_after = e.retry_after or 60

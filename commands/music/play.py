@@ -149,7 +149,7 @@ class MusicPlayer(commands.Cog):
                 # Optimized FFmpeg options for streaming
                 ffmpeg_options = {
                     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-                    'options': '-vn'  # Ensure that no video is processed
+                    'options': '-vn' 
                 }
 
                 # Play the audio stream with FFmpeg options
@@ -228,7 +228,7 @@ class MusicPlayer(commands.Cog):
         # Check if the queue is empty
         if guild_id not in self.music_queue or not self.music_queue[guild_id]:
             await self.send_message(ctx, "The queue is empty.")
-            self.now_playing.pop(guild_id, None)  # Make sure to pop the now_playing variable
+            self.now_playing.pop(guild_id, None) 
             return
 
         # Get the next song from the queue
@@ -240,7 +240,6 @@ class MusicPlayer(commands.Cog):
             if error:
                 print(f"Player error: {error}")
                 asyncio.run_coroutine_threadsafe(ctx.send(":x: An error occurred while playing the song."), self.bot.loop)
-            # Move to the next song in the queue
             asyncio.run_coroutine_threadsafe(self.play_next_in_queue(ctx, voice_channel, config), self.bot.loop)
 
         try:
@@ -268,16 +267,6 @@ class MusicPlayer(commands.Cog):
             print(f"Error in play_next_in_queue: {e}")
 
 
-    
-    
-
-
-
-
-
-
-
-
     async def handle_playlist(self, ctx, voice_channel, playlist_url, config):
         global intentional_disconnect
 
@@ -302,7 +291,6 @@ class MusicPlayer(commands.Cog):
 
         youtube = self.youtube_service
 
-        # Fetch playlist items from YouTube
         try:
             playlist_videos = await self.fetch_playlist_items(youtube, playlist_id, max_results=config.get("PlaylistAddLimit", 50))
             total_videos = len(playlist_videos)
