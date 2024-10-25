@@ -49,10 +49,8 @@ bot = MyBot(command_prefix='!', intents=intents, help_command=None)
 async def on_ready():
     print(f'Logged in as {bot.user.name}')
 
-# Load environment variables from the .env file
-check_and_load_env_file()
+print(check_and_load_env_file())
 
-# Retrieve the bot token from the .env file
 bot_token = os.getenv('DiscordBotToken')
 
 if not bot_token:

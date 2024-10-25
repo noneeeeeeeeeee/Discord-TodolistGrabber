@@ -137,28 +137,33 @@ def cache_read_latest(weekSelect=None):
     
     latest_file = None
     latest_time = None
-    today = datetime.datetime.now()
 
     for file in os.listdir(cache_dir):
+        date_part = None  # Initialize date_part at the beginning of each iteration
+
         if weekSelect is None:
             if file.startswith("cache_") and file.endswith(".json") and "_week_" not in file:
                 date_part = file.split('_')[1:6]  # To get minute, hour, day, month, year
         else:
             if file.startswith("cache_") and file.endswith(f"_week_{weekSelect}.json"):
-                date_part = file.split('_')[1:6]
+                date_part = file.split('_')[1:6]  # To get minute, hour, day, month, year
         
-        if date_part:
-            # Construct the full datetime string
-            datetime_str = '_'.join(date_part)
-            time_str, day_str, month_str, year_str = datetime_str.split('_')[0:4]
-            
-            # Combine all parts to form a valid datetime
-            file_datetime_str = f"{day_str}_{month_str}_{year_str} {time_str.replace('-', ':')}"
+        if date_part:  # Only proceed if date_part is assigned
+            # Split Minutes-Hours manually
+            time_part = date_part[0].split('-')  # Split Minutes-Hours
+            minute_str = time_part[0]
+            hour_str = time_part[1]
+            day_str = date_part[1]
+            month_str = date_part[2]
+            year_str = date_part[3]
+
+            # Construct full datetime string
+            file_datetime_str = f"{day_str}_{month_str}_{year_str} {hour_str}:{minute_str}"
             try:
                 file_date = datetime.datetime.strptime(file_datetime_str, "%d_%m_%Y %H:%M")
-                
-                # Check if this file is from today and is the latest one
-                if file_date.date() == today.date() and (latest_time is None or file_date > latest_time):
+
+                # Check if this file is the latest
+                if latest_time is None or file_date > latest_time:
                     latest_time = file_date
                     latest_file = file
             except ValueError:
@@ -166,9 +171,8 @@ def cache_read_latest(weekSelect=None):
                 continue
     
     if latest_file:
+        # Return the latest file's content
         with open(os.path.join(cache_dir, latest_file), 'r') as f:
             return f.read()
     else:
         return None
-
-    

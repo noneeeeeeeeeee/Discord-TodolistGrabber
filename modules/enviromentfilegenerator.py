@@ -11,10 +11,9 @@ def check_and_load_env_file():
             "GeminiApiKey=YOUR_GEMINI_API_KEY\n"
             "FFMPEG_PATH=C:/ffmpeg/bin/ffmpeg.exe\n"
             "YOUTUBE_API_KEY=YOUR_YOUTUBE_API_KEY\n"
-            "MUSIXMATCH_API_KEY=YOUR_MUSIXMATCH_API_KEY\n"
         )
         with open(env_path, 'w') as env_file:
             env_file.write(example_env_content)
-            return "No .env file found. Creating one with example content."
+            return "No .env file found. A .env file has been generated for you with placeholder content. Please fill in all of it."
     return load_dotenv(env_path)
             
