@@ -151,15 +151,6 @@ class NoticeAutoUpdate(commands.Cog):
             edit_json_file(guild_id, "noticeboardEditID", new_message_ids)
             print(f"Updated noticeboardEditID for guild {guild_id} with new valid message IDs: {new_message_ids}")
 
-
-
-
-
-
-
-
-
-
     async def edit_with_retries(self, message, **kwargs):
         """Attempts to edit a message with retries for handling rate limits."""
         max_retries = 5
@@ -177,7 +168,7 @@ class NoticeAutoUpdate(commands.Cog):
                     break  # Break on any other error
 
 
-    @tasks.loop(minutes=1)
+    @tasks.loop(minutes=10)
     async def send_ping_message_loop(self):
         now = datetime.now()
         today = now.date()
