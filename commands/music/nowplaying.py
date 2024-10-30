@@ -22,7 +22,7 @@ class NowPlaying(commands.Cog):
                 
                 embed = discord.Embed(
                     title="Now Playing",
-                    description=f"**Title:** {title}\n**Duration:** {formatted_duration}\n**URL:** {url}",
+                    description=f"**Title:** {title}\n**Duration:** {formatted_duration}\n**URL:** Being Fixed",
                     color=discord.Color.blue()
                 )
                 embed.set_author(name="Media Player")

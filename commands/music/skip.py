@@ -23,7 +23,7 @@ class Skip(commands.Cog):
             guild_id = ctx.guild.id
             if guild_id in music_player.now_playing:
                 current_song_info = music_player.now_playing[guild_id]
-                await ctx.send(f"Now playing: **{current_song_info[1]}**")
+                # await ctx.send(f"Now playing: **{current_song_info[1]}**")
             else:
                 await ctx.send(":x: No more songs in the queue.")
 

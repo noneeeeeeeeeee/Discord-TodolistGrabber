@@ -43,7 +43,7 @@ class NoticeAutoUpdate(commands.Cog):
             noticeboard_edit_ids = config.get("noticeboardEditID", [])
             interval = config.get("NoticeBoardUpdateInterval", 3600)
 
-            if noticeboard_channel_id == "Default":
+            if noticeboard_channel_id == "Default" or noticeboard_channel_id is None:
                 continue
 
             if interval == None:

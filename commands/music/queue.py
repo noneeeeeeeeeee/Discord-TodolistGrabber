@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 from modules.setconfig import json_get
+import asyncio
 
 class MusicQueue(commands.Cog):
     def __init__(self, bot):
@@ -16,14 +17,88 @@ class MusicQueue(commands.Cog):
             return
 
         queue = music_player.music_queue[guild_id]
-        queue_list = "\n".join([f"{idx + 1}. {title} ({duration // 60}:{duration % 60:02})" for idx, (_, title, duration) in enumerate(queue)])
+        per_page = 5  # Number of songs per page
+        max_pages = (len(queue) - 1) // per_page + 1
+
+        # Initialize the pagination view
+        view = QueuePaginator(ctx, queue, per_page, max_pages)
+        await view.start()
+
+class QueuePaginator(discord.ui.View):
+    def __init__(self, ctx, queue, per_page, max_pages):
+        super().__init__(timeout=10)  # Timeout of 10 seconds
+        self.ctx = ctx
+        self.queue = queue
+        self.per_page = per_page
+        self.max_pages = max_pages
+        self.current_page = 0
+
+        # Disable buttons if there’s only one page
+        if self.max_pages <= 1:
+            for button in self.children:
+                button.disabled = True
+
+    async def start(self):
+        """Starts the paginator by sending the initial embed and setting up buttons."""
+        self.message = await self.ctx.send(embed=self.create_embed(), view=self)
+
+    def create_embed(self):
+        """Creates an embed for the current page."""
+        start_idx = self.current_page * self.per_page
+        end_idx = start_idx + self.per_page
+        page_queue = self.queue[start_idx:end_idx]
+
+        # Format the queue entries with clickable links
+        queue_list = "\n".join(
+            f"{idx + 1}. [{title}]({ogurl}) ({duration // 60}:{duration % 60:02})"
+            for idx, (url, ogurl, title, duration) in enumerate(page_queue, start=start_idx)
+        )
 
         embed = discord.Embed(
             title="Current Song Queue",
             description=queue_list,
             color=discord.Color.blue()
         )
-        await ctx.send(embed=embed)
+        embed.set_footer(text=f"Page {self.current_page + 1}/{self.max_pages}")
+        return embed
+
+    async def interaction_check(self, interaction):
+        """Ensures only the original user can interact with the buttons."""
+        return interaction.user == self.ctx.author
+
+    async def disable_buttons(self):
+        """Disable all buttons in the view."""
+        for button in self.children:
+            button.disabled = True
+        await self.message.edit(view=self)
+
+    async def on_timeout(self):
+        """Disables the buttons when the view times out."""
+        await self.disable_buttons()
+
+    # Button callbacks
+    @discord.ui.button(label="<<", style=discord.ButtonStyle.primary)
+    async def first_page(self, interaction, button):
+        self.current_page = 0
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    @discord.ui.button(label="<", style=discord.ButtonStyle.primary)
+    async def previous_page(self, interaction, button):
+        if self.current_page > 0:
+            self.current_page -= 1
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    @discord.ui.button(label=">", style=discord.ButtonStyle.primary)
+    async def next_page(self, interaction, button):
+        if self.current_page < self.max_pages - 1:
+            self.current_page += 1
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    @discord.ui.button(label=">>", style=discord.ButtonStyle.primary)
+    async def last_page(self, interaction, button):
+        self.current_page = self.max_pages - 1
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
 
 async def setup(bot):
     await bot.add_cog(MusicQueue(bot))
