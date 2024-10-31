@@ -1,7 +1,6 @@
 import discord
 from discord.ext import commands
-from modules.setconfig import json_get
-import asyncio
+from modules.readversion import read_current_version
 
 class MusicQueue(commands.Cog):
     def __init__(self, bot):
@@ -33,10 +32,7 @@ class QueuePaginator(discord.ui.View):
         self.max_pages = max_pages
         self.current_page = 0
 
-        # Disable buttons if there’s only one page
-        if self.max_pages <= 1:
-            for button in self.children:
-                button.disabled = True
+        self.update_buttons()
 
     async def start(self):
         """Starts the paginator by sending the initial embed and setting up buttons."""
@@ -53,13 +49,13 @@ class QueuePaginator(discord.ui.View):
             f"{idx + 1}. [{title}]({ogurl}) ({duration // 60}:{duration % 60:02})"
             for idx, (url, ogurl, title, duration) in enumerate(page_queue, start=start_idx)
         )
-
         embed = discord.Embed(
             title="Current Song Queue",
             description=queue_list,
             color=discord.Color.blue()
         )
-        embed.set_footer(text=f"Page {self.current_page + 1}/{self.max_pages}")
+        embed.set_author(name=f"Page {self.current_page + 1}/{self.max_pages}")
+        embed.set_footer(text=f"Bot Version: {read_current_version()}")
         return embed
 
     async def interaction_check(self, interaction):
@@ -76,29 +72,39 @@ class QueuePaginator(discord.ui.View):
         """Disables the buttons when the view times out."""
         await self.disable_buttons()
 
+    def update_buttons(self):
+        """Update the state of the buttons based on the current page."""
+        self.first_page.disabled = self.current_page == 0
+        self.previous_page.disabled = self.current_page == 0
+        self.next_page.disabled = self.current_page == self.max_pages - 1
+        self.last_page.disabled = self.current_page == self.max_pages - 1
+
     # Button callbacks
     @discord.ui.button(label="<<", style=discord.ButtonStyle.primary)
     async def first_page(self, interaction, button):
         self.current_page = 0
+        self.update_buttons()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
     @discord.ui.button(label="<", style=discord.ButtonStyle.primary)
     async def previous_page(self, interaction, button):
         if self.current_page > 0:
             self.current_page -= 1
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
     @discord.ui.button(label=">", style=discord.ButtonStyle.primary)
     async def next_page(self, interaction, button):
         if self.current_page < self.max_pages - 1:
             self.current_page += 1
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
     @discord.ui.button(label=">>", style=discord.ButtonStyle.primary)
     async def last_page(self, interaction, button):
         self.current_page = self.max_pages - 1
+        self.update_buttons()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
-
 
 async def setup(bot):
     await bot.add_cog(MusicQueue(bot))

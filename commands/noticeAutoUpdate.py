@@ -334,42 +334,45 @@ class NoticeAutoUpdate(commands.Cog):
             return False
 
     def create_weekly_embed(self, task_data, version, api_call_time):
-        today = datetime.now().date()  # Get today's date
-        week_start = today - timedelta(days=today.weekday())  # Start of the week
-        week_end = week_start + timedelta(days=6)  # End of the week
+        today = datetime.now().date()
+        week_start = today - timedelta(days=today.weekday()) 
+        week_end = week_start + timedelta(days=6)  
         embed = discord.Embed(title="This Week's Assignments", color=discord.Color.green())
         embed.set_author(name=f"{week_start.strftime('%d %b %Y')} to {week_end.strftime('%d %b %Y')}")
         tasks_found = False
-
+    
         for date, tasks in task_data.items():
             if date == "Status" or not self.is_valid_date(date):
                 continue
-
+            
             task_date = datetime.strptime(date, "%A, %d-%m-%Y").date()
-            days_until_due = (task_date - today).days
+    
+            # Only include tasks within the current week
+            if week_start <= task_date <= week_end:
+                days_until_due = (task_date - today).days
+    
+                task_datetime = datetime.combine(task_date, datetime.min.time())
+                discord_timestamp = f"<t:{int(task_datetime.timestamp())}:R>" 
+    
+                # Determine the due in format
+                due_in = f"Due in {days_until_due} day" if days_until_due == 1 else f"Due in {days_until_due} days"
+    
+                formatted_date = task_date.strftime('%d %b %Y')
+                task_list = [f"{idx}. {task['subject']} [{task['task']}] - {task['description']}" for idx, task in enumerate(tasks, start=1)]
+    
 
-            # Convert date to datetime for timestamp calculation
-            task_datetime = datetime.combine(task_date, datetime.min.time())
-            discord_timestamp = f"<t:{int(task_datetime.timestamp())}:R>"  # Use the combined datetime to get the timestamp
-
-            # Determine the due in format
-            due_in = f"Due in {days_until_due} day" if days_until_due == 1 else f"Due in {days_until_due} days"
-
-            formatted_date = task_date.strftime('%d %b %Y')
-            task_list = [f"{idx}. {task['subject']} [{task['task']}] - {task['description']}" for idx, task in enumerate(tasks, start=1)]
-
-            # Display the date along with due information
-            if days_until_due >= 0:
-                embed.add_field(name=f"{formatted_date} ({due_in})", value="\n".join(task_list), inline=False)
-            else:
-                embed.add_field(name=formatted_date, value="\n".join(task_list), inline=False)
-
-            tasks_found = True
-
+                if days_until_due >= 0:
+                    embed.add_field(name=f"{formatted_date} ({due_in})", value="\n".join(task_list), inline=False)
+                else:
+                    embed.add_field(name=formatted_date, value="\n".join(task_list), inline=False)
+    
+                tasks_found = True
+    
         if not tasks_found:
             embed.description = "No Assignments this week! 🎉"
         embed.set_footer(text=f"Bot Version: {version}")
         return embed
+    
 
     def create_notice_embed(self, task_data, version):
         embed = discord.Embed(title="Notice Board", description="Tasks you have to do", color=discord.Color.blue())

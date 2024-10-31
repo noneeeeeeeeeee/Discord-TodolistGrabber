@@ -8,10 +8,10 @@ class NoticeBoard(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command()
-    async def noticeboard(self, ctx, action: str = None, field: str = None):
+    @commands.command(name="noticeboard")
+    async def noticeboard_name(self, ctx, action: str = None, field: str = None):
         guild_id = ctx.guild.id
-        user_id = ctx.author.id
+        # user_id = ctx.author.id
 
         user_roles = [role.id for role in ctx.author.roles]
 
@@ -23,13 +23,11 @@ class NoticeBoard(commands.Cog):
             await ctx.send("You do not have permission to modify the noticeboard settings.")
             return
 
-        # Normalize action and field (case and space insensitive)
         if action:
             action = action.strip().lower()
         if field:
             field = field.strip().lower()
 
-        # Display current configuration if no action or field is specified
         if not action or not field:
             json_file = json_get(guild_id)
             noticeboard_channel_id = json_file.get('NoticeBoardChannelId', 'Default')
@@ -59,14 +57,20 @@ class NoticeBoard(commands.Cog):
             embed.add_field(name="Daily Ping Time", value=config_data["PingDailyTime"], inline=False)
 
             async def update_callback(interaction):
-                await ctx.send("Updating noticeboard now...")
+                if interaction.user != ctx.author:
+                    await interaction.response.send_message("You are not authorized to use this button.", ephemeral=True)
+                    return
+                await interaction.response.send_message("Updating noticeboard now...", ephemeral=True, delete_after=10)
                 # Trigger the update manually
                 cog = self.bot.get_cog('NoticeAutoUpdate')
                 if cog:
                     await cog.update_noticeboard()
 
             async def delete_cache_callback(interaction):
-                await ctx.send("Deleting cache...")
+                if interaction.user != ctx.author:
+                    await interaction.response.send_message("You are not authorized to use this button.", ephemeral=True)
+                    return
+                await interaction.response.send_message("Deleting cache...", ephemeral=True, delete_after=10)
                 truncate_cache()  # Ensure this function deletes the cache files
 
             btnview = View(timeout=30)
@@ -76,6 +80,13 @@ class NoticeBoard(commands.Cog):
             delete_cache.callback = delete_cache_callback
             btnview.add_item(update_now)
             btnview.add_item(delete_cache)
+
+            async def on_timeout():
+                for item in btnview.children:
+                    item.disabled = True
+                await ctx.message.edit(view=btnview)
+
+            btnview.on_timeout = on_timeout
 
             await ctx.send(embed=embed, view=btnview)
             return
