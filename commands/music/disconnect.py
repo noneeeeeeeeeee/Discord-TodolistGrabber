@@ -1,29 +1,32 @@
 import discord
 from discord.ext import commands
 import asyncio
-from .disconnect_state import DisconnectState 
+from .disconnect_state import DisconnectState
+from .clearqueue import ClearQueue  # Import the ClearQueue cog
 
 class Disconnect(commands.Cog):
     def __init__(self, bot, disconnect_state: DisconnectState):
         self.bot = bot
         self.disconnect_task = {}
-        self.disconnect_state = disconnect_state 
+        self.disconnect_state = disconnect_state
 
     async def schedule_disconnect(self, ctx):
         """Schedules a disconnect after 5 minutes of inactivity."""
         await asyncio.sleep(300)
         if ctx.guild.voice_client and not ctx.guild.voice_client.is_playing():
-            self.disconnect_state.set_intentional() 
+            self.disconnect_state.set_intentional()
             await ctx.guild.voice_client.disconnect()
             await ctx.send(":wave: Disconnected due to inactivity.")
+            await self.clear_queue(ctx)  # Clear the queue
 
     @commands.command(name="disconnect", aliases=["dc"])
     async def disconnect(self, ctx):
         """Immediately disconnects the bot from the voice channel."""
         if ctx.guild.voice_client and ctx.guild.voice_client.is_connected():
-            self.disconnect_state.set_intentional()  
+            self.disconnect_state.set_intentional()
             await ctx.guild.voice_client.disconnect()
             await ctx.send(":wave: Disconnected from the voice channel.")
+            await self.clear_queue(ctx)  # Clear the queue
             # Cancel any active disconnect task
             if self.disconnect_task.get(ctx.guild.id):
                 self.disconnect_task[ctx.guild.id].cancel()
@@ -42,16 +45,23 @@ class Disconnect(commands.Cog):
                 await asyncio.sleep(180)  # Wait for 3 minutes
             if member.guild.voice_client and member.guild.voice_client.is_connected() and \
                     len(member.guild.voice_client.channel.members) == 1:
-                self.disconnect_state.set_intentional()  # Set intentional disconnect
+                self.disconnect_state.set_intentional()
                 await member.guild.voice_client.disconnect()
                 channel = member.guild.system_channel
                 if channel:
                     await channel.send(":wave: The bot has disconnected since the channel is empty.")
-    
+                await self.clear_queue(member.guild)  # Clear the queue
+
+    async def clear_queue(self, ctx):
+        """Clears the music queue."""
+        clear_queue_cog = self.bot.get_cog("ClearQueue")
+        if clear_queue_cog:
+            await clear_queue_cog.clear_queue(ctx)
+
     async def cog_command_error(self, ctx, error):
         """Handles errors that occur within the cog's commands."""
         await ctx.send(f"An error occurred: {str(error)}")
 
 async def setup(bot):
-    disconnect_state = DisconnectState()  
-    await bot.add_cog(Disconnect(bot, disconnect_state)) 
+    disconnect_state = DisconnectState()
+    await bot.add_cog(Disconnect(bot, disconnect_state))
