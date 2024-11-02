@@ -166,6 +166,7 @@ class NoticeAutoUpdate(commands.Cog):
                     print(f"Failed to edit message due to an error: {e}")
                     break 
 
+    @tasks.loop(seconds=3600)
     async def send_ping_message_loop(self):
         now = datetime.now()
         today = now.date()
