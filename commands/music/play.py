@@ -2,11 +2,11 @@ import asyncio
 import discord
 from discord.ext import commands
 from discord.ui import View, Button
-from modules.youtubefetch import YouTubeFetcher
+from modules.music.youtubefetch import YouTubeFetcher
 from modules.readversion import read_current_version
 from modules.setconfig import json_get, check_guild_config_available
+import yt_dlp as youtube_dl
 import urllib.parse
-import yt_dlp as youtube_dl  # Ensure youtube_dl is imported
 
 class MusicPlayer(commands.Cog):
     def __init__(self, bot):
@@ -76,14 +76,15 @@ class MusicPlayer(commands.Cog):
                 await self.send_message(ctx_or_interaction, ":x: No audio stream found for the provided link.")
                 return
             title = info.get('title', 'Unknown Title')
-            duration = info.get('duration', 0)  # This line can be removed if duration is not used
+            duration = info.get('duration', 0) 
             guild_id = guild.id
             self.music_queue.setdefault(guild_id, [])
-            self.music_queue[guild_id].append((url, ogurl, title, duration))
+            self.music_queue[guild_id].append((author, url, ogurl, title, duration))
+            print(f"Queue: {self.music_queue}")
             if guild.voice_client.is_playing():
                 await self.send_message(ctx_or_interaction, f"Added **{title}** to the queue.")
             else:
-                await self.play_song(ctx_or_interaction, guild.voice_client, url, ogurl, title, config, author)
+                await self.play_next_song(ctx_or_interaction, guild.voice_client, config, author)
         except youtube_dl.utils.DownloadError as e:
             await self.send_message(ctx_or_interaction, f"Download error: {e}")
             print(f"Download error: {e}")
@@ -116,32 +117,40 @@ class MusicPlayer(commands.Cog):
             await self.send_message(ctx_or_interaction, f":x: An error occurred: {error}")
 
         if self.music_queue[guild_id]:
-            next_url, ogurl, next_title, next_duration = self.music_queue[guild_id].pop(0)
+            next_song = self.music_queue[guild_id].pop(0)
+            author, next_url, ogurl, next_title, duration = next_song
             await self.play_song(ctx_or_interaction, guild.voice_client, next_url, ogurl, next_title, json_get(guild_id), ctx_or_interaction.author)
+        else:
+            await self.send_message(ctx_or_interaction, "The queue is now empty.")
 
-    async def play_next_in_queue(self, ctx, voice_channel, config):
-        guild_id = ctx.guild.id
+    async def play_next_song(self, ctx_or_interaction, voice_client, config, author):
+        guild_id = ctx_or_interaction.guild.id
 
+        # Check if there’s a song in the `now_playing` or if the queue has another song to play
         if guild_id not in self.music_queue or not self.music_queue[guild_id]:
             self.now_playing.pop(guild_id, None)
+            print("Queue is empty, nothing to play.")
             return
 
-        # Get the next song from the queue, now with ogurl
-        url, ogurl, title, duration = self.music_queue[guild_id].pop(0)
+        # Get the next song from the queue
+        next_song = self.music_queue[guild_id].pop(0) 
+        author, url, ogurl, title, duration = next_song
         self.now_playing[guild_id] = {
+            "requester": author,
             "url": url,
             "ogurl": ogurl,
             "title": title,
             "duration": duration
         }
-        print(self.now_playing)
 
         # Define the after_playing callback
         def after_playing(error):
             if error:
                 print(f"Player error: {error}")
-                asyncio.run_coroutine_threadsafe(ctx.send(":x: An error occurred while playing the song."), self.bot.loop)
-            asyncio.run_coroutine_threadsafe(self.play_next_in_queue(ctx, voice_channel, config), self.bot.loop)
+                asyncio.run_coroutine_threadsafe(ctx_or_interaction.send(":x: An error occurred while playing the song."), self.bot.loop)
+            else:
+                print("Song finished, moving to next in queue.")
+            asyncio.run_coroutine_threadsafe(self.play_next_song(ctx_or_interaction, voice_client, config, author), self.bot.loop)
 
         # Play the audio stream with FFmpeg options
         ffmpeg_options = {
@@ -149,12 +158,7 @@ class MusicPlayer(commands.Cog):
             'options': '-vn'
         }
 
-        if ctx.voice_client is None:
-            await voice_channel.connect()
-        else:
-            await ctx.voice_client.move_to(voice_channel)
-
-        ctx.voice_client.play(
+        voice_client.play(
             discord.FFmpegPCMAudio(url, **ffmpeg_options, executable=config.get("FFmpegPath", "ffmpeg")),
             after=after_playing
         )
@@ -164,42 +168,49 @@ class MusicPlayer(commands.Cog):
             description=f"[{title}]({ogurl})",
             color=discord.Color.green()
         )
-        embed.set_author(name=f"Requested by {ctx.author.display_name}", icon_url=ctx.author.avatar.url)
+        embed.set_author(name=f"Requested by {author.display_name}", icon_url=author.avatar.url)
         embed.set_footer(text=f"Bot Version: {read_current_version()}")
-        await self.send_message(ctx, embed=embed)
+        await self.send_message(ctx_or_interaction, embed=embed)
 
     async def handle_playlist(self, ctx, voice_channel, playlist_url, config):
         await ctx.reply(":hourglass: Adding playlist to the queue... Larger playlists may take longer to add. (Beta)")
-    
         guild_id = ctx.guild.id
         if guild_id not in self.music_queue:
             self.music_queue[guild_id] = []
-    
+
+        # Extract the author information
+        author = ctx.author if isinstance(ctx, commands.Context) else ctx.user
+
+        # Parse the playlist URL to extract the playlist ID
+        parsed_url = urllib.parse.urlparse(playlist_url)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        playlist_id = query_params.get("list", [None])[0]
+        if not playlist_id:
+            await ctx.send(":x: Invalid playlist URL. Could not extract the playlist ID.")
+            return
+
+        playlist_items = []
         try:
-            added_videos, skipped_videos = await self.youtube_fetcher.handle_playlist(
-                playlist_url=playlist_url,
-                music_queue=self.music_queue,
-                guild_id=guild_id,
-                max_duration=config.get("TrackMaxDuration", 360),
-                max_results=config.get("PlaylistAddLimit", 50)
-            )
-    
-            if skipped_videos > 0:
-                await ctx.send(f":white_check_mark: Added {added_videos} videos to the queue. Skipped {skipped_videos} videos due to errors.")
-            else:
-                await ctx.send(f":white_check_mark: Added {added_videos} videos to the queue.")
-    
-            if added_videos > 0:
-                # Ensure voice client is connected before checking playback status
-                if ctx.voice_client is None:
-                    await voice_channel.connect()
-    
-                if not ctx.voice_client.is_playing():
-                    await self.play_next_in_queue(ctx, voice_channel, config)
-    
+            playlist_items = await self.youtube_fetcher.fetch_playlist_items(playlist_id)
+            if not playlist_items:
+                await ctx.send("No videos found in the playlist.")
+                return
+
+            for item in playlist_items:
+                await self.youtube_fetcher.process_video_entry(item, self.music_queue, ctx.guild.id, config.get("TrackMaxDuration", 360), author)
+
+            await ctx.send(f"Added {len(playlist_items)} songs from the playlist to the queue.")
+
+            # Ensure the bot is connected to the voice channel
+            if not ctx.voice_client:
+                await voice_channel.connect()
+
+            # Check if the bot is playing
+            if not ctx.voice_client.is_playing():
+                await self.play_next_song(ctx, ctx.voice_client, config, author)
+
         except Exception as e:
             await ctx.send(f"An error occurred while retrieving the playlist: {str(e)}")
-    
     
 
     async def search_youtube(self, ctx, query, top_n=1):

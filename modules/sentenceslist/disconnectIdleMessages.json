@@ -1,0 +1,64 @@
+{
+  "bot_disconnected_by_user": [
+    {
+      "messages": [
+        "Disconnected from the voice channel.",
+        "Disconnected from the voice channel. Hope it wasn't something I said!",
+        "Disconnected. Guess I'll go take a nap now.",
+        "Disconnected. I'll be here if you need me again!",
+        "Disconnected. Time to catch up on some robot dreams.",
+        "Disconnected. Did I do something wrong?",
+        "Disconnected. I'll just be over here, recharging.",
+        "Disconnected. Don't worry, I'll be back!",
+        "Disconnected. I'll miss our chats.",
+        "Disconnected. I'll be waiting for your call.",
+        "Disconnected. Until next time, human!",
+        "Disconnected. I'll be here if you need me.",
+        "Disconnected. I'll be here, just a command away.",
+        "Disconnected. I'll be around if you need me.",
+        "Disconnected. Don't hesitate to call me back.",
+        "Disconnected. I'll be here, waiting for your next command.",
+        "Disconnected. I'll be here, ready when you are.",
+        "Disconnected. I'll be here, just say the word.",
+        "Disconnected. I'll be here, whenever you need me.",
+        "Disconnected. I'll be here, just let me know.",
+        "Disconnected. I'll be here, always ready.",
+        "Disconnected. I'll be here, just give me a shout."
+      ]
+    }
+  ],
+  "disconnected_by_inactivity": [
+    {
+      "messages": [
+        "Disconnected due to inactivity.",
+        "Disconnected due to inactivity. Guess I'll go into sleep mode.",
+        "Disconnected due to inactivity. Time for a quick nap.",
+        "Disconnected due to inactivity. I'll be here when you need me.",
+        "Disconnected due to inactivity. I'll just be over here, recharging.",
+        "Disconnected due to inactivity. I'll be waiting for your next song.",
+        "Disconnected due to inactivity. I'll be here, dreaming of tunes.",
+        "Disconnected due to inactivity. I'll be ready when you are.",
+        "Disconnected due to inactivity. I'll be here, just say the word.",
+        "Disconnected due to inactivity. I'll be here, waiting for your command.",
+        "Disconnected due to inactivity. I'll be here, whenever you're ready."
+      ]
+    }
+  ],
+  "disconnected_due_to_empty_channel": [
+    {
+      "messages": [
+        "The bot has disconnected since the channel is empty.",
+        "The bot has disconnected because the channel is empty. I'll be here if you need me.",
+        "The bot has disconnected because the channel is empty. I'll be waiting for your return.",
+        "The bot has disconnected because the channel is empty. I'll be here, ready when you are.",
+        "The bot has disconnected because the channel is empty. I'll be here, just say the word.",
+        "The bot has disconnected because the channel is empty. I'll be here, waiting for your command.",
+        "The bot has disconnected because the channel is empty. I'll be here, whenever you're ready.",
+        "The bot has disconnected because the channel is empty. I'll be here, just let me know.",
+        "The bot has disconnected because the channel is empty. I'll be here, always ready.",
+        "The bot has disconnected because the channel is empty. I'll be here, just give me a shout.",
+        "The bot has disconnected because the channel is empty. I'll be here, dreaming of tunes."
+      ]
+    }
+  ]
+}

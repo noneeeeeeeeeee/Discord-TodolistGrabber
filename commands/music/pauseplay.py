@@ -5,7 +5,7 @@ class PausePlay(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="pauseplay", aliases=["pause", "resume"])
+    @commands.command(name="pauseplay", aliases=["pause", "resume", "pp"])
     async def pause_play(self, ctx):
         """Toggles between pausing and resuming the current song."""
         voice_client = ctx.guild.voice_client

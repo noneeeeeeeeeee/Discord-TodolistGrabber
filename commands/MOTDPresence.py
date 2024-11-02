@@ -9,7 +9,7 @@ class MOTDPresence(commands.Cog):
         self.change_presence_task.start()
 
     def load_motd_list(self):
-        with open('modules/fun/MOTD_List.txt', 'r', encoding='utf-8') as f:
+        with open('modules/sentenceslist/MOTD_List.txt', 'r', encoding='utf-8') as f:
             motd_list = [line.strip() for line in f if line.strip()]
         return motd_list
 

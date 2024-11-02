@@ -4,3 +4,4 @@ requests
 google-generativeai
 PyNaCl
 yt-dlp
+isolate

@@ -14,11 +14,13 @@ class Seek(commands.Cog):
         if voice_client and (voice_client.is_playing() or voice_client.is_paused()) and music_player and music_player.now_playing.get(ctx.guild.id):
             try:
                 current_song_info = music_player.now_playing[ctx.guild.id]
-                if len(current_song_info) != 3:
+                if not all(key in current_song_info for key in ("url", "title", "duration")):
                     await ctx.send(":x: Unable to get current song information. Invalid structure.")
                     return
 
-                song_url, song_title, song_duration = current_song_info
+                song_url = current_song_info["url"]
+                song_title = current_song_info["title"]
+                song_duration = current_song_info["duration"]
 
                 match = re.match(r"(?:(\d+):)?(\d+):(\d+)", time)
                 if match:
@@ -46,7 +48,7 @@ class Seek(commands.Cog):
 
                         await ctx.send(f":fast_forward: Seeked to {time} in **{song_title}**.")
                     else:
-                        await ctx.send(":x: Invalid seek time. It's outside the song's duration.")
+                        await ctx.send(":x: Invalid time format. Use HH:MM:SS or MM:SS.")
                 else:
                     await ctx.send(":x: Invalid time format. Use HH:MM:SS or MM:SS")
 

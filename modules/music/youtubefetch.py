@@ -85,7 +85,7 @@ class YouTubeFetcher:
 
         return videos
 
-    async def process_video_entry(self, video, music_queue, guild_id, track_max_duration):
+    async def process_video_entry(self, video, music_queue, guild_id, track_max_duration, author):
         """Processes a single video entry and adds it to the music queue if it meets the criteria."""
         try:
             video_id = video["id"]
@@ -105,7 +105,7 @@ class YouTubeFetcher:
             duration = info.get('duration', 0)
 
             if audio_url and duration <= track_max_duration:
-                music_queue.setdefault(guild_id, []).append((audio_url, video_url, title, duration))
+                music_queue.setdefault(guild_id, []).append((author, audio_url, video_url, title, duration))
             else:
                 print(f"Skipped video: {title}, no audio URL found or duration exceeds limit.")
 

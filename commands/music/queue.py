@@ -11,7 +11,7 @@ class MusicQueue(commands.Cog):
         music_player = self.bot.get_cog("MusicPlayer")
         guild_id = ctx.guild.id
 
-        if guild_id not in music_player.music_queue or not music_player.music_queue[guild_id]:
+        if guild_id not in music_player.music_queue or not music_player.music_queue[guild_id] or music_player.now_playing.get(guild_id) is None:
             await ctx.send(":x: The queue is currently empty.")
             return
 
@@ -44,11 +44,22 @@ class QueuePaginator(discord.ui.View):
         end_idx = start_idx + self.per_page
         page_queue = self.queue[start_idx:end_idx]
 
-        # Format the queue entries with clickable links
-        queue_list = "\n".join(
+        music_player = self.ctx.bot.get_cog("MusicPlayer")
+        guild_id = self.ctx.guild.id
+        now_playing = music_player.now_playing.get(guild_id)
+
+        queue_list = ""
+        if now_playing:
+            title = now_playing['title']
+            duration = now_playing['duration']
+            ogurl = now_playing['ogurl']
+            queue_list += f"### :arrow_forward: [{title}]({ogurl}) ({duration // 60}:{duration % 60:02})\n"
+
+        queue_list += "\n".join(
             f"{idx + 1}. [{title}]({ogurl}) ({duration // 60}:{duration % 60:02})"
-            for idx, (url, ogurl, title, duration) in enumerate(page_queue, start=start_idx)
+            for idx, (author, url, ogurl, title, duration) in enumerate(page_queue, start=start_idx)
         )
+
         embed = discord.Embed(
             title="Current Song Queue",
             description=queue_list,
