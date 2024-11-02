@@ -12,7 +12,6 @@ class NoticeAutoUpdate(commands.Cog):
         self.bot = bot
         self.sent_message_ids = {}
         self.first_start = True
-        self.ping_sent_today = {}
         self.guild_update_info = {}
         self.startup_ping_sent = {}
         self.ping_message_being_updated = {} 
@@ -165,14 +164,11 @@ class NoticeAutoUpdate(commands.Cog):
                     await asyncio.sleep(retry_after)  # Wait before retrying
                 else:
                     print(f"Failed to edit message due to an error: {e}")
-                    break  # Break on any other error
+                    break 
 
-
-    @tasks.loop(minutes=10)
     async def send_ping_message_loop(self):
         now = datetime.now()
         today = now.date()
-
         for guild in self.bot.guilds:
             guild_id = guild.id
             config = json_get(guild_id)
@@ -182,30 +178,30 @@ class NoticeAutoUpdate(commands.Cog):
         
             if noticeboard_channel_id == "Default":
                 continue
-
-            if interval == None:
+            if interval is None:
                 continue
-
             channel = guild.get_channel(int(noticeboard_channel_id))
             if channel is None:
                 print(f"Channel not found for guild {guild_id}.")
                 continue
 
-            # Skip if already sent today
-            if self.ping_sent_today.get(guild_id) == today:
-                continue
+
+            ping_date_str = config.get("pingDateTime", None)
+            if ping_date_str is not None:
+                ping_date = datetime.strptime(ping_date_str, '%Y-%m-%d').date()
+                if ping_date == today:
+                    continue
+            else:
+                print("It seems like the pingDateTime is not set. It will now send the ping message and set it up as the date today.")
 
             ping_time = datetime.strptime(ping_daily_time, "%H:%M").time()
             ping_datetime = datetime.combine(today, ping_time)
-
             # Logic for sending the first ping when the bot starts
             if self.first_start:
                 await asyncio.sleep(5)
                 await self.handle_ping_message(channel, guild_id, today, ping_daily_time, now)
                 self.first_start = False  
                 continue 
-
-
             time_diff = abs((now - ping_datetime).total_seconds() / 60)
             if time_diff > 10:  
                 continue
@@ -216,18 +212,15 @@ class NoticeAutoUpdate(commands.Cog):
         """Handles sending or updating the ping message."""
         async with self.ping_message_lock:
             self.ping_message_being_updated[guild_id] = True
-
             try:
                 config = json_get(guild_id)
                 if guild_id not in self.sent_message_ids:
                     self.sent_message_ids[guild_id] = {}
-
                 pingmessage_edit_id = config.get("pingmessageEditID", None)
                 interval = config.get("NoticeBoardUpdateInterval", 3600)
                 next_update_time = now + timedelta(seconds=interval)
                 api_call_time = self.guild_update_info.get(guild_id, {}).get('api_call_time', "Unknown")
 
-                # Send new ping message
                 new_ping_message = await self.send_ping_message(
                     channel,
                     config.get("PingRoleId", "NotSet"),
@@ -236,9 +229,7 @@ class NoticeAutoUpdate(commands.Cog):
                     next_update_time,
                     api_call_time
                 )
-
                 await asyncio.sleep(1)
-
                 if pingmessage_edit_id is None:
                     print(f"No ping message ID for guild {guild_id}. Sending a new ping message.")
                     self.sent_message_ids[guild_id]['ping'] = new_ping_message.id
@@ -249,9 +240,9 @@ class NoticeAutoUpdate(commands.Cog):
                     edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
                     print(f"New ping message sent for guild {guild_id}, ID: {new_ping_message.id}")
             finally:
-                self.ping_sent_today[guild_id] = today
+                edit_json_file(guild_id, "pingDateTime", today.strftime('%Y-%m-%d'))
                 self.ping_message_being_updated[guild_id] = False
-
+    
 
     
 

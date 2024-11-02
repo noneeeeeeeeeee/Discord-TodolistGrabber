@@ -5,6 +5,7 @@ from discord.ui import View, Button
 from modules.music.youtubefetch import YouTubeFetcher
 from modules.readversion import read_current_version
 from modules.setconfig import json_get, check_guild_config_available
+from modules.music.linksidentifier import LinksIdentifier
 import yt_dlp as youtube_dl
 import urllib.parse
 
@@ -36,7 +37,8 @@ class MusicPlayer(commands.Cog):
         if not ctx.author.voice:
             await ctx.send(":x: You need to be in a voice channel to play music.")
             return
-
+        linkType = LinksIdentifier.identify_link(input)
+        print(f"Link Type: {linkType}")
         voice_channel = ctx.author.voice.channel
         if "https://www.youtube.com" in input and not "list=" in input:
             await self.play_link(ctx, voice_channel, input, config)
@@ -48,7 +50,7 @@ class MusicPlayer(commands.Cog):
         elif input:
             await self.search_youtube(ctx, input, top_n=1)
         else:
-            await ctx.send(":x: Please provide a valid input. Example: !play <YouTube link, search query, or playlist> or !play search <search query>")
+            await ctx.send(":x: Please provide a valid input. Example: !play <YouTube link, search query, or playlist> or !play search <search query> \n More sources coming soon!")
 
     async def play_link(self, ctx, voice_channel, link, config):
         await self.play_song_or_link(ctx, voice_channel, link, config)
@@ -199,7 +201,7 @@ class MusicPlayer(commands.Cog):
             for item in playlist_items:
                 await self.youtube_fetcher.process_video_entry(item, self.music_queue, ctx.guild.id, config.get("TrackMaxDuration", 360), author)
 
-            await ctx.send(f"Added {len(playlist_items)} songs from the playlist to the queue.")
+            await ctx.send(f":white_check_mark: Added {len(playlist_items)} songs from the playlist to the queue.")
 
             # Ensure the bot is connected to the voice channel
             if not ctx.voice_client:
