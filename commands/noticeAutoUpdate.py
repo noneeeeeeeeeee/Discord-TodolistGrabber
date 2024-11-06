@@ -166,7 +166,7 @@ class NoticeAutoUpdate(commands.Cog):
                     print(f"Failed to edit message due to an error: {e}")
                     break 
 
-    @tasks.loop(seconds=3600)
+    @tasks.loop(minutes=10)
     async def send_ping_message_loop(self):
         now = datetime.now()
         today = now.date()
@@ -175,11 +175,11 @@ class NoticeAutoUpdate(commands.Cog):
             config = json_get(guild_id)
             ping_daily_time = config.get("PingDailyTime", "15:00")
             noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
-            interval = config.get("NoticeBoardUpdateInterval", 3600)
+            interval = config.get("NoticeBoardUpdateInterval", "null")
         
             if noticeboard_channel_id == "Default":
                 continue
-            if interval is None:
+            if interval is None or interval == "null":
                 continue
             channel = guild.get_channel(int(noticeboard_channel_id))
             if channel is None:
@@ -197,7 +197,6 @@ class NoticeAutoUpdate(commands.Cog):
 
             ping_time = datetime.strptime(ping_daily_time, "%H:%M").time()
             ping_datetime = datetime.combine(today, ping_time)
-            # Logic for sending the first ping when the bot starts
             if self.first_start:
                 await asyncio.sleep(5)
                 await self.handle_ping_message(channel, guild_id, today, ping_daily_time, now)
