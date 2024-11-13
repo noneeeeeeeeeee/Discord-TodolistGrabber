@@ -16,7 +16,6 @@ class Status(commands.Cog):
         message = await ctx.reply("Checking API status...")
 
         try:
-            # Check API status
             api_data = fetch_api_data(None, True)
             if api_data:
                 api_data_json = json.loads(api_data)

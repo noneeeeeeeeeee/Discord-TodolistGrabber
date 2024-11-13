@@ -16,16 +16,15 @@ class MusicQueue(commands.Cog):
             return
 
         queue = music_player.music_queue[guild_id]
-        per_page = 5  # Number of songs per page
+        per_page = 5 
         max_pages = (len(queue) - 1) // per_page + 1
 
-        # Initialize the pagination view
         view = QueuePaginator(ctx, queue, per_page, max_pages)
         await view.start()
 
 class QueuePaginator(discord.ui.View):
     def __init__(self, ctx, queue, per_page, max_pages):
-        super().__init__(timeout=10)  # Timeout of 10 seconds
+        super().__init__(timeout=10)  
         self.ctx = ctx
         self.queue = queue
         self.per_page = per_page
