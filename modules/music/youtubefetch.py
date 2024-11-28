@@ -4,6 +4,7 @@ import asyncio
 from modules.enviromentfilegenerator import check_and_load_env_file
 import googleapiclient.discovery
 import urllib.parse
+from modules.setconfig import json_get
 
 class YouTubeFetcher:
     def __init__(self):
@@ -12,7 +13,6 @@ class YouTubeFetcher:
         if not self.youtube_api_key:
             raise ValueError("YouTube API key is missing. Ensure it's set in the environment variables.")
         
-        # Initialize the YouTube API client without a custom build_request function
         self.youtube_service = googleapiclient.discovery.build(
             "youtube", "v3", developerKey=self.youtube_api_key
         )
@@ -84,7 +84,17 @@ class YouTubeFetcher:
                 break
 
         return videos
+    
+    async def remove_non_songs_using_sponsorblock(self, music_queue, guild_id):
+        """Removes non-song entries from the music queue using the SponsorBlock API."""
+        config = json_get(guild_id)
+        sponsorblockcheck = config.get("RemoveNonSongsUsingSponsorBlock", False)
+        sponsorblock_api = "https://sponsor.ajay.app/api/"
 
+        if not sponsorblockcheck:
+            return
+        
+    
     async def process_video_entry(self, video, music_queue, guild_id, track_max_duration, author):
         """Processes a single video entry and adds it to the music queue if it meets the criteria."""
         try:
