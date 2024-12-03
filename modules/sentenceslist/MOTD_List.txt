@@ -1,9 +1,8 @@
-Have a great day!
+Have a great day! (Optional)
 Don't forget to check the Todo List!
 Need assistance? Too bad!
 Enjoy your time here!
 Be kind and respectful to others (Optional)
-Remember to smile!
 Lunch is on the house... just kidding.
 Don't forget to bring your sense of humor.
 We're glad you're here... sometimes.
@@ -59,7 +58,6 @@ Reality called; it wants its expectations back.
 Don't count your chickens before they hatch, unless you're a mathematician.
 If opportunity doesn't knock, build a door.
 Where uncertainty is the only certainty.
-Komodo dragons are the world's largest lizards, native to Indonesian islands.
 Honey never spoils. Archaeologists have found edible honey in ancient Egyptian tombs!
 Why can't you trust atoms? They make up everything!
 Parallel lines have so much in common, they'll never meet.
@@ -74,19 +72,13 @@ Warning: Contains traces of sarcasm and bad puns.
 When in doubt, ctrl+alt+delete.
 Brain cells are like Wi-Fi: limited and easily lost.
 Nature's way of keeping your feet on the ground.
-The Majapahit Empire once controlled most of maritime Southeast Asia.
 Walks into a bar... and doesn't.
 Solution to world peace: More pizza, less drama.
 You die when you are killed.
 If you poop into the toilet it will stink.
-When you translate dog into indonesian, it will turn into a swear word.
-"Minggir lu miskin!" - IShowSpeed
-"Santay bro!" - IShowSpeed
-The 8th president of Indonesia is known online as "gemoy"
-The 8th Vice president of Indonesia is known as "fufufafa"
+Santay bro!
 Leak and leek sound the same!
-Im gonna fanum tax the creator!
-heeheeeheehawwww - CR King
+heheheha
 Mathematicians do it with precision.
 Breaking the laws of physics: One coffee at a time.
 Octopuses have three hearts.
@@ -157,8 +149,6 @@ The ultimate problem solver.
 Where "maybe" is a scientific term of precision.
 Not visible from space.
 It's not just a good idea, it's the law.
-Are you a 45-degree angle? Because you're acute.
-Honey bees can recognize human faces.
 "Like winning a single voyage."
 Error 404: Motivation not found. Have you tried turning it off and on?
 When particles know each other better than most couples.
@@ -170,4 +160,72 @@ Energy is conserved, motivation is not.
 I told a joke about sodium... Na.
 You're here. Or are you?
 Keep calm and carry on... preferably with coffee.
-Made by Vendouple!!
+Made by Vendouple!
+Why do programmers prefer dark mode? Because light attracts bugs!
+Debugging: Removing the needles from the haystack you just added.
+Code is like humor; if it needs explaining, it's not good.
+404: Joke not found. But nice try looking for it!
+"It works on my machine" is the battle cry of doomed code.
+Arrays start at 0 because counting is for mere mortals.
+Why do Java developers wear glasses? Because they don't C#.
+Trust issues start when if (true) fails.
+Segfault: When your program asks too many questions.
+I'm not lazy; I'm just caching my energy.
+The best algorithm is... one that works before the deadline.
+There are 10 types of developers: those who understand binary and those who don’t.
+A semicolon walks into a bar; it’s the end of the line.
+Git happens, especially when you forget to commit.
+Why was the function sad? It felt no closure.
+Writing code is 10% typing and 90% staring at the screen.
+"Null" is not a valid date for the meeting; check your calendar.
+Coding without coffee? Undefined behavior.
+Always code as if the person maintaining your code is a chainsaw-wielding maniac who knows your address.
+In programming, there’s no CTRL+Z for deleting production data.
+Made by Vendouple, or is it?
+Life’s a joke, and gravity always gets the punchline.
+Parallel lines meet at infinity; some people call it optimism.
+Time flies like an arrow; fruit flies like a banana.
+Why don’t skeletons fight? They don’t have the guts.
+Arrays start at 0, but your potential starts at infinity.
+I would tell you a UDP joke, but you might not get it.
+Why do Java developers wear glasses? Because they don't C#!
+Recursion: See "Recursion" for definition.
+My code doesn't have bugs, it just develops random features.
+Git push --force: Because sometimes relationships need a reset.
+CSS is like modern art - nobody really knows how it works, but everyone has an opinion.
+Warning: Coffee levels critically low, code quality may vary.
+The only thing more reliable than my code is my ability to break it.
+Semicolons are like traffic signals; miss one and everything crashes.
+My code passes all tests... when no one's watching.
+Remember: 'undefined' is not 'not defined', but 'null' is definitely nothing.
+Keep calm and clear your cache.
+Code reviews: Where semicolons matter more than your feelings.
+If at first you don't succeed, call it version 1.0 and deploy anyway.
+Documentation? You mean those comments I'll write "tomorrow"?
+My code works perfectly in my dreams; reality is still buffering.
+There are two hard problems in computer science: cache invalidation, naming things, and off-by-one errors.
+Python: Where indentation is not just good practice, it's the law.
+My code is like a box of chocolates - full of unexpected types.
+There are 10 types of debugging: the one that works, and the other 1111.
+Stack Overflow: Because someone else has already solved your problem and marked it as duplicate.
+The best thing about Boolean jokes is that even if they're bad, they're still True.
+Why did the programmer quit his job? Because he didn't get arrays.
+Machine Learning: Because "if-else" statements can't solve everything.
+Always code as if the person maintaining it is a violent psychopath who knows where you live.
+Regular Expressions: Now you have two problems.
+Frontend developers: Making things pretty while backend developers make things work... sometimes.
+Database administrators do it with commitment (and frequent rollbacks).
+Don't worry if your code works on the first try - that's just the calm before the exception.
+The only thing more dangerous than a developer with a deadline is a developer with caffeine withdrawal.
+Remember: It's not a bug - it's an undocumented feature waiting to be discovered.
+Our testing environment closely resembles production... in the same way that a skateboard resembles a Ferrari.
+Dear Code: I know we had our differences yesterday, but I really need you to work today.
+The three most dangerous things in the world: a programmer with a soldering iron, a hardware engineer with software, and a user with an idea.
+Your code compiles? Quick, push to production before it changes its mind!
+Remember kids: In SQL, always use protection (prepared statements).
+Quantum Computing: Because sometimes being in two states at once is easier than debugging.
+JavaScript: Where everything is made up and the types don't matter.
+DevOps is like teenage dating - everybody talks about it, nobody knows how to do it.
+The only time a programmer is truly happy is the split second between typing 'run' and seeing the first error message.
+Why do programmers prefer dark mode? Because light attracts bugs.
+Today's fortune: May your code be bug-free, your coffee be strong, and your deadlines be reasonable (pick two).
