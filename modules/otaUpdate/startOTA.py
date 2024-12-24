@@ -9,9 +9,17 @@ import sys
 import time
 
 # File paths and constants
-UPDATE_VARS_PATH = "./updateVars.json"
-LOGS_DIR = "./logs"
-TEMP_DIR = "./temp_update"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+UPDATE_VARS_PATH = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "..", "updateVars.json")
+)
+LOGS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "logs"))
+TEMP_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "temp_update"))
+
+# Ensure the logs and temp directories exist
+os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(TEMP_DIR, exist_ok=True)
+
 TEMP_ZIP_PATH = os.path.join(TEMP_DIR, "update.zip")
 WHITELISTED_FILES_KEY = "WHITELISTED_FILES_FOLDERS"
 
