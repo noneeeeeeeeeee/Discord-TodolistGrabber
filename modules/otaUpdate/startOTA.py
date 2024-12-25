@@ -38,48 +38,73 @@ def log_error(stage, message, exception=None):
 
 
 def print_progress(stage, message):
-    """
-    Prints progress to the console with a progress bar.
-    """
     print(f"[{stage}] {message}")
-    log_error(stage, message)  # Log progress as well
+    log_error(stage, message)
+
+
+def fetch_with_retries(url, headers, max_retries=5):
+    """
+    Fetches a URL with retries.
+    """
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            print(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+            time.sleep(2**attempt)
+    raise Exception("Max retries exceeded.")
 
 
 def fetch_update(repo_url, method, api_key=None):
     """
     Handles fetching the update file with optional API key.
-    Only `GET_FROM_RELEASE_SOURCE` is implemented.
     """
-    if method == "GET_FROM_RELEASE_SOURCE":
-        try:
-            headers = {"Authorization": f"token {api_key}"} if api_key else {}
-            release_url = f"{repo_url}/releases/latest"
-            response = requests.get(release_url, headers=headers)
-            response.raise_for_status()
-            download_url = response.json()["assets"][0][
-                "browser_download_url"
-            ]  # Assumes the first asset is the desired file
+    try:
+        headers = {"Authorization": f"token {api_key}"} if api_key else {}
+        release_url = f"https://api.github.com/repos/{'/'.join(repo_url.rstrip('/').split('/')[-2:])}/releases/latest"
+        print(f"Release URL: {release_url}")
+        print(f"Headers: {headers}")
 
-            print_progress("Download", "Downloading update...")
-            os.makedirs(TEMP_DIR, exist_ok=True)
-            with requests.get(
-                download_url, stream=True, headers=headers
-            ) as download_response:
-                with open(TEMP_ZIP_PATH, "wb") as temp_file:
-                    total_size = int(download_response.headers.get("content-length", 0))
-                    downloaded_size = 0
-                    for chunk in download_response.iter_content(chunk_size=1024):
-                        if chunk:
-                            temp_file.write(chunk)
-                            downloaded_size += len(chunk)
-                            percent = (downloaded_size / total_size) * 100
-                            print(f"Downloading... {percent:.2f}% Complete", end="\r")
-            print_progress("Download", "Download complete.")
-        except Exception as e:
-            log_error("Download", "Failed to fetch update.", e)
-            raise
-    else:
-        raise NotImplementedError(f"Update method {method} is not implemented.")
+        response = fetch_with_retries(release_url, headers)
+        print(f"Response Status Code: {response.status_code}")
+        print(f"Response JSON: {response.json()}")
+
+        release_data = response.json()
+
+        if method == "GET_FROM_RELEASE_SOURCE":
+            # Get the source code URL for the latest tag
+            download_url = release_data.get("zipball_url")
+            if not download_url:
+                raise ValueError("No source code URL found for the latest release.")
+        elif method == "GET_FROM_RELEASE_PACKAGE":
+            # Get the first asset URL if using release packages
+            assets = release_data.get("assets", [])
+            if not assets:
+                raise ValueError("No assets found in the latest release.")
+            download_url = assets[0]["browser_download_url"]
+        else:
+            raise ValueError(f"Unsupported update method: {method}")
+
+        print(f"Download URL: {download_url}")
+
+        print_progress("Download", "Downloading update...")
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        with fetch_with_retries(download_url, headers) as download_response:
+            with open(TEMP_ZIP_PATH, "wb") as temp_file:
+                total_size = int(download_response.headers.get("content-length", 0))
+                downloaded_size = 0
+                for chunk in download_response.iter_content(chunk_size=1024):
+                    if chunk:
+                        temp_file.write(chunk)
+                        downloaded_size += len(chunk)
+                        percent = (downloaded_size / total_size) * 100
+                        print(f"Downloading... {percent:.2f}% Complete", end="\r")
+        print_progress("Download", "Download complete.")
+    except Exception as e:
+        log_error("Download", "Failed to fetch update.", e)
+        raise
 
 
 def cleanup_root_directory(whitelist):
@@ -153,7 +178,7 @@ def perform_ota_update():
         print_progress("Restart", "Bot started successfully.")
 
         # Exit updater
-        time.sleep(2)  # Allow time for bot to start
+        time.sleep(5)
         sys.exit(0)
     except Exception as e:
         log_error("OTA Update", "Update failed.", e)
