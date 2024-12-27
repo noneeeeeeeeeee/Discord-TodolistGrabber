@@ -3,7 +3,14 @@
   "_comment1": "There is also a option C where its GET_FROM_RELEASE_SOURCE, where this will get it from the source code of the release instead of the latest commit hash",
   "REPOSITORY_URL": "https://github.com/noneeeeeeeeeee/Discord-TodolistGrabber",
   "REPO_API_KEY": "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",
-  "WHITELISTED_FILES_FOLDERS": ["config", ".env", "cache", "logs"],
+  "WHITELISTED_FILES_FOLDERS": [
+    "config",
+    ".env",
+    "cache",
+    "logs",
+    "temp_update"
+  ],
   "UPDATE_GET_METHOD": "GET_FROM_RELEASE_SOURCE",
-  "EXTRACT_FILES": true
+  "EXTRACT_FILES": true,
+  "MOVE_CONTENTS_IN_FOLDER": true
 }

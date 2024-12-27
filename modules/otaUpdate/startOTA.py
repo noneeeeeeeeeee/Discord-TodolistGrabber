@@ -7,13 +7,17 @@ import zipfile
 import datetime
 import sys
 import time
+import traceback
+import stat
+from check import check_update
 
-# File paths and constants
+# File paths, constants, and custom module imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
 UPDATE_VARS_PATH = os.path.abspath(
     os.path.join(SCRIPT_DIR, "..", "..", "updateVars.json")
 )
-LOGS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "logs"))
+LOGS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "ota_logs"))
 TEMP_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "temp_update"))
 
 # Ensure the logs and temp directories exist
@@ -30,16 +34,96 @@ def log_error(stage, message, exception=None):
     """
     os.makedirs(LOGS_DIR, exist_ok=True)
     now = datetime.datetime.now().strftime("%d_%m_%Y_%H_%M")
-    log_path = os.path.join(LOGS_DIR, f"crash_{now}.txt")
+    log_path = os.path.join(LOGS_DIR, f"log_{now}.txt")
     with open(log_path, "a") as log_file:
-        log_file.write(f"[{stage}] {message}\n")
-        if exception:
-            log_file.write(str(exception) + "\n")
+        log_file.write(f"[{stage}] {message}\n\n")
+        if stage != "OTA Update" and exception:
+            log_file.write("[Stack Trace]\n")
+            log_file.write(traceback.format_exc() + "\n")
 
 
 def print_progress(stage, message):
     print(f"[{stage}] {message}")
     log_error(stage, message)
+
+
+def smart_download_check():
+    # Smart download check to determine whether the file needs to be redownloaded or not or if the bot is up to date or not so that it will not perform unnecessary updates.
+    print("   ____ _______          _____  _____ _____  _____ _____ _______ ")
+    print("  / __ \__   __|/\      / ____|/ ____|  __ \|_   _|  __ \__   __|")
+    print(" | |  | | | |  /  \    | (___ | |    | |__) | | | | |__) | | |   ")
+    print(" | |  | | | | / /\ \    \___ \| |    |  _  /  | | |  _  /  | |   ")
+    print(" | |__| | | |/ ____ \   ____) | |____| | \ \ _| |_| | \ \  | |   ")
+    print("  \____/  |_/_/    \_\ |_____/ \_____|_|  \_\_____|_|  \_\ |_|   ")
+    print("                                                                ")
+    print_progress("Smart Download Check", "Starting smart download check...")
+    try:
+        # Fetch current and latest version info
+        result = check_update()
+        if result["status"] == "error":
+            log_error("Smart Download Check", result["message"])
+            return None
+
+        current_version = result.get("current_version")
+        latest_version = result.get("latest_version")
+
+        # Check temp_update folder
+        temp_package_path = TEMP_DIR
+        temp_version = None
+        if os.path.exists(temp_package_path):
+            # Extract version from the downloaded package if exists
+            for item in os.listdir(temp_package_path):
+                if item.endswith(".zip"):
+                    temp_version = os.path.splitext(item)[0]
+                    break
+
+        # Logic based on different cases
+        if current_version == latest_version:
+            # Case 1: Bot is up-to-date
+            print_progress(
+                "Smart Download Check",
+                "Bot is already up-to-date. Aborting installation.",
+            )
+            if os.path.exists(temp_package_path):
+                shutil.rmtree(temp_package_path, onerror=handle_remove_readonly)
+                print_progress("Smart Download Check", "Temp folder deleted.")
+            return "abort_update"
+
+        if temp_version and temp_version == latest_version:
+            # Case 2: Temp package matches repository version
+            print_progress(
+                "Smart Download Check",
+                "Skipping download, using existing temp package.",
+            )
+            return "skip_download"
+
+        if temp_version and temp_version < latest_version:
+            # Case 3: Temp package is outdated
+            print_progress(
+                "Smart Download Check", "Temp package is outdated. Cleaning..."
+            )
+            shutil.rmtree(temp_package_path, onerror=handle_remove_readonly)
+            print_progress("Smart Download Check", "Temp folder cleaned.")
+            return "continue"
+
+        if temp_version and temp_version > current_version:
+            # Case 4: Temp package is invalid
+            print_progress(
+                "Smart Download Check", "Temp package is invalid. Cleaning..."
+            )
+            shutil.rmtree(temp_package_path, onerror=handle_remove_readonly)
+            print_progress("Smart Download Check", "Temp folder cleaned.")
+            return None
+
+        # Default: Continue installation if none of the above
+        print_progress(
+            "Smart Download Check", "Condition not met, continuing installation."
+        )
+        return "continue"
+
+    except Exception as e:
+        log_error("Smart Download Check", "Failed during smart download check.", e)
+        raise
 
 
 def fetch_with_retries(url, headers, max_retries=5):
@@ -52,7 +136,7 @@ def fetch_with_retries(url, headers, max_retries=5):
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
-            print(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+            print(f"Attempt {attempt + 1}/{max_retries}")
             time.sleep(2**attempt)
     raise Exception("Max retries exceeded.")
 
@@ -64,13 +148,9 @@ def fetch_update(repo_url, method, api_key=None):
     try:
         headers = {"Authorization": f"token {api_key}"} if api_key else {}
         release_url = f"https://api.github.com/repos/{'/'.join(repo_url.rstrip('/').split('/')[-2:])}/releases/latest"
-        print(f"Release URL: {release_url}")
-        print(f"Headers: {headers}")
+        print(f"Fetching Update File From: {release_url}")
 
         response = fetch_with_retries(release_url, headers)
-        print(f"Response Status Code: {response.status_code}")
-        print(f"Response JSON: {response.json()}")
-
         release_data = response.json()
 
         if method == "GET_FROM_RELEASE_SOURCE":
@@ -87,38 +167,54 @@ def fetch_update(repo_url, method, api_key=None):
         else:
             raise ValueError(f"Unsupported update method: {method}")
 
-        print(f"Download URL: {download_url}")
+        tag_name = release_data.get("tag_name", "latest")
+        temp_zip_path = os.path.join(TEMP_DIR, f"{tag_name}.zip")
 
         print_progress("Download", "Downloading update...")
         os.makedirs(TEMP_DIR, exist_ok=True)
         with fetch_with_retries(download_url, headers) as download_response:
-            with open(TEMP_ZIP_PATH, "wb") as temp_file:
+            with open(temp_zip_path, "wb") as temp_file:
                 total_size = int(download_response.headers.get("content-length", 0))
                 downloaded_size = 0
                 for chunk in download_response.iter_content(chunk_size=1024):
                     if chunk:
                         temp_file.write(chunk)
                         downloaded_size += len(chunk)
-                        percent = (downloaded_size / total_size) * 100
-                        print(f"Downloading... {percent:.2f}% Complete", end="\r")
+                        if total_size > 0:
+                            percent = (downloaded_size / total_size) * 100
+                            print(f"Downloading: {percent:.2f}% Complete", end="\r")
+                        else:
+                            print("Downloading: Size unknown", end="\r")
         print_progress("Download", "Download complete.")
     except Exception as e:
         log_error("Download", "Failed to fetch update.", e)
         raise
 
 
+def handle_remove_readonly(func, path, exc_info):
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
 def cleanup_root_directory(whitelist):
     """
-    Cleans up all files and folders in the root directory except those in the whitelist.
+    Cleans up all files and folders in the project root directory except those in the whitelist.
     """
+    project_root = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
     try:
-        print_progress("Cleanup", "Cleaning up non-whitelisted files and folders...")
-        for item in os.listdir("."):
+        # Prevent accidental removal of the actual system root
+        if project_root == os.path.abspath("/"):
+            print_progress("Cleanup", "Detected system root, skipping cleanup.")
+            return
+
+        print_progress("Cleanup", "Starting cleanup process...")
+        for item in os.listdir(project_root):
             if item not in whitelist:
-                if os.path.isfile(item) or os.path.islink(item):
-                    os.unlink(item)
-                elif os.path.isdir(item):
-                    shutil.rmtree(item)
+                item_path = os.path.join(project_root, item)
+                if os.path.isfile(item_path) or os.path.islink(item_path):
+                    os.unlink(item_path)
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path, onerror=handle_remove_readonly)
         print_progress("Cleanup", "Cleanup complete.")
     except Exception as e:
         log_error("Cleanup", "Failed during cleanup.", e)
@@ -126,24 +222,43 @@ def cleanup_root_directory(whitelist):
 
 
 def extract_update(extract):
-    """
-    Extracts the downloaded update if `extract` is true.
-    """
-    if extract:
-        try:
-            print_progress("Extraction", "Extracting update files...")
-            with zipfile.ZipFile(TEMP_ZIP_PATH, "r") as zip_ref:
-                zip_ref.extractall(".")
-            print_progress("Extraction", "Extraction complete.")
-        except Exception as e:
-            log_error("Extraction", "Failed to extract update.", e)
-            raise
+    if not extract:
+        return
+    try:
+        print_progress("Extraction", "Extracting update files...")
+        with zipfile.ZipFile(TEMP_ZIP_PATH, "r") as zip_ref:
+            zip_ref.extractall(TEMP_DIR)
+        print_progress("Extraction", "Extraction complete.")
+        log_error("Extraction", "Extraction complete.")
+    except Exception as e:
+        log_error("Extraction", "Failed to extract update.", e)
+        raise
+
+
+def move_extracted_contents_from_folder(move_contents_in_folder):
+    print_progress(
+        "Move Files", "Moving files from extracted folder to root directory..."
+    )
+    access_extracted_folder = os.listdir(TEMP_DIR)
+    try:
+        if move_contents_in_folder:
+            extracted_folder = os.path.join(TEMP_DIR, access_extracted_folder[0])
+            for item in os.listdir(extracted_folder):
+                item_path = os.path.join(extracted_folder, item)
+                shutil.move(item_path, os.path.join("/", item))
+            shutil.rmtree(extracted_folder)
+        else:
+            for item in access_extracted_folder:
+                item_path = os.path.join(TEMP_DIR, item)
+                shutil.move(item_path, os.path.join("/", item))
+    except Exception as e:
+        log_error("Move Files", "Failed to move files from extracted folder.", e)
+        raise
+    print_progress("Move Files", "Files moved successfully.")
+    log_error("Move Files", "Files moved successfully.")
 
 
 def perform_ota_update():
-    """
-    Performs the OTA update process and tracks progress in console and logs.
-    """
     try:
         # Load update variables
         if not os.path.exists(UPDATE_VARS_PATH):
@@ -156,48 +271,65 @@ def perform_ota_update():
         repo_url = update_vars["REPOSITORY_URL"]
         update_method = update_vars["UPDATE_GET_METHOD"]
         extract_files = update_vars.get("EXTRACT_FILES", False)
+        move_contents_in_folder = update_vars.get("MOVE_CONTENTS_IN_FOLDER", False)
         api_key = update_vars.get("REPO_API_KEY", "")
 
-        # Fetch the update file
-        fetch_update(repo_url, update_method, api_key)
+        # Prequisite checks
+        result = smart_download_check()
 
-        # Cleanup root directory
+        # Fetch the update file
+        if result == "continue" or not result:
+            fetch_update(repo_url, update_method, api_key)
+
+        if result == "abort_update":
+            print("<<<---Bot is already up-to-date. Aborting installation.--->>>")
+            time.sleep(10)
+            sys.exit(0)
+        # Cleanup
         cleanup_root_directory(whitelist)
 
-        # Extract update
-        extract_update(extract_files)
+        # Extract and move files
+        if result == "continue" or not result:
+            extract_update(extract_files)
+        move_extracted_contents_from_folder(move_contents_in_folder)
 
         # Cleanup residuals
         print_progress("Post-Cleanup", "Removing temporary files...")
-        shutil.rmtree(TEMP_DIR, ignore_errors=True)
+        # shutil.rmtree(TEMP_DIR, ignore_errors=True)
         print_progress("Post-Cleanup", "Temporary files removed.")
 
         # Start the bot
         print_progress("Restart", "Starting bot...")
-        subprocess.Popen(["python", "main.py"], close_fds=True)
+        # subprocess.Popen(["python", os.path.join(SCRIPT_DIR, "..", "..", "main.py")], close_fds=True)
         print_progress("Restart", "Bot started successfully.")
 
         # Exit updater
         time.sleep(5)
         sys.exit(0)
     except Exception as e:
-        log_error("OTA Update", "Update failed.", e)
+        log_error(
+            "OTA Update",
+            "Update failed and is Aborted, Please check the stack trace above for more Information",
+            e,
+        )
+        print(
+            "<<<---Update failed and is Aborted, Please check the logs for more Information. This window will now close in 10 seconds.--->>>"
+        )
+        time.sleep(10)
         sys.exit(1)
 
 
 def main():
-    """
-    Main function that runs `startOTA.py` in a subprocess with a new command prompt window for self-update capability.
-    """
     if len(sys.argv) > 1 and sys.argv[1] == "worker":
-        # Worker mode: Perform OTA update
         perform_ota_update()
     else:
-        # Parent process: Spawn a new process for the updater in a new command prompt window
-        subprocess.Popen(
-            ["start", "cmd", "/k", sys.executable, __file__, "worker"],
-            shell=True,
-        )
+        try:
+            subprocess.Popen(
+                ["start", "cmd", "/c", sys.executable, __file__, "worker"],
+                shell=True,
+            )
+        except Exception as e:
+            log_error("Main", "Failed to start worker process.", e)
         sys.exit(0)
 
 

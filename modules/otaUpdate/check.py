@@ -51,7 +51,11 @@ def check_update():
 
         # Compare versions
         if current_version == latest_version:
-            return {"status": "up-to-date", "current_version": current_version}
+            return {
+                "status": "up-to-date",
+                "current_version": current_version,
+                "latest_version": latest_version,
+            }
         else:
             return {
                 "status": "update-available",
