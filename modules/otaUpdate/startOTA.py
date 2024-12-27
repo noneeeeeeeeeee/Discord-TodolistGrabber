@@ -13,12 +13,10 @@ from check import check_update
 
 # File paths, constants, and custom module imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
-UPDATE_VARS_PATH = os.path.abspath(
-    os.path.join(SCRIPT_DIR, "..", "..", "updateVars.json")
-)
-LOGS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "ota_logs"))
-TEMP_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "temp_update"))
+ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+UPDATE_VARS_PATH = os.path.join(ROOT_DIR, "updateVars.json")
+LOGS_DIR = os.path.join(ROOT_DIR, "ota_logs")
+TEMP_DIR = os.path.join(ROOT_DIR, "temp_update")
 
 # Ensure the logs and temp directories exist
 os.makedirs(LOGS_DIR, exist_ok=True)
@@ -36,7 +34,7 @@ def log_error(stage, message, exception=None):
     now = datetime.datetime.now().strftime("%d_%m_%Y_%H_%M")
     log_path = os.path.join(LOGS_DIR, f"log_{now}.txt")
     with open(log_path, "a") as log_file:
-        log_file.write(f"[{stage}] {message}\n\n")
+        log_file.write(f"[{stage}] {message}\n")
         if stage != "OTA Update" and exception:
             log_file.write("[Stack Trace]\n")
             log_file.write(traceback.format_exc() + "\n")
@@ -47,8 +45,7 @@ def print_progress(stage, message):
     log_error(stage, message)
 
 
-def smart_download_check():
-    # Smart download check to determine whether the file needs to be redownloaded or not or if the bot is up to date or not so that it will not perform unnecessary updates.
+def logo_message(message):
     print("   ____ _______          _____  _____ _____  _____ _____ _______ ")
     print("  / __ \__   __|/\      / ____|/ ____|  __ \|_   _|  __ \__   __|")
     print(" | |  | | | |  /  \    | (___ | |    | |__) | | | | |__) | | |   ")
@@ -56,6 +53,11 @@ def smart_download_check():
     print(" | |__| | | |/ ____ \   ____) | |____| | \ \ _| |_| | \ \  | |   ")
     print("  \____/  |_/_/    \_\ |_____/ \_____|_|  \_\_____|_|  \_\ |_|   ")
     print("                                                                ")
+    print(f"<<<---{message}--->>>")
+
+
+def smart_download_check():
+    # Smart download check to determine whether the file needs to be redownloaded or not or if the bot is up to date or not so that it will not perform unnecessary updates.
     print_progress("Smart Download Check", "Starting smart download check...")
     try:
         # Fetch current and latest version info
@@ -198,23 +200,64 @@ def handle_remove_readonly(func, path, exc_info):
 
 def cleanup_root_directory(whitelist):
     """
-    Cleans up all files and folders in the project root directory except those in the whitelist.
+    Cleans up all folders and files in the project root directory except those in the whitelist.
     """
-    project_root = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
-    try:
-        # Prevent accidental removal of the actual system root
-        if project_root == os.path.abspath("/"):
-            print_progress("Cleanup", "Detected system root, skipping cleanup.")
-            return
+    project_root = ROOT_DIR
+    max_retries = 5
+    retry_delay = 2  # seconds
 
+    try:
         print_progress("Cleanup", "Starting cleanup process...")
+        time.sleep(3)
         for item in os.listdir(project_root):
-            if item not in whitelist:
-                item_path = os.path.join(project_root, item)
-                if os.path.isfile(item_path) or os.path.islink(item_path):
-                    os.unlink(item_path)
-                elif os.path.isdir(item_path):
-                    shutil.rmtree(item_path, onerror=handle_remove_readonly)
+            item_path = os.path.join(project_root, item)
+            if item not in whitelist or item == ".gitignore":
+                if os.path.isdir(item_path):
+                    for attempt in range(max_retries):
+                        try:
+                            shutil.rmtree(item_path, onerror=handle_remove_readonly)
+                            print_progress(
+                                f"Cleanup", f"Removed directory: {item_path}"
+                            )
+                            break
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                print_progress(
+                                    "Cleanup",
+                                    f"Failed to remove directory: {item_path}. Reason: {e}. Retrying in {retry_delay} seconds...",
+                                )
+                                time.sleep(retry_delay)
+                            else:
+                                print_progress(
+                                    "Cleanup",
+                                    f"Failed to remove directory: {item_path}. Reason: {e}. Max retries reached.",
+                                )
+                                log_error(
+                                    "Cleanup",
+                                    f"Failed to remove directory {item_path}.",
+                                    e,
+                                )
+                elif os.path.isfile(item_path):
+                    for attempt in range(max_retries):
+                        try:
+                            os.remove(item_path)
+                            print_progress(f"Cleanup", f"Removed file: {item_path}")
+                            break
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                print_progress(
+                                    "Cleanup",
+                                    f"Failed to remove file: {item_path}. Reason: {e}. Retrying in {retry_delay} seconds...",
+                                )
+                                time.sleep(retry_delay)
+                            else:
+                                print_progress(
+                                    "Cleanup",
+                                    f"Failed to remove file: {item_path}. Reason: {e}. Max retries reached.",
+                                )
+                                log_error(
+                                    "Cleanup", f"Failed to remove file {item_path}.", e
+                                )
         print_progress("Cleanup", "Cleanup complete.")
     except Exception as e:
         log_error("Cleanup", "Failed during cleanup.", e)
@@ -245,12 +288,12 @@ def move_extracted_contents_from_folder(move_contents_in_folder):
             extracted_folder = os.path.join(TEMP_DIR, access_extracted_folder[0])
             for item in os.listdir(extracted_folder):
                 item_path = os.path.join(extracted_folder, item)
-                shutil.move(item_path, os.path.join("/", item))
+                shutil.move(item_path, os.path.join(ROOT_DIR, item))
             shutil.rmtree(extracted_folder)
         else:
             for item in access_extracted_folder:
                 item_path = os.path.join(TEMP_DIR, item)
-                shutil.move(item_path, os.path.join("/", item))
+                shutil.move(item_path, os.path.join(ROOT_DIR, item))
     except Exception as e:
         log_error("Move Files", "Failed to move files from extracted folder.", e)
         raise
@@ -272,10 +315,18 @@ def perform_ota_update():
         update_method = update_vars["UPDATE_GET_METHOD"]
         extract_files = update_vars.get("EXTRACT_FILES", False)
         move_contents_in_folder = update_vars.get("MOVE_CONTENTS_IN_FOLDER", False)
+        smart_download_enabled = update_vars.get("SMART_DOWNLOAD_ENABLED", False)
         api_key = update_vars.get("REPO_API_KEY", "")
 
         # Prequisite checks
-        result = smart_download_check()
+        if smart_download_enabled:
+            result = smart_download_check()
+        else:
+            print_progress(
+                "Smart Download Check",
+                "Smart download disabled. It will now continue with the update.",
+            )
+            result = "continue"
 
         # Fetch the update file
         if result == "continue" or not result:
@@ -324,8 +375,12 @@ def main():
         perform_ota_update()
     else:
         try:
+            logo_message(f"OTA Automatic Update Script")
+            print_progress("Main", "Starting OTA Update Worker...")
+            time.sleep(3)
             subprocess.Popen(
                 ["start", "cmd", "/c", sys.executable, __file__, "worker"],
+                cwd=ROOT_DIR,
                 shell=True,
             )
         except Exception as e:

@@ -7,10 +7,11 @@
     "config",
     ".env",
     "cache",
-    "logs",
+    "ota_logs",
     "temp_update"
   ],
   "UPDATE_GET_METHOD": "GET_FROM_RELEASE_SOURCE",
   "EXTRACT_FILES": true,
-  "MOVE_CONTENTS_IN_FOLDER": true
+  "MOVE_CONTENTS_IN_FOLDER": true,
+  "SMART_DOWNLOAD_ENABLED": false
 }
