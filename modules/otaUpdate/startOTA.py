@@ -269,8 +269,13 @@ def extract_update(extract):
         return
     try:
         print_progress("Extraction", "Extracting update files...")
-        with zipfile.ZipFile(TEMP_ZIP_PATH, "r") as zip_ref:
-            zip_ref.extractall(TEMP_DIR)
+        zip_files = [f for f in os.listdir(TEMP_DIR) if f.endswith(".zip")]
+        if zip_files:
+            first_zip_path = os.path.join(TEMP_DIR, zip_files[0])
+            with zipfile.ZipFile(first_zip_path, "r") as zip_ref:
+                zip_ref.extractall(TEMP_DIR)
+        else:
+            raise FileNotFoundError("No zip file found in the temp_update folder.")
         print_progress("Extraction", "Extraction complete.")
         log_error("Extraction", "Extraction complete.")
     except Exception as e:
@@ -282,18 +287,32 @@ def move_extracted_contents_from_folder(move_contents_in_folder):
     print_progress(
         "Move Files", "Moving files from extracted folder to root directory..."
     )
-    access_extracted_folder = os.listdir(TEMP_DIR)
     try:
         if move_contents_in_folder:
-            extracted_folder = os.path.join(TEMP_DIR, access_extracted_folder[0])
+            extracted_folders = [
+                f
+                for f in os.listdir(TEMP_DIR)
+                if os.path.isdir(os.path.join(TEMP_DIR, f))
+            ]
+            if not extracted_folders:
+                raise FileNotFoundError(
+                    "No extracted folder found in the temp_update folder."
+                )
+            extracted_folder = os.path.join(TEMP_DIR, extracted_folders[0])
             for item in os.listdir(extracted_folder):
                 item_path = os.path.join(extracted_folder, item)
                 shutil.move(item_path, os.path.join(ROOT_DIR, item))
             shutil.rmtree(extracted_folder)
         else:
-            for item in access_extracted_folder:
+            for item in os.listdir(TEMP_DIR):
                 item_path = os.path.join(TEMP_DIR, item)
-                shutil.move(item_path, os.path.join(ROOT_DIR, item))
+                if os.path.isdir(item_path):
+                    for sub_item in os.listdir(item_path):
+                        sub_item_path = os.path.join(item_path, sub_item)
+                        shutil.move(sub_item_path, os.path.join(ROOT_DIR, sub_item))
+                    shutil.rmtree(item_path)
+                else:
+                    shutil.move(item_path, os.path.join(ROOT_DIR, item))
     except Exception as e:
         log_error("Move Files", "Failed to move files from extracted folder.", e)
         raise
@@ -336,24 +355,31 @@ def perform_ota_update():
             print("<<<---Bot is already up-to-date. Aborting installation.--->>>")
             time.sleep(10)
             sys.exit(0)
+
         # Cleanup
+        time.sleep(2)
         cleanup_root_directory(whitelist)
 
         # Extract and move files
+        time.sleep(2)
         if result == "continue" or not result:
             extract_update(extract_files)
         move_extracted_contents_from_folder(move_contents_in_folder)
 
         # Cleanup residuals
+        time.sleep(2)
         print_progress("Post-Cleanup", "Removing temporary files...")
-        # shutil.rmtree(TEMP_DIR, ignore_errors=True)
+        shutil.rmtree(TEMP_DIR, ignore_errors=True)
         print_progress("Post-Cleanup", "Temporary files removed.")
 
         # Start the bot
+        time.sleep(1)
         print_progress("Restart", "Starting bot...")
-        # subprocess.Popen(["python", os.path.join(SCRIPT_DIR, "..", "..", "main.py")], close_fds=True)
+        subprocess.Popen(
+            ["python", os.path.join(SCRIPT_DIR, "..", "..", "main.py")], close_fds=True
+        )
         print_progress("Restart", "Bot started successfully.")
-
+        print("<<<---OTA Update completed successfully. The bot will now start.--->>>")
         # Exit updater
         time.sleep(5)
         sys.exit(0)
