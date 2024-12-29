@@ -320,8 +320,62 @@ def move_extracted_contents_from_folder(move_contents_in_folder):
     log_error("Move Files", "Files moved successfully.")
 
 
+def stop_bot_process():
+    print_progress("Process", "Checking if bot is running...")
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq python.exe"],
+            capture_output=True,
+            text=True,
+        )
+        current_pid = os.getpid()
+        if "python.exe" in result.stdout:
+            print_progress("Process", "Stopping bot...")
+            tasks = result.stdout.splitlines()
+            for task in tasks:
+                if "python.exe" in task:
+                    pid = int(task.split()[1])
+                    if pid != current_pid:
+                        os.system(f"taskkill /f /pid {pid} /t")
+            print_progress("Process", "Bot stopped successfully.")
+        else:
+            print_progress("Process", "Bot is not running. No need to stop.")
+    except Exception as e:
+        print_progress("Process", "Failed to check or stop the bot.")
+        print(
+            "<<<---Failed to check or stop the bot. Please stop the bot manually and run the script again.--->>>"
+        )
+        log_error("Process", "Failed to check or stop the bot.", e)
+        raise
+    print_progress("Process", "Bot stopped successfully.")
+
+
+def check_files_required():
+    print_progress("File Check", "Checking if required files exist...")
+    try:
+        if not os.path.exists(UPDATE_VARS_PATH):
+            print_progress(
+                "File Check", f"{UPDATE_VARS_PATH} not found. Aborting installation."
+            )
+            log_error(
+                "File Check", f"{UPDATE_VARS_PATH} not found. Aborting installation."
+            )
+            print(
+                "<<<---Required updateVars.json not found. Aborting installation.--->>>"
+            )
+            time.sleep(5)
+            sys.exit(1)
+        print_progress("File Check", "All required files exist.")
+    except Exception as e:
+        log_error("File Check", "Failed to check required files.", e)
+        raise
+
+
 def perform_ota_update():
     try:
+        # Prequisite checks
+        check_files_required()
+
         # Load update variables
         if not os.path.exists(UPDATE_VARS_PATH):
             raise FileNotFoundError(f"{UPDATE_VARS_PATH} not found.")
@@ -337,7 +391,7 @@ def perform_ota_update():
         smart_download_enabled = update_vars.get("SMART_DOWNLOAD_ENABLED", False)
         api_key = update_vars.get("REPO_API_KEY", "")
 
-        # Prequisite checks
+        # Prequisite checks 2
         if smart_download_enabled:
             result = smart_download_check()
         else:
@@ -346,6 +400,9 @@ def perform_ota_update():
                 "Smart download disabled. It will now continue with the update.",
             )
             result = "continue"
+
+        # Stop the bot
+        stop_bot_process()
 
         # Fetch the update file
         if result == "continue" or not result:
@@ -374,11 +431,9 @@ def perform_ota_update():
 
         # Start the bot
         time.sleep(1)
-        print_progress("Restart", "Starting bot...")
-        subprocess.Popen(
-            ["python", os.path.join(SCRIPT_DIR, "..", "..", "main.py")], close_fds=True
-        )
-        print_progress("Restart", "Bot started successfully.")
+        print_progress("Process", "Starting bot...")
+        subprocess.Popen(["python", os.path.join(ROOT_DIR, "main.py")], close_fds=True)
+        print_progress("Process", "Bot started successfully.")
         print("<<<---OTA Update completed successfully. The bot will now start.--->>>")
         # Exit updater
         time.sleep(5)
