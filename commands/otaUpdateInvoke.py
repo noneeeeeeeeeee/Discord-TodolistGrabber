@@ -40,7 +40,7 @@ class Update(commands.Cog):
             await view.wait()
 
             if view.value:
-                await view.message.edit(content="Starting OTA update...", view=None)
+                await view.message.edit(content="Starting OTA update... The bot will be stopped soon, if something goes wrong within 10 minutes please check the ota_logs in the bot folder", view=None)
                 subprocess.run(["python", "startOTA.py"])
             else:
                 await view.message.edit(
