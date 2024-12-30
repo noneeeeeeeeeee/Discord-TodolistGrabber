@@ -1,53 +1,39 @@
-import discord
+import subprocess
 from discord.ext import commands
 from modules.otaUpdate import check
-# import modules.otaUpdate.startOTA as start_ota
 
-# class Update(commands.Cog):
-#     def __init__(self, bot):
-#         self.bot = bot
+class Update(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
 
-#     class UpdateView(discord.ui.View):
-#         def __init__(self):
-#             super().__init__(timeout=15.0)
-#             self.value = None
+    @commands.hybrid_command(name="checkupdates", description="Check for updates.")
+    async def check_updates(self, ctx: commands.Context):
+        try:
+            # Check for updates
+            result = check.check_update()
+            print(f"Update check result: {result}")
 
-#         @discord.ui.button(
-#             label="Start OTA Update", style=discord.ButtonStyle.green, emoji="✅"
-#         )
-#         async def confirm(
-#             self, button: discord.ui.Button, interaction: discord.Interaction
-#         ):
-#             self.stop()
+            update_available = result.get("status") == "update-available"
+            version = result.get("current_version", "Unknown")
 
-#         async def on_timeout(self):
-#             for child in self.children:
-#                 child.disabled = True
-#             await self.message.edit(view=self)
+            if update_available:
+                await ctx.send(
+                    "Update available! Starting the OTA update process. The bot will stop shortly."
+                )
 
-#     @commands.hybrid_command(name="checkupdates", description="Check for updates.")
-#     async def check_updates(self, ctx: commands.Context):
-#         # Check for updates using the imported function
-#         result = check.check_update()
-#         print(result)
-#         update_available = False
-#         version = "Unknown"
-#         if update_available:
-#             view = self.UpdateView()
-#             view.message = await ctx.send(
-#                 "Update available! Click the button to start the OTA update.", view=view
-#             )
-#             await view.wait()
+                # Run startOTA.py in a separate process
+                subprocess.Popen(
+                    ["python", "modules/otaUpdate/startOTA.py"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
 
-#             if view.value:
-#                 await view.message.edit(content="Starting OTA update... The bot will be stopped soon, if something goes wrong within 10 minutes please check the ota_logs in the bot folder", view=None)
-#                 start_ota.main()
-#             else:
-#                 await view.message.edit(
-#                     content="Update confirmation timed out.", view=None
-#                 )
-#         else:
-#             await ctx.send(f"No updates available. Latest version {version} is already installed.")
+                await ctx.send("OTA update process started successfully.")
+            else:
+                await ctx.send(f"No updates available. Latest version {version} is already installed.")
+        except Exception as e:
+            await ctx.send(f"Error checking updates: {e}")
+            print(f"Error: {e}")
 
 async def setup(bot):
-   await bot.add_cog(Update(bot))
+    await bot.add_cog(Update(bot))

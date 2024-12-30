@@ -12,7 +12,6 @@ VERSION_FILE_PATH = os.path.join(PROJECT_ROOT, "version.txt")
 
 def check_update():
     # Check for required files
-    print("Checking updates loaded successfully")
     if not os.path.exists(UPDATE_VARS_PATH):
         raise FileNotFoundError(f"{UPDATE_VARS_PATH} not found.")
     if not os.path.exists(VERSION_FILE_PATH):
