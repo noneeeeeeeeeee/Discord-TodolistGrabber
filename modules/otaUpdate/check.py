@@ -2,16 +2,17 @@ import os
 import json
 import requests
 
+# Define the project root directory
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
 # File paths
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-UPDATE_VARS_PATH = os.path.abspath(
-    os.path.join(SCRIPT_DIR, "..", "..", "updateVars.json")
-)
-VERSION_FILE_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "version.txt"))
+UPDATE_VARS_PATH = os.path.join(PROJECT_ROOT, "updateVars.json")
+VERSION_FILE_PATH = os.path.join(PROJECT_ROOT, "version.txt")
 
 
 def check_update():
     # Check for required files
+    print("Checking updates loaded successfully")
     if not os.path.exists(UPDATE_VARS_PATH):
         raise FileNotFoundError(f"{UPDATE_VARS_PATH} not found.")
     if not os.path.exists(VERSION_FILE_PATH):
