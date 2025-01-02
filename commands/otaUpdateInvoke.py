@@ -86,7 +86,9 @@ class Update(commands.Cog):
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                     )
-                    await ctx.send("OTA update process started successfully.")
+                    await ctx.send(
+                        "The bot will now shortly shutdown for OTA update. If it doesn't turn back on in a few minutes, please check the logs in the bot folder called ota_logs."
+                    )
                 else:
                     await ctx.send("OTA update cancelled.")
             else:
