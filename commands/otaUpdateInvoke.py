@@ -3,6 +3,7 @@ import discord
 from discord.ext import commands
 from modules.otaUpdate import check
 
+
 class Update(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -14,7 +15,9 @@ class Update(commands.Cog):
             self.value = None
 
         @discord.ui.button(label="Confirm Update", style=discord.ButtonStyle.green)
-        async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
+        async def confirm(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
             # Ensure only the original user can confirm
             if interaction.user.id != self.author_id:
                 await interaction.response.send_message(
@@ -23,11 +26,15 @@ class Update(commands.Cog):
                 return
 
             self.value = True
-            await interaction.response.send_message("Update confirmed! Starting OTA process.")
+            await interaction.response.send_message(
+                "Update confirmed! Starting OTA process."
+            )
             self.stop()
 
         @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
-        async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        async def cancel(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
             # Ensure only the original user can cancel
             if interaction.user.id != self.author_id:
                 await interaction.response.send_message(
@@ -42,7 +49,7 @@ class Update(commands.Cog):
         async def on_timeout(self):
             for child in self.children:
                 child.disabled = True
-            if self.message:
+            if hasattr(self, "message") and self.message:
                 await self.message.edit(view=self)
 
     @commands.hybrid_command(name="checkupdates", description="Check for updates.")
@@ -54,15 +61,19 @@ class Update(commands.Cog):
 
             update_available = result.get("status") == "update-available"
             current_version = result.get("current_version", "Unknown")
-            new_version = result.get("new_version", "Unknown")
+            new_version = result.get("latest_version", "Unknown")
             changelog = result.get("changelog", "Unknown")
 
             if update_available:
                 embed = discord.Embed(
                     title="Update Available!",
-                    description=f"Current Version: {current_version}\nNew Version: {new_version}\nChangelog: {changelog}",
-                    color=discord.Color.green()
+                    description=f"# Changelog v{new_version} \n {changelog}",
+                    color=discord.Color.green(),
                 )
+                embed.add_field(
+                    name="Current Version", value=current_version, inline=True
+                )
+                embed.add_field(name="New Version", value=new_version, inline=True)
                 view = self.ConfirmUpdateView(ctx.author.id)
                 view.message = await ctx.send(embed=embed, view=view)
 
@@ -82,17 +93,18 @@ class Update(commands.Cog):
                 embed = discord.Embed(
                     title="No Updates Available",
                     description=f"Latest version {current_version} is already installed.",
-                    color=discord.Color.dark_gray()
+                    color=discord.Color.dark_gray(),
                 )
                 await ctx.send(embed=embed)
         except Exception as e:
             embed = discord.Embed(
                 title="Error Checking Updates",
                 description=f"Error: {e}",
-                color=discord.Color.red()
+                color=discord.Color.red(),
             )
             await ctx.send(embed=embed)
             print(f"Error: {e}")
+
 
 async def setup(bot):
     await bot.add_cog(Update(bot))

@@ -3,7 +3,7 @@ import json
 import requests
 
 # Define the project root directory
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 # File paths
 UPDATE_VARS_PATH = os.path.join(PROJECT_ROOT, "updateVars.json")
@@ -41,7 +41,9 @@ def check_update():
         # Fetch the latest release version tag
         response = requests.get(latest_release_api, headers=headers)
         response.raise_for_status()
-        latest_version = response.json().get("tag_name")
+        release_data = response.json()
+        latest_version = release_data.get("tag_name")
+        changelog = release_data.get("body")
 
         if not latest_version:
             return {
@@ -55,12 +57,14 @@ def check_update():
                 "status": "up-to-date",
                 "current_version": current_version,
                 "latest_version": latest_version,
+                "changelog": changelog,
             }
         else:
             return {
                 "status": "update-available",
                 "current_version": current_version,
                 "latest_version": latest_version,
+                "changelog": changelog,
             }
     except requests.exceptions.RequestException as e:
         return {"status": "error", "message": f"HTTP request failed: {e}"}
