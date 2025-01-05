@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 import discord
 from discord.ext import commands
 from discord.ui import View, Button
@@ -47,11 +48,14 @@ class MusicPlayer(commands.Cog):
         if not ctx.author.voice:
             await ctx.send(":x: You need to be in a voice channel to play music.")
             return
+
         linkType = LinksIdentifier.identify_link(input)
-        print(f"Link Type: {linkType}")
+        print(
+            f"Link Type (Soon, the music bot should support more link types): {linkType}"
+        )
         voice_channel = ctx.author.voice.channel
         if "https://www.youtube.com" in input and not "list=" in input:
-            await self.play_link(ctx, voice_channel, input, config)
+            await self.add_to_queue(ctx, voice_channel, input, config)
         elif "list=" in input:
             await self.handle_playlist(ctx, voice_channel, input, config)
         elif input.lower().startswith("search"):
@@ -64,10 +68,7 @@ class MusicPlayer(commands.Cog):
                 ":x: Please provide a valid input. Example: !play <YouTube link, search query, or playlist> or !play search <search query> \n More sources coming soon!"
             )
 
-    async def play_link(self, ctx, voice_channel, link, config):
-        await self.play_song_or_link(ctx, voice_channel, link, config)
-
-    async def play_song_or_link(
+    async def add_to_queue(
         self, ctx_or_interaction, voice_channel, link_or_url, config
     ):
         guild = ctx_or_interaction.guild
@@ -79,13 +80,7 @@ class MusicPlayer(commands.Cog):
 
         if guild.voice_client is None or guild.voice_client.channel != voice_channel:
             await voice_channel.connect()
-        await self.add_song_to_queue(
-            ctx_or_interaction, guild, author, link_or_url, config, link_or_url
-        )
 
-    async def add_song_to_queue(
-        self, ctx_or_interaction, guild, author, link_or_url, config, ogurl
-    ):
         try:
             info = await self.youtube_fetcher.extract_info(link_or_url)
             if info is None or "formats" not in info:
@@ -113,91 +108,31 @@ class MusicPlayer(commands.Cog):
             duration = info.get("duration", 0)
             guild_id = guild.id
             self.music_queue.setdefault(guild_id, [])
-            self.music_queue[guild_id].append((author, url, ogurl, title, duration))
-            print(f"Queue: {self.music_queue}")
-            if guild.voice_client.is_playing():
+            self.music_queue[guild_id].append(
+                (author, url, link_or_url, title, duration)
+            )
+
+            if not guild.voice_client.is_playing():
+                await self.play_now(ctx_or_interaction, guild.voice_client, config)
+            else:
                 await self.send_message(
                     ctx_or_interaction, f"Added **{title}** to the queue."
-                )
-            else:
-                await self.play_next_song(
-                    ctx_or_interaction, guild.voice_client, config, author
                 )
         except youtube_dl.utils.DownloadError as e:
             await self.send_message(ctx_or_interaction, f"Download error: {e}")
             print(f"Download error: {e}")
         except Exception as e:
-            print(f"Error in add_song_to_queue: {e}")
+            print(f"Error in add_to_queue: {e}")
             await self.send_message(ctx_or_interaction, f":x: An error occurred: {e}")
 
-    async def play_song(
-        self, ctx_or_interaction, voice_client, url, ogurl, title, config, author
-    ):
-        ffmpeg_options = {
-            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            "options": "-vn",
-        }
-
-        voice_client.play(
-            discord.FFmpegPCMAudio(
-                url, **ffmpeg_options, executable=config.get("FFmpegPath", "ffmpeg")
-            ),
-            after=lambda e: self.bot.loop.create_task(
-                self.after_play(ctx_or_interaction, e)
-            ),
-        )
-
-        # Apply the stored volume level
-        volume_cog = self.bot.get_cog("Volume")
-        if volume_cog:
-            await volume_cog.apply_volume(voice_client)
-
-        embed = discord.Embed(
-            title="Now Playing (Beta)",
-            description=f"[{title}]({ogurl})",
-            color=discord.Color.green(),
-        )
-        embed.set_author(
-            name=f"Requested by {author.display_name}", icon_url=author.avatar.url
-        )
-        embed.set_footer(text=f"Bot Version: {read_current_version()}")
-        await self.send_message(ctx_or_interaction, embed=embed)
-
-    async def after_play(self, ctx_or_interaction, error):
-        guild = ctx_or_interaction.guild
-        guild_id = guild.id
-
-        if error:
-            print(f"Player error: {error}")
-            await self.send_message(
-                ctx_or_interaction, f":x: An error occurred: {error}"
-            )
-
-        if self.music_queue[guild_id]:
-            next_song = self.music_queue[guild_id].pop(0)
-            author, next_url, ogurl, next_title, duration = next_song
-            await self.play_song(
-                ctx_or_interaction,
-                guild.voice_client,
-                next_url,
-                ogurl,
-                next_title,
-                json_get(guild_id),
-                ctx_or_interaction.author,
-            )
-        else:
-            await self.send_message(ctx_or_interaction, "The queue is now empty.")
-
-    async def play_next_song(self, ctx_or_interaction, voice_client, config, author):
+    async def play_now(self, ctx_or_interaction, voice_client, config):
         guild_id = ctx_or_interaction.guild.id
 
-        # Check if there’s a song in the `now_playing` or if the queue has another song to play
         if guild_id not in self.music_queue or not self.music_queue[guild_id]:
             self.now_playing.pop(guild_id, None)
             print("Queue is empty, nothing to play.")
             return
 
-        # Get the next song from the queue
         next_song = self.music_queue[guild_id].pop(0)
         author, url, ogurl, title, duration = next_song
         self.now_playing[guild_id] = {
@@ -206,9 +141,9 @@ class MusicPlayer(commands.Cog):
             "ogurl": ogurl,
             "title": title,
             "duration": duration,
+            "start_time": datetime.now(),
         }
 
-        # Define the after_playing callback
         def after_playing(error):
             if error:
                 print(f"Player error: {error}")
@@ -221,46 +156,51 @@ class MusicPlayer(commands.Cog):
             else:
                 print("Song finished, moving to next in queue.")
             asyncio.run_coroutine_threadsafe(
-                self.play_next_song(ctx_or_interaction, voice_client, config, author),
+                self.play_now(ctx_or_interaction, voice_client, config),
                 self.bot.loop,
             )
 
-        # Play the audio stream with FFmpeg options
         ffmpeg_options = {
             "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
             "options": "-vn",
         }
 
         voice_client.play(
-            discord.FFmpegPCMAudio(
-                url, **ffmpeg_options, executable=config.get("FFmpegPath", "ffmpeg")
-            ),
+            discord.FFmpegPCMAudio(url, **ffmpeg_options),
             after=after_playing,
         )
 
-        embed = discord.Embed(
-            title="Now Playing (Beta)",
-            description=f"[{title}]({ogurl})",
-            color=discord.Color.green(),
-        )
-        embed.set_author(
-            name=f"Requested by {author.display_name}", icon_url=author.avatar.url
-        )
-        embed.set_footer(text=f"Bot Version: {read_current_version()}")
-        await self.send_message(ctx_or_interaction, embed=embed)
+        # Apply the stored volume level
+        volume_cog = self.bot.get_cog("Volume")
+        if volume_cog:
+            await volume_cog.apply_volume(voice_client)
+
+        now_playing_cog = self.bot.get_cog("NowPlaying")
+        if now_playing_cog:
+            elapsed = (
+                datetime.now() - self.now_playing[guild_id]["start_time"]
+            ).seconds
+            embed = now_playing_cog.now_playing_embed(
+                title, ogurl, author, discord.Color.green(), elapsed, duration
+            )
+            await self.send_message(ctx_or_interaction, embed=embed)
+
+    def get_current_duration(self, guild_id):
+        if guild_id in self.now_playing:
+            start_time = self.now_playing[guild_id]["start_time"]
+            return (datetime.now() - start_time).seconds
+        return 0
 
     async def handle_playlist(self, ctx, voice_channel, playlist_url, config):
         await ctx.reply(
-            ":hourglass: Adding playlist to the queue... Larger playlists may take longer to add. (Beta)"
+            ":hourglass: Adding playlist to the queue... Larger playlists may take longer to add."
         )
         guild_id = ctx.guild.id
         if guild_id not in self.music_queue:
             self.music_queue[guild_id] = []
 
-        # Extract the author information
         author = ctx.author if isinstance(ctx, commands.Context) else ctx.user
 
-        # Parse the playlist URL to extract the playlist ID
         parsed_url = urllib.parse.urlparse(playlist_url)
         query_params = urllib.parse.parse_qs(parsed_url.query)
         playlist_id = query_params.get("list", [None])[0]
@@ -270,7 +210,6 @@ class MusicPlayer(commands.Cog):
             )
             return
 
-        playlist_items = []
         try:
             playlist_items = await self.youtube_fetcher.fetch_playlist_items(
                 playlist_id
@@ -292,13 +231,11 @@ class MusicPlayer(commands.Cog):
                 f":white_check_mark: Added {len(playlist_items)} songs from the playlist to the queue."
             )
 
-            # Ensure the bot is connected to the voice channel
             if not ctx.voice_client:
                 await voice_channel.connect()
 
-            # Check if the bot is playing
             if not ctx.voice_client.is_playing():
-                await self.play_next_song(ctx, ctx.voice_client, config, author)
+                await self.play_now(ctx, ctx.voice_client, config)
 
         except Exception as e:
             await ctx.send(f"An error occurred while retrieving the playlist: {str(e)}")
@@ -309,7 +246,7 @@ class MusicPlayer(commands.Cog):
 
             if top_n == 1:
                 if search_results:
-                    await self.play_link(
+                    await self.add_to_queue(
                         ctx,
                         ctx.author.voice.channel,
                         search_results[0][0],
@@ -377,7 +314,7 @@ class SongSelectionView(View):
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
-        await self.ctx.send("Time is up! You didn't select a song.", timeout=10)
+        await self.ctx.send("Time is up! You didn't select a song.")
         await self.ctx.edit(view=self)
 
 
@@ -403,13 +340,11 @@ class SongSelectionButton(Button):
             button.disabled = True
         self.view.stop()
 
-        # Access voice_client via interaction.guild.voice_client
         voice_channel = interaction.user.voice.channel
         if not interaction.guild.voice_client:
             await voice_channel.connect()
 
-        # Play the selected song
-        await self.music_player.play_link(
+        await self.music_player.add_to_queue(
             interaction,
             voice_channel,
             self.song_info[0],
