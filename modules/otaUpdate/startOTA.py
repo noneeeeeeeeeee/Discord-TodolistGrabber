@@ -13,8 +13,21 @@ from check import check_update
 
 # File paths, constants, and custom module imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
-UPDATE_VARS_PATH = os.path.join(ROOT_DIR, "updateVars.json")
+UPDATE_VARS_PATH = os.path.join(SCRIPT_DIR, "updateVars.json")
+
+# Load update variables
+if not os.path.exists(UPDATE_VARS_PATH):
+    raise FileNotFoundError(f"{UPDATE_VARS_PATH} not found.")
+
+with open(UPDATE_VARS_PATH, "r") as f:
+    update_vars = json.load(f)
+
+# Determine the root directory based on the PROJECT_ROOT_FROM_OTA_SCRIPT_LOCATION value
+root_dir_depth = update_vars.get("PROJECT_ROOT_FROM_OTA_SCRIPT_LOCATION", 0)
+ROOT_DIR = SCRIPT_DIR
+for _ in range(root_dir_depth):
+    ROOT_DIR = os.path.dirname(ROOT_DIR)
+
 LOGS_DIR = os.path.join(ROOT_DIR, "ota_logs")
 TEMP_DIR = os.path.join(ROOT_DIR, "temp_update")
 

@@ -13,5 +13,7 @@
   "UPDATE_GET_METHOD": "GET_FROM_RELEASE_SOURCE",
   "EXTRACT_FILES": true,
   "MOVE_CONTENTS_IN_FOLDER": true,
-  "SMART_DOWNLOAD_ENABLED": false
+  "SMART_DOWNLOAD_ENABLED": true,
+  "_comment2": "PROJECT_ROOT_FROM_OTA_SCRIPT_LOCATION is the path to the project root from the location of the OTA script. This is used to move the files to the correct location, the number indicates how many directories above it is, 0 means its already at root, 1.. etc.",
+  "PROJECT_ROOT_FROM_OTA_SCRIPT_LOCATION": 2
 }

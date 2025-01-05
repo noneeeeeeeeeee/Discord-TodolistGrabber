@@ -47,3 +47,7 @@ class Lyrics(commands.Cog):
             await ctx.send(embed=embed)
         else:
             await ctx.send(":x: No song is currently playing.")
+
+
+def setup(bot):
+    bot.add_cog(Lyrics(bot))
