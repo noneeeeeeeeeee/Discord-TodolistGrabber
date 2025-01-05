@@ -3,11 +3,21 @@ import json
 import requests
 
 # Define the project root directory
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+UPDATE_VARS_PATH = os.path.join(SCRIPT_DIR, "updateVars.json")
+# Load update variables
+if not os.path.exists(UPDATE_VARS_PATH):
+    raise FileNotFoundError(f"{UPDATE_VARS_PATH} not found.")
+
+with open(UPDATE_VARS_PATH, "r") as f:
+    update_vars = json.load(f)
+root_dir_depth = update_vars.get("PROJECT_ROOT_FROM_OTA_SCRIPT_LOCATION", 0)
+ROOT_DIR = SCRIPT_DIR
+for _ in range(root_dir_depth):
+    ROOT_DIR = os.path.dirname(ROOT_DIR)
 
 # File paths
-UPDATE_VARS_PATH = os.path.join(PROJECT_ROOT, "updateVars.json")
-VERSION_FILE_PATH = os.path.join(PROJECT_ROOT, "version.txt")
+VERSION_FILE_PATH = os.path.join(ROOT_DIR, "version.txt")
 
 
 def check_update():
