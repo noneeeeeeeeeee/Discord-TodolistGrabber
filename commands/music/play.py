@@ -338,22 +338,27 @@ class MusicPlayer(commands.Cog):
 
     async def send_message(self, ctx_or_interaction, message=None, embed=None):
         """Helper function to send a message or an embed in both Context and Interaction."""
-        if isinstance(ctx_or_interaction, commands.Context):
-            if embed:
-                await ctx_or_interaction.send(embed=embed)
-            else:
-                await ctx_or_interaction.send(message)
-        else:
-            if not ctx_or_interaction.response.is_done():
+        try:
+            if isinstance(ctx_or_interaction, commands.Context):
                 if embed:
-                    await ctx_or_interaction.response.send_message(embed=embed)
+                    await ctx_or_interaction.send(embed=embed)
                 else:
-                    await ctx_or_interaction.response.send_message(message)
+                    await ctx_or_interaction.send(message)
             else:
-                if embed:
-                    await ctx_or_interaction.followup.send(embed=embed)
+                if not ctx_or_interaction.response.is_done():
+                    if embed:
+                        await ctx_or_interaction.response.send_message(embed=embed)
+                    else:
+                        await ctx_or_interaction.response.send_message(message)
                 else:
-                    await ctx_or_interaction.followup.send(message)
+                    if embed:
+                        await ctx_or_interaction.followup.send(embed=embed)
+                    else:
+                        await ctx_or_interaction.followup.send(message)
+        except discord.errors.NotFound:
+            print("Interaction not found or has expired.")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
 
 
 class SongSelectionView(View):

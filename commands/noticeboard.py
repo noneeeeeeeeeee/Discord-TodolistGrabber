@@ -1,5 +1,7 @@
 import discord
 from discord.ext import commands
+import os
+from modules.enviromentfilegenerator import check_and_load_env_file
 from discord.ui import Button, View
 from modules.setconfig import (
     edit_noticeboard_config,
@@ -13,6 +15,7 @@ from modules.cache import truncate_cache  # Make sure you have this function imp
 class NoticeBoard(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        check_and_load_env_file()
 
     @commands.command(name="noticeboard")
     async def noticeboard_name(self, ctx, action: str = None, field: str = None):
@@ -173,9 +176,14 @@ class NoticeBoard(commands.Cog):
                     interval = int(interval_msg.content)
 
                     edit_noticeboard_config(guild_id, None, interval)
-                    await ctx.send(
-                        f"NoticeBoard update interval has been set to {interval} seconds."
-                    )
+                    if os.getenv("DEV_GUILD") == guild_id:
+                        await ctx.send(
+                            f"NoticeBoard update interval has been set to {interval} seconds."
+                        )
+                    else:
+                        await ctx.send(
+                            f"NoticeBoard update interval has been set to {interval} seconds, although it will not take effect, since it is not in the owners guild, if you have an issue with the check time, please contact the bot hoster."
+                        )
                 except ValueError:
                     await ctx.send(
                         "Invalid interval provided. Please enter a valid number of seconds."

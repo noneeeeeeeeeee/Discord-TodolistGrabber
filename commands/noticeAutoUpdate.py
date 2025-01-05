@@ -1,11 +1,13 @@
 from discord.ext import commands, tasks
 import discord
 import json
+import os
 from datetime import datetime, timedelta
 import asyncio
 from modules.setconfig import json_get, check_guild_config_available, edit_json_file
 from modules.cache import cache_data, cache_read_latest
 from modules.readversion import read_current_version
+from modules.enviromentfilegenerator import check_and_load_env_file
 
 
 class NoticeAutoUpdate(commands.Cog):
@@ -19,6 +21,7 @@ class NoticeAutoUpdate(commands.Cog):
         self.ping_message_lock = asyncio.Lock()
         self.update_noticeboard.start()
         self.send_ping_message_loop.start()
+        check_and_load_env_file()
 
     @tasks.loop(seconds=3600)
     async def update_noticeboard(self):
@@ -26,31 +29,30 @@ class NoticeAutoUpdate(commands.Cog):
         for guild in self.bot.guilds:
             guild_id = guild.id
             try:
-                # Code is fundamentally flawd when inviting to multiple discord servers, as it will fight for the loop interval for the config
-                # todo: Fix this by making the interval 1 hour by default and check each config for the interval/time.
                 config = json_get(guild_id)
-                interval = config.get("NoticeBoardUpdateInterval", 3600)
-                self.update_noticeboard.change_interval(seconds=interval)
+                if os.getenv("DEV_GUILD") == guild_id:
+                    interval = config.get("NoticeBoardUpdateInterval", 3600)
+                    self.update_noticeboard.change_interval(seconds=interval)
                 pingmessage_edit_id = config.get("pingmessageEditID", None)
                 ping_role = config.get("PingRoleId", None)
             except Exception as e:
                 print(f"Error getting config for guild {guild_id}: {e}")
-                continue
+                return
 
             noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
             noticeboard_edit_ids = config.get("noticeboardEditID", [])
             interval = config.get("NoticeBoardUpdateInterval", 3600)
 
             if noticeboard_channel_id == "Default" or noticeboard_channel_id is None:
-                continue
+                return
 
-            if interval == None:
-                continue
+            if interval == None and os.getenv("DEV_GUILD") == guild_id:
+                return
 
             channel = guild.get_channel(int(noticeboard_channel_id))
             if channel is None:
                 print(f"Channel not found for guild {guild_id}.")
-                continue
+                return
 
             version = read_current_version()
             new_message_ids = []
@@ -61,14 +63,14 @@ class NoticeAutoUpdate(commands.Cog):
 
             if not task_data_str:
                 print("Error: No task data found in the cache.")
-                continue
+                return
 
             try:
                 task_data = json.loads(task_data_str)
                 api_call_time = task_data.get("api-call-time", "Unknown")
             except json.JSONDecodeError:
                 print(f"Error: Unable to decode cached data. Raw data: {task_data_str}")
-                continue
+                return
 
             # Ensure task_data is in the expected format (dict)
             if not isinstance(task_data, dict):
@@ -209,7 +211,11 @@ class NoticeAutoUpdate(commands.Cog):
                 )
                 return
 
-            if interval is None or interval == "null":
+            if (
+                interval is None
+                or interval == "null"
+                and os.getenv("DEV_GUILD") == guild_id
+            ):
                 print(
                     f"Noticeboard update interval not set for guild {guild_id}. Skipping update."
                 )
