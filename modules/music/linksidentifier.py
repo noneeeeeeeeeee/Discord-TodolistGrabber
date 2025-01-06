@@ -16,19 +16,42 @@ class LinksIdentifier:
         "AppleMusic": {
             "station": r"https://music\.apple\.com/.*/station/([^?]+)",
             "playlist": r"https://music\.apple\.com/.*/playlist/([^?]+)",
-            "album": r"https://music\.apple\.com/.*/album/([^?]+)",
+            "album": r"https://music\.apple\.com/.*/album/([^/]+)/([^?]+)",
             "artist": r"https://music\.apple\.com/.*/artist/([^?]+)",
         },
     }
 
     @staticmethod
     def identify_link(input_link: str):
+        # Check for Search
+        if input_link.startswith("search "):
+            search_query = input_link[7:].strip()
+            return {
+                "musicProvider": "SearchQuery",
+                "type": "Search",
+                "query": search_query,
+            }
+
+        search_query = input_link.strip()
+        if search_query:
+            return {
+                "musicProvider": "SearchQuery",
+                "type": "QuickSearch",
+                "query": search_query,
+            }
+
         # Iterate through patterns to find a match
         for provider, types in LinksIdentifier.PATTERNS.items():
             for link_type, pattern in types.items():
                 match = re.search(pattern, input_link)
                 if match:
-                    # If a match is found, return parsed data in JSON format
+                    if provider == "AppleMusic" and link_type == "album":
+                        return {
+                            "musicProvider": provider,
+                            "type": link_type,
+                            "title": match.group(1),
+                            "id": match.group(2),
+                        }
                     return {
                         "musicProvider": provider,
                         "type": link_type,

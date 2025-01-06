@@ -8,7 +8,7 @@ class NowPlaying(commands.Cog):
         self.bot = bot
 
     def now_playing_embed(self, title, url, author, color, elapsed, duration):
-        progress_bar_length = 20
+        progress_bar_length = 15
         progress = int((elapsed / duration) * progress_bar_length)
         progress_bar = "▬" * progress + "🔘" + "▬" * (progress_bar_length - progress)
 
