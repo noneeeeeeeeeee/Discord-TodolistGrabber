@@ -6,29 +6,36 @@ import googleapiclient.discovery
 import urllib.parse
 from modules.setconfig import json_get
 
+
 class YouTubeFetcher:
     def __init__(self):
         check_and_load_env_file()
         self.youtube_api_key = os.getenv("YOUTUBE_API_KEY")
         if not self.youtube_api_key:
-            raise ValueError("YouTube API key is missing. Ensure it's set in the environment variables.")
-        
+            raise ValueError(
+                "YouTube API key is missing. Ensure it's set in the environment variables."
+            )
+
         self.youtube_service = googleapiclient.discovery.build(
             "youtube", "v3", developerKey=self.youtube_api_key
         )
 
         self.youtube_dl_options = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'nocheckcertificate': True,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }]
+            "format": "bestaudio/best",
+            "quiet": True,
+            "nocheckcertificate": True,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
         }
 
-    async def handle_playlist(self, playlist_url, music_queue, guild_id, max_duration, max_results=50):
+    async def handle_playlist(
+        self, playlist_url, music_queue, guild_id, max_duration, max_results=50
+    ):
         """Handles playlist processing by fetching items and adding them to the music queue."""
         # Parse the playlist URL to extract the playlist ID
         parsed_url = urllib.parse.urlparse(playlist_url)
@@ -36,7 +43,7 @@ class YouTubeFetcher:
         playlist_id = query_params.get("list", [None])[0]
         if not playlist_id:
             raise ValueError("Invalid playlist URL. Could not extract the playlist ID.")
-        
+
         # Fetch playlist items
         try:
             playlist_items = await self.fetch_playlist_items(playlist_id, max_results)
@@ -70,7 +77,7 @@ class YouTubeFetcher:
                 part="snippet",
                 maxResults=min(max_results - len(videos), 50),
                 playlistId=playlist_id,
-                pageToken=next_page_token
+                pageToken=next_page_token,
             )
             response = request.execute()
 
@@ -84,7 +91,7 @@ class YouTubeFetcher:
                 break
 
         return videos
-    
+
     async def remove_non_songs_using_sponsorblock(self, music_queue, guild_id):
         """Removes non-song entries from the music queue using the SponsorBlock API."""
         config = json_get(guild_id)
@@ -93,34 +100,47 @@ class YouTubeFetcher:
 
         if not sponsorblockcheck:
             return
-        
-    
-    async def process_video_entry(self, video, music_queue, guild_id, track_max_duration, author):
+
+    async def process_video_entry(
+        self, video, music_queue, guild_id, track_max_duration, author
+    ):
         """Processes a single video entry and adds it to the music queue if it meets the criteria."""
         try:
             video_id = video["id"]
             video_url = f"https://www.youtube.com/watch?v={video_id}"
             info = await self.extract_info(video_url)
 
-            if info is None or 'formats' not in info:
+            if info is None or "formats" not in info:
                 print(f"Could not extract info for video: {video_url}")
-                return
+                return video["title"]
 
             audio_url = next(
-                (f['url'] for f in info['formats'] if f.get('acodec') and f['acodec'] != 'none'),
-                None
+                (
+                    f["url"]
+                    for f in info["formats"]
+                    if f.get("acodec") and f["acodec"] != "none"
+                ),
+                None,
             )
 
-            title = info.get('title', 'Unknown Title')
-            duration = info.get('duration', 0)
+            title = info.get("title", "Unknown Title")
+            duration = info.get("duration", 0)
 
             if audio_url and duration <= track_max_duration:
-                music_queue.setdefault(guild_id, []).append((author, audio_url, video_url, title, duration))
+                music_queue.setdefault(guild_id, []).append(
+                    (author, audio_url, video_url, title, duration)
+                )
             else:
-                print(f"Skipped video: {title}, no audio URL found or duration exceeds limit.")
+                print(
+                    f"Skipped video: {title}, no audio URL found or duration exceeds limit."
+                )
+                return title
 
         except Exception as e:
             print(f"Error adding video to queue: {e}")
+            return video["title"]
+
+        return None
 
     async def extract_info(self, url):
         loop = asyncio.get_event_loop()
@@ -132,7 +152,9 @@ class YouTubeFetcher:
 
     async def search_youtube(self, query, top_n=1):
         try:
-            response = await asyncio.to_thread(self.youtube_search_handler, query, top_n)
+            response = await asyncio.to_thread(
+                self.youtube_search_handler, query, top_n
+            )
 
             search_results = []
             for item in response["items"]:
@@ -154,6 +176,6 @@ class YouTubeFetcher:
             maxResults=top_n,
             type="video",
             videoCategoryId="10",
-            videoEmbeddable="true"
+            videoEmbeddable="true",
         )
         return request.execute()

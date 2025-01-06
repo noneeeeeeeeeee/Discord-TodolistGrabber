@@ -4,7 +4,6 @@ import discord
 from discord.ext import commands
 from discord.ui import View, Button
 from modules.music.youtubefetch import YouTubeFetcher
-from modules.readversion import read_current_version
 from modules.setconfig import json_get, check_guild_config_available
 from modules.music.linksidentifier import LinksIdentifier
 import yt_dlp as youtube_dl
@@ -24,49 +23,55 @@ class MusicPlayer(commands.Cog):
     @discord.app_commands.describe(
         input="Input can be a YouTube link, file, or search query"
     )
-    async def play(self, ctx: commands.Context, *, input: str):
-        guild_id = ctx.guild.id
-        # Check if guild is configured
-        if not check_guild_config_available(guild_id):
-            await ctx.send(
-                ":x: The server is not configured yet. Please run the !setup command."
-            )
-            return
-        config = json_get(guild_id)
-        # Check if music is enabled
-        if not config.get("MusicEnabled", False):
-            await ctx.send(":x: Music is disabled on this server.")
-            return
-        # Check if DJ role is required
-        if config.get("MusicDJRoleRequired", False) and not any(
-            role.id == config["MusicDJRole"] or role.id == config["DefaultAdmin"]
-            for role in ctx.author.roles
-        ):
-            await ctx.send(":x: You don't have the required role to play music.")
-            return
-        # Check if user is in a voice channel
-        if not ctx.author.voice:
-            await ctx.send(":x: You need to be in a voice channel to play music.")
-            return
+    async def play(self, ctx: commands.Context, *, input: str = None):
+        try:
+            guild_id = ctx.guild.id
+            # Check if guild is configured
+            if not check_guild_config_available(guild_id):
+                await ctx.send(
+                    ":x: The server is not configured yet. Please run the !setup command."
+                )
+                return
+            config = json_get(guild_id)
+            # Check if music is enabled
+            if not config.get("MusicEnabled", False):
+                await ctx.send(":x: Music is disabled on this server.")
+                return
+            # Check if DJ role is required
+            if config.get("MusicDJRoleRequired", False) and not any(
+                role.id == config["MusicDJRole"] or role.id == config["DefaultAdmin"]
+                for role in ctx.author.roles
+            ):
+                await ctx.send(":x: You don't have the required role to play music.")
+                return
+            # Check if user is in a voice channel
+            if not ctx.author.voice:
+                await ctx.send(":x: You need to be in a voice channel to play music.")
+                return
 
-        linkType = LinksIdentifier.identify_link(input)
-        print(
-            f"Link Type (Soon, the music bot should support more link types): {linkType}"
-        )
-        voice_channel = ctx.author.voice.channel
-        if "https://www.youtube.com" in input and not "list=" in input:
-            await self.add_to_queue(ctx, voice_channel, input, config)
-        elif "list=" in input:
-            await self.handle_playlist(ctx, voice_channel, input, config)
-        elif input.lower().startswith("search"):
-            query = input[len("search") :].strip()
-            await self.search_youtube(ctx, query, top_n=10)
-        elif input:
-            await self.search_youtube(ctx, input, top_n=1)
-        else:
-            await ctx.send(
-                ":x: Please provide a valid input. Example: !play <YouTube link, search query, or playlist> or !play search <search query> \n More sources coming soon!"
+            linkType = LinksIdentifier.identify_link(input)
+            print(
+                f"Link Type (Soon, the music bot should support more link types): {linkType}"
             )
+            voice_channel = ctx.author.voice.channel
+            if "https://www.youtube.com" in input and not "list=" in input:
+                await self.add_to_queue(ctx, voice_channel, input, config)
+            elif "list=" in input:
+                await self.handle_playlist(ctx, voice_channel, input, config)
+            elif input.lower().startswith("search"):
+                query = input[len("search") :].strip()
+                await self.search_youtube(ctx, query, top_n=10)
+            elif input:
+                await self.search_youtube(ctx, input, top_n=1)
+            else:
+                await ctx.send(
+                    ":x: Please provide a valid input. Example: !play <YouTube link, search query, or playlist> or !play search <search query> \n More sources coming soon!"
+                )
+        except commands.errors.MissingRequiredArgument as e:
+            await ctx.send(f":x: Missing required argument: {e.param.name}")
+        except Exception as e:
+            await ctx.send(f":x: An unexpected error occurred: {str(e)}")
+            print(f"Error in play command: {e}")
 
     async def add_to_queue(
         self, ctx_or_interaction, voice_channel, link_or_url, config
@@ -125,12 +130,12 @@ class MusicPlayer(commands.Cog):
             print(f"Error in add_to_queue: {e}")
             await self.send_message(ctx_or_interaction, f":x: An error occurred: {e}")
 
-    async def play_now(self, ctx_or_interaction, voice_client, config):
-        guild_id = ctx_or_interaction.guild.id
+    async def play_now(self, ctx, voice_client, config):
+        guild_id = ctx.guild.id
 
         if guild_id not in self.music_queue or not self.music_queue[guild_id]:
             self.now_playing.pop(guild_id, None)
-            print("Queue is empty, nothing to play.")
+            await ctx.send(":x: No more songs in the queue.")
             return
 
         next_song = self.music_queue[guild_id].pop(0)
@@ -148,15 +153,11 @@ class MusicPlayer(commands.Cog):
             if error:
                 print(f"Player error: {error}")
                 asyncio.run_coroutine_threadsafe(
-                    ctx_or_interaction.send(
-                        ":x: An error occurred while playing the song."
-                    ),
+                    ctx.send(":x: An error occurred while playing the song."),
                     self.bot.loop,
                 )
-            else:
-                print("Song finished, moving to next in queue.")
             asyncio.run_coroutine_threadsafe(
-                self.play_now(ctx_or_interaction, voice_client, config),
+                self.play_now(ctx, voice_client, config),
                 self.bot.loop,
             )
 
@@ -183,7 +184,7 @@ class MusicPlayer(commands.Cog):
             embed = now_playing_cog.now_playing_embed(
                 title, ogurl, author, discord.Color.green(), elapsed, duration
             )
-            await self.send_message(ctx_or_interaction, embed=embed)
+            await self.send_message(ctx, embed=embed)
 
     def get_current_duration(self, guild_id):
         if guild_id in self.now_playing:
@@ -218,18 +219,27 @@ class MusicPlayer(commands.Cog):
                 await ctx.send("No videos found in the playlist.")
                 return
 
+            failed_videos = []
             for item in playlist_items:
-                await self.youtube_fetcher.process_video_entry(
+                result = await self.youtube_fetcher.process_video_entry(
                     item,
                     self.music_queue,
                     ctx.guild.id,
                     config.get("TrackMaxDuration", 360),
                     author,
                 )
+                if result:
+                    failed_videos.append(result)
 
-            await ctx.send(
-                f":white_check_mark: Added {len(playlist_items)} songs from the playlist to the queue."
-            )
+            if failed_videos:
+                failed_videos_str = "\n - ".join(failed_videos)
+                await ctx.send(
+                    f":white_check_mark: Added {len(playlist_items) - len(failed_videos)} songs from the playlist to the queue.\n :x: {len(failed_videos)} videos did not get added to the queue: - {failed_videos_str}"
+                )
+            else:
+                await ctx.send(
+                    f":white_check_mark: Added {len(playlist_items)} songs from the playlist to the queue."
+                )
 
             if not ctx.voice_client:
                 await voice_channel.connect()
@@ -328,12 +338,12 @@ class SongSelectionButton(Button):
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.original_user_id:
             await interaction.response.send_message(
-                "This isn't your message! You cannot select a song.", ephemeral=True
+                ":x: This isn't your message! You cannot select a song.", ephemeral=True
             )
             return
 
         await interaction.response.send_message(
-            f"You selected {self.song_info[1]}. Playing it now!"
+            f":arrow_right: You selected {self.song_info[1]}."
         )
 
         for button in self.view.children:
