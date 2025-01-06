@@ -23,23 +23,6 @@ class LinksIdentifier:
 
     @staticmethod
     def identify_link(input_link: str):
-        # Check for Search
-        if input_link.startswith("search "):
-            search_query = input_link[7:].strip()
-            return {
-                "musicProvider": "SearchQuery",
-                "type": "Search",
-                "query": search_query,
-            }
-
-        search_query = input_link.strip()
-        if search_query:
-            return {
-                "musicProvider": "SearchQuery",
-                "type": "QuickSearch",
-                "query": search_query,
-            }
-
         # Iterate through patterns to find a match
         for provider, types in LinksIdentifier.PATTERNS.items():
             for link_type, pattern in types.items():
@@ -57,5 +40,23 @@ class LinksIdentifier:
                         "type": link_type,
                         "id": match.group(1),
                     }
+
+        # Check for Search
+        if input_link.startswith("search "):
+            search_query = input_link[7:].strip()
+            return {
+                "musicProvider": "SearchQuery",
+                "type": "Search",
+                "query": search_query,
+            }
+
+        search_query = input_link.strip()
+        if search_query:
+            return {
+                "musicProvider": "SearchQuery",
+                "type": "QuickSearch",
+                "query": search_query,
+            }
+
         # Return None if no pattern matches the input link
         return None
