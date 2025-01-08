@@ -87,7 +87,7 @@ class MusicPlayer(commands.Cog):
             await voice_channel.connect()
 
         try:
-            info, headers = await self.youtube_fetcher.extract_info(link_or_url)
+            info = await self.youtube_fetcher.extract_info(link_or_url)
             if info is None or "formats" not in info:
                 await self.send_message(
                     ctx_or_interaction,
