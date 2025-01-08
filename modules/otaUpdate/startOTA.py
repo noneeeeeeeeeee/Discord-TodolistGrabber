@@ -440,6 +440,7 @@ def perform_ota_update():
             print("<<<---Bot is already up-to-date. Aborting installation.--->>>")
             time.sleep(10)
             sys.exit(0)
+
         # Stop the bot
         stop_bot_process()
 
