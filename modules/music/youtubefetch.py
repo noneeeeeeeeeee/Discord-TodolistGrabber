@@ -104,15 +104,16 @@ class YouTubeFetcher:
     async def process_video_entry(
         self, video, music_queue, guild_id, track_max_duration, author
     ):
-        """Processes a single video entry and adds it to the music queue if it meets the criteria."""
         try:
             video_id = video["id"]
             video_url = f"https://www.youtube.com/watch?v={video_id}"
             info = await self.extract_info(video_url)
 
-            if info is None or "formats" not in info:
-                print(f"Could not extract info for video: {video_url}")
-                return video["title"]
+            if isinstance(info, tuple):  # Error case
+                return f"{video['title']} - {info[1]}"
+
+            if "formats" not in info:
+                return f"{video['title']} - No playable formats found"
 
             audio_url = next(
                 (
@@ -126,29 +127,39 @@ class YouTubeFetcher:
             title = info.get("title", "Unknown Title")
             duration = info.get("duration", 0)
 
-            if audio_url and duration <= track_max_duration:
-                music_queue.setdefault(guild_id, []).append(
-                    (author, audio_url, video_url, title, duration)
-                )
-            else:
-                print(
-                    f"Skipped video: {title}, no audio URL found or duration exceeds limit."
-                )
-                return title
+            if not audio_url:
+                return f"{title} - No audio stream available"
+
+            if duration > track_max_duration:
+                return f"{title} - Duration ({duration}s) exceeds limit ({track_max_duration}s)"
+
+            music_queue.setdefault(guild_id, []).append(
+                (author, audio_url, video_url, title, duration)
+            )
+            return None
 
         except Exception as e:
-            print(f"Error adding video to queue: {e}")
-            return video["title"]
-
-        return None
+            return f"{video['title']} - {str(e)}"
 
     async def extract_info(self, url):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.extract_info_sync, url)
 
     def extract_info_sync(self, url):
-        with youtube_dl.YoutubeDL(self.youtube_dl_options) as ydl:
-            return ydl.extract_info(url, download=False)
+        try:
+            with youtube_dl.YoutubeDL(self.youtube_dl_options) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info is None:
+                    return None, "Could not extract video information"
+                return info
+        except youtube_dl.utils.ExtractorError as e:
+            return None, f"YouTube extraction error: {str(e)}"
+        except youtube_dl.utils.DownloadError as e:
+            if "429" in str(e):
+                return None, "Rate limited by YouTube. Please try again later"
+            return None, f"Download error: {str(e)}"
+        except Exception as e:
+            return None, f"Unexpected error: {str(e)}"
 
     async def search_youtube(self, query, top_n=1):
         try:

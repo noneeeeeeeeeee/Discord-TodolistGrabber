@@ -192,33 +192,32 @@ class MusicPlayer(commands.Cog):
         return 0
 
     async def handle_playlist(self, ctx, voice_channel, playlist_url, config):
-        await ctx.reply(
-            ":hourglass: Adding playlist to the queue... Larger playlists may take longer to add."
-        )
-        guild_id = ctx.guild.id
-        if guild_id not in self.music_queue:
-            self.music_queue[guild_id] = []
-
-        author = ctx.author if isinstance(ctx, commands.Context) else ctx.user
-
-        parsed_url = urllib.parse.urlparse(playlist_url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
-        playlist_id = query_params.get("list", [None])[0]
-        if not playlist_id:
-            await ctx.send(
-                ":x: Invalid playlist URL. Could not extract the playlist ID."
-            )
-            return
+        progress_message = await ctx.reply(":hourglass: Processing playlist...")
+        author = ctx.author
 
         try:
+            parsed_url = urllib.parse.urlparse(playlist_url)
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            playlist_id = query_params.get("list", [None])[0]
+
+            if not playlist_id:
+                await progress_message.edit(content=":x: Invalid playlist URL.")
+                return
+
             playlist_items = await self.youtube_fetcher.fetch_playlist_items(
                 playlist_id
             )
             if not playlist_items:
-                await ctx.send("No videos found in the playlist.")
+                await progress_message.edit(
+                    content=":x: No videos found in the playlist."
+                )
                 return
 
+            total_videos = len(playlist_items)
             failed_videos = []
+            processed_count = 0
+            last_update = 0
+
             for item in playlist_items:
                 result = await self.youtube_fetcher.process_video_entry(
                     item,
@@ -227,27 +226,33 @@ class MusicPlayer(commands.Cog):
                     config.get("TrackMaxDuration", 360),
                     author,
                 )
+
+                processed_count += 1
                 if result:
                     failed_videos.append(result)
 
+                if (
+                    processed_count - last_update >= 5
+                    or processed_count == total_videos
+                ):
+                    await progress_message.edit(
+                        content=f":hourglass: Adding playlist to queue: {processed_count}/{total_videos} videos processed..."
+                    )
+                    last_update = processed_count
+
             if failed_videos:
-                failed_videos_str = "\n - ".join(failed_videos)
-                await ctx.send(
-                    f":white_check_mark: Added {len(playlist_items) - len(failed_videos)} songs from the playlist to the queue.\n :x: {len(failed_videos)} videos did not get added to the queue: - {failed_videos_str}"
+                error_msg = "\n- ".join(failed_videos)
+                await progress_message.edit(
+                    content=f":white_check_mark: Playlist processing complete!\nAdded {total_videos - len(failed_videos)}/{total_videos} songs to queue\n"
+                    f":x: {len(failed_videos)} failed:\n- {error_msg}"
                 )
             else:
-                await ctx.send(
-                    f":white_check_mark: Added {len(playlist_items)} songs from the playlist to the queue."
+                await progress_message.edit(
+                    content=f":white_check_mark: Successfully added all {total_videos} songs to queue!"
                 )
 
-            if not ctx.voice_client:
-                await voice_channel.connect()
-
-            if not ctx.voice_client.is_playing():
-                await self.play_now(ctx, ctx.voice_client, config)
-
         except Exception as e:
-            await ctx.send(f"An error occurred while retrieving the playlist: {str(e)}")
+            await progress_message.edit(content=f":x: Playlist error: {str(e)}")
 
     async def search_youtube(self, ctx, query, top_n=1):
         try:
