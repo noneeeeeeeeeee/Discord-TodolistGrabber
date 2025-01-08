@@ -22,9 +22,9 @@ class YouTubeFetcher:
 
         self.youtube_dl_options = {
             "format": "bestaudio/best",
-            "quiet": False,  # Changed to False for debugging
+            "quiet": True,
             "nocheckcertificate": True,
-            "no_warnings": False,  # Changed to False for debugging
+            "no_warnings": True,
             "extractaudio": True,
             "audioformat": "mp3",
             "postprocessors": [
@@ -37,7 +37,7 @@ class YouTubeFetcher:
             "ignoreerrors": True,
             "logtostderr": True,
             "geo_bypass": True,
-            "cookies-from-browser": "chrome",  # Use Chrome cookies if available
+            "cookies-from-browser": "chrome",
         }
 
     async def handle_playlist(
@@ -158,16 +158,11 @@ class YouTubeFetcher:
     def extract_info_sync(self, url):
         try:
             with youtube_dl.YoutubeDL(self.youtube_dl_options) as ydl:
-                print(f"Attempting to extract info from: {url}")
                 info = ydl.extract_info(url, download=False)
                 if info is None:
-                    print("Failed to extract info - returned None")
                     return None, {}
 
                 headers = info.get("http_headers", {})
-                print(
-                    f"Successfully extracted info for: {info.get('title', 'Unknown')}"
-                )
                 return info, headers
         except Exception as e:
             print(f"Error in extract_info_sync: {str(e)}")
