@@ -251,6 +251,14 @@ class MusicPlayer(commands.Cog):
                     content=f":white_check_mark: Successfully added all {total_videos} songs to queue!"
                 )
 
+            # Connect to the voice channel if not already connected
+            if not ctx.voice_client:
+                await voice_channel.connect()
+
+            # Play the music if not already playing
+            if not ctx.voice_client.is_playing():
+                await self.play_now(ctx, ctx.voice_client, config)
+
         except Exception as e:
             await progress_message.edit(content=f":x: Playlist error: {str(e)}")
 
