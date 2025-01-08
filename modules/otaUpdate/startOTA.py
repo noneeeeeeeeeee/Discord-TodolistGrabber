@@ -436,6 +436,10 @@ def perform_ota_update():
             )
             result = "continue"
 
+        if result == "abort_update":
+            print("<<<---Bot is already up-to-date. Aborting installation.--->>>")
+            time.sleep(10)
+            sys.exit(0)
         # Stop the bot
         stop_bot_process()
 
@@ -445,11 +449,6 @@ def perform_ota_update():
         # Fetch the update file
         if result == "continue" or not result:
             fetch_update(repo_url, update_method, api_key)
-
-        if result == "abort_update":
-            print("<<<---Bot is already up-to-date. Aborting installation.--->>>")
-            time.sleep(10)
-            sys.exit(0)
 
         # Cleanup
         time.sleep(2)
