@@ -79,21 +79,26 @@ class Disconnect(commands.Cog):
                     )
                 await self.clear_queue(member.guild)
 
-    async def clear_queue(self, ctx):
-        """Clears the music queue and stops all music-related tasks."""
+    async def clear_queue(self, guild_or_ctx):
+        """Clears the music queue and stops all music-related tasks.
+        Args:
+            guild_or_ctx: Can be either a discord.Guild or Context object
+        """
         music_player = self.bot.get_cog("MusicPlayer")
         if music_player:
-            guild_id = ctx.guild.id
+            # Get guild_id regardless of parameter type
+            guild_id = (
+                guild_or_ctx.id
+                if hasattr(guild_or_ctx, "id")
+                else guild_or_ctx.guild.id
+            )
+
             if guild_id in music_player.music_queue:
                 music_player.music_queue[guild_id].clear()
             if guild_id in music_player.now_playing:
                 del music_player.now_playing[guild_id]
-            if ctx.guild.voice_client and ctx.guild.voice_client.is_playing():
-                ctx.guild.voice_client.stop()
-
-        clear_queue_cog = self.bot.get_cog("ClearQueue")
-        if clear_queue_cog:
-            await clear_queue_cog.clear_queue(ctx)
+            if guild_or_ctx.voice_client and guild_or_ctx.voice_client.is_playing():
+                guild_or_ctx.voice_client.stop()
 
     async def cog_command_error(self, ctx, error):
         """Handles errors that occur within the cog's commands."""
