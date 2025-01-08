@@ -110,7 +110,7 @@ class MusicPlayer(commands.Cog):
                 )
                 return
             title = info.get("title", "Unknown Title")
-            duration = info.get("duration", 0)
+            duration = info.get("duration", 600)
             guild_id = guild.id
             self.music_queue.setdefault(guild_id, [])
             self.music_queue[guild_id].append(
@@ -163,10 +163,8 @@ class MusicPlayer(commands.Cog):
 
         ffmpeg_options = {
             "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            "options": "-vn -loglevel debug",  # Added debug logging level
+            "options": "-vn ",
         }
-        print(f"FFmpeg options: {ffmpeg_options}")  # Debug print
-
         voice_client.play(
             discord.FFmpegPCMAudio(url, **ffmpeg_options),
             after=after_playing,
