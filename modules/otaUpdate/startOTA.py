@@ -333,6 +333,28 @@ def move_extracted_contents_from_folder(move_contents_in_folder):
     log_error("Move Files", "Files moved successfully.")
 
 
+def update_dependencies():
+    print_progress("Dependencies", "Updating any outdated dependencies...")
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "pip"]
+        )
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                os.path.join(ROOT_DIR, "requirements.txt"),
+            ]
+        )
+        print_progress("Dependencies", "Dependencies updated successfully.")
+    except subprocess.CalledProcessError as e:
+        log_error("Dependencies", "Failed to update dependencies.", e)
+        raise
+
+
 def stop_bot_process():
     print_progress("Process", "Checking if bot is running...")
     try:
@@ -417,6 +439,9 @@ def perform_ota_update():
         # Stop the bot
         stop_bot_process()
 
+        # Update Dependencies
+        update_dependencies()
+
         # Fetch the update file
         if result == "continue" or not result:
             fetch_update(repo_url, update_method, api_key)
@@ -484,108 +509,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    def update_dependencies():
-        print_progress("Dependencies", "Updating dependencies...")
-        try:
-            requirements_path = os.path.join(ROOT_DIR, "requirements.txt")
-            if os.path.exists(requirements_path):
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", "-r", requirements_path]
-                )
-                print_progress("Dependencies", "Dependencies updated successfully.")
-            else:
-                print_progress(
-                    "Dependencies",
-                    "No requirements.txt found. Skipping dependency update.",
-                )
-        except Exception as e:
-            log_error("Dependencies", "Failed to update dependencies.", e)
-            raise
-
-    # Add the update_dependencies step in the perform_ota_update function
-    def perform_ota_update():
-        try:
-            # Prequisite checks
-            check_files_required()
-
-            # Load update variables
-            if not os.path.exists(UPDATE_VARS_PATH):
-                raise FileNotFoundError(f"{UPDATE_VARS_PATH} not found.")
-
-            with open(UPDATE_VARS_PATH, "r") as f:
-                update_vars = json.load(f)
-
-            whitelist = set(update_vars.get(WHITELISTED_FILES_KEY, []))
-            repo_url = update_vars["REPOSITORY_URL"]
-            update_method = update_vars["UPDATE_GET_METHOD"]
-            extract_files = update_vars.get("EXTRACT_FILES", False)
-            move_contents_in_folder = update_vars.get("MOVE_CONTENTS_IN_FOLDER", False)
-            smart_download_enabled = update_vars.get("SMART_DOWNLOAD_ENABLED", False)
-            api_key = update_vars.get("REPO_API_KEY", "")
-
-            # Prequisite checks 2
-            if smart_download_enabled:
-                result = smart_download_check()
-            else:
-                print_progress(
-                    "Smart Download Check",
-                    "Smart download disabled. It will now continue with the update.",
-                )
-                result = "continue"
-
-            # Stop the bot
-            stop_bot_process()
-
-            # Fetch the update file
-            if result == "continue" or not result:
-                fetch_update(repo_url, update_method, api_key)
-
-            if result == "abort_update":
-                print("<<<---Bot is already up-to-date. Aborting installation.--->>>")
-                time.sleep(10)
-                sys.exit(0)
-
-            # Cleanup
-            time.sleep(2)
-            cleanup_root_directory(whitelist)
-
-            # Extract and move files
-            time.sleep(2)
-            if result == "continue" or not result:
-                extract_update(extract_files)
-            move_extracted_contents_from_folder(move_contents_in_folder)
-
-            # Update dependencies
-            update_dependencies()
-
-            # Cleanup residuals
-            time.sleep(2)
-            print_progress("Post-Cleanup", "Removing temporary files...")
-            shutil.rmtree(TEMP_DIR, ignore_errors=True)
-            print_progress("Post-Cleanup", "Temporary files removed.")
-
-            # Start the bot
-            time.sleep(1)
-            print_progress("Process", "Starting bot...")
-            subprocess.Popen(
-                ["python", os.path.join(ROOT_DIR, "main.py")], close_fds=True
-            )
-            print_progress("Process", "Bot started successfully.")
-            print(
-                "<<<---OTA Update completed successfully. The bot will now start.--->>>"
-            )
-            # Exit updater
-            time.sleep(5)
-            sys.exit(0)
-        except Exception as e:
-            log_error(
-                "OTA Update",
-                "Update failed and is Aborted, Please check the stack trace above for more Information",
-                e,
-            )
-            print(
-                "<<<---Update failed and is Aborted, Please check the logs for more Information. This window will now close in 10 seconds.--->>>"
-            )
-            time.sleep(10)
-            sys.exit(1)
