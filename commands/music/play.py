@@ -87,7 +87,7 @@ class MusicPlayer(commands.Cog):
             await voice_channel.connect()
 
         try:
-            info = await self.youtube_fetcher.extract_info(link_or_url)
+            info, headers = await self.youtube_fetcher.extract_info(link_or_url)
             if info is None or "formats" not in info:
                 await self.send_message(
                     ctx_or_interaction,
@@ -163,8 +163,9 @@ class MusicPlayer(commands.Cog):
 
         ffmpeg_options = {
             "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            "options": "-vn",
+            "options": "-vn -loglevel debug",  # Added debug logging level
         }
+        print(f"FFmpeg options: {ffmpeg_options}")  # Debug print
 
         voice_client.play(
             discord.FFmpegPCMAudio(url, **ffmpeg_options),

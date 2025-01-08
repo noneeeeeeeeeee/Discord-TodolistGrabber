@@ -22,8 +22,11 @@ class YouTubeFetcher:
 
         self.youtube_dl_options = {
             "format": "bestaudio/best",
-            "quiet": True,
+            "quiet": False,  # Changed to False for debugging
             "nocheckcertificate": True,
+            "no_warnings": False,  # Changed to False for debugging
+            "extractaudio": True,
+            "audioformat": "mp3",
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
@@ -31,6 +34,10 @@ class YouTubeFetcher:
                     "preferredquality": "192",
                 }
             ],
+            "ignoreerrors": True,
+            "logtostderr": True,
+            "geo_bypass": True,
+            "cookies-from-browser": "chrome",  # Use Chrome cookies if available
         }
 
     async def handle_playlist(
@@ -50,7 +57,9 @@ class YouTubeFetcher:
             added_videos = 0
             skipped_videos = 0
             tasks = [
-                self.process_video_entry(item, music_queue, guild_id, max_duration)
+                self.process_video_entry(
+                    item, music_queue, guild_id, max_duration, None
+                )
                 for item in playlist_items
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -92,15 +101,6 @@ class YouTubeFetcher:
 
         return videos
 
-    async def remove_non_songs_using_sponsorblock(self, music_queue, guild_id):
-        """Removes non-song entries from the music queue using the SponsorBlock API."""
-        config = json_get(guild_id)
-        sponsorblockcheck = config.get("RemoveNonSongsUsingSponsorBlock", False)
-        sponsorblock_api = "https://sponsor.ajay.app/api/"
-
-        if not sponsorblockcheck:
-            return
-
     async def process_video_entry(
         self, video, music_queue, guild_id, track_max_duration, author
     ):
@@ -108,7 +108,7 @@ class YouTubeFetcher:
         try:
             video_id = video["id"]
             video_url = f"https://www.youtube.com/watch?v={video_id}"
-            info = await self.extract_info(video_url)
+            info, headers = await self.extract_info(video_url)
 
             if info is None or "formats" not in info:
                 print(f"Could not extract info for video: {video_url}")
@@ -126,9 +126,18 @@ class YouTubeFetcher:
             title = info.get("title", "Unknown Title")
             duration = info.get("duration", 0)
 
-            if audio_url and duration <= track_max_duration:
+            if audio_url and (
+                track_max_duration == -1 or duration <= track_max_duration
+            ):
                 music_queue.setdefault(guild_id, []).append(
-                    (author, audio_url, video_url, title, duration)
+                    (
+                        author,
+                        audio_url,
+                        video_url,
+                        title,
+                        duration,
+                        headers,
+                    )
                 )
             else:
                 print(
@@ -147,8 +156,22 @@ class YouTubeFetcher:
         return await loop.run_in_executor(None, self.extract_info_sync, url)
 
     def extract_info_sync(self, url):
-        with youtube_dl.YoutubeDL(self.youtube_dl_options) as ydl:
-            return ydl.extract_info(url, download=False)
+        try:
+            with youtube_dl.YoutubeDL(self.youtube_dl_options) as ydl:
+                print(f"Attempting to extract info from: {url}")
+                info = ydl.extract_info(url, download=False)
+                if info is None:
+                    print("Failed to extract info - returned None")
+                    return None, {}
+
+                headers = info.get("http_headers", {})
+                print(
+                    f"Successfully extracted info for: {info.get('title', 'Unknown')}"
+                )
+                return info, headers
+        except Exception as e:
+            print(f"Error in extract_info_sync: {str(e)}")
+            return None, {}
 
     async def search_youtube(self, query, top_n=1):
         try:
