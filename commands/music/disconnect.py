@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 import asyncio
-from modules.disconnect_state import DisconnectState
+from modules.music.disconnect_state import DisconnectState
 from .clearqueue import ClearQueue
 
 

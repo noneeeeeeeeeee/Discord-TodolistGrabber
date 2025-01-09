@@ -75,6 +75,7 @@ class YouTubeFetcher:
         while len(videos) < max_results:
             request = self.youtube_service.playlistItems().list(
                 part="snippet",
+                fields="items(snippet(resourceId(videoId),title)),nextPageToken",
                 maxResults=min(max_results - len(videos), 50),
                 playlistId=playlist_id,
                 pageToken=next_page_token,

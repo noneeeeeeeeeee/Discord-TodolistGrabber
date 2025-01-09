@@ -6,8 +6,10 @@ from discord.ui import View, Button
 from modules.music.youtubefetch import YouTubeFetcher
 from modules.setconfig import json_get, check_guild_config_available
 from modules.music.linksidentifier import LinksIdentifier
+from modules.music.disconnect_state import DisconnectState
 import yt_dlp as youtube_dl
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 
 class MusicPlayer(commands.Cog):
@@ -16,6 +18,9 @@ class MusicPlayer(commands.Cog):
         self.youtube_fetcher = YouTubeFetcher()
         self.music_queue = {}
         self.now_playing = {}
+        self.executor = ThreadPoolExecutor(
+            max_workers=4
+        )  # Adjust the number of workers as needed
 
     @commands.hybrid_command(
         name="play", aliases=["p"], description="Play a song or add to queue"
@@ -89,6 +94,7 @@ class MusicPlayer(commands.Cog):
             await voice_channel.connect()
 
         try:
+            loop = asyncio.get_event_loop()
             info = await self.youtube_fetcher.extract_info(link_or_url)
             if info is None or "formats" not in info:
                 await self.send_message(
@@ -119,13 +125,6 @@ class MusicPlayer(commands.Cog):
                 (author, url, link_or_url, title, duration)
             )
 
-            # Pre-buffer the audio (download or start streaming)
-            ffmpeg_options = {
-                "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-                "options": "-vn",
-            }
-            audio_stream = discord.FFmpegPCMAudio(url, **ffmpeg_options)
-
             # Ensure the voice client is playing the audio once it's ready
             if not guild.voice_client.is_playing():
                 await self.play_now(ctx_or_interaction, guild.voice_client, config)
@@ -143,7 +142,11 @@ class MusicPlayer(commands.Cog):
 
     async def ensure_voice_ready(self, voice_client):
         retry_count = 0
-        while not voice_client.is_connected() and retry_count < 5:
+        while (
+            not voice_client.is_connected()
+            and retry_count < 5
+            and DisconnectState().get_intentional() == False
+        ):
             print("Waiting for voice client to stabilize...")
             await asyncio.sleep(1)
             retry_count += 1
@@ -227,6 +230,7 @@ class MusicPlayer(commands.Cog):
                 await progress_message.edit(content=":x: Invalid playlist URL.")
                 return
 
+            loop = asyncio.get_event_loop()
             playlist_items = await self.youtube_fetcher.fetch_playlist_items(
                 playlist_id
             )
@@ -240,20 +244,26 @@ class MusicPlayer(commands.Cog):
             failed_videos = []
             processed_count = 0
             last_update = 0
+            chunk_size = 10  # Process 10 videos at a time
 
-            for item in playlist_items:
-                result = await self.youtube_fetcher.process_video_entry(
-                    item,
-                    self.music_queue,
-                    ctx.guild.id,
-                    config.get("TrackMaxDuration", 360),
-                    author,
-                )
+            for i in range(0, total_videos, chunk_size):
+                chunk = playlist_items[i : i + chunk_size]
+                tasks = [
+                    self.youtube_fetcher.process_video_entry(
+                        item,
+                        self.music_queue,
+                        ctx.guild.id,
+                        config.get("TrackMaxDuration", 360),
+                        author,
+                    )
+                    for item in chunk
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        failed_videos.append(str(result))
 
-                processed_count += 1
-                if result:
-                    failed_videos.append(result)
-
+                processed_count += len(chunk)
                 if (
                     processed_count - last_update >= 5
                     or processed_count == total_videos
@@ -274,11 +284,9 @@ class MusicPlayer(commands.Cog):
                     content=f":white_check_mark: Successfully added all {total_videos} songs to queue!"
                 )
 
-            # Connect to the voice channel if not already connected
             if not ctx.voice_client:
                 await voice_channel.connect()
 
-            # Play the music if not already playing
             if not ctx.voice_client.is_playing():
                 await self.play_now(ctx, ctx.voice_client, config)
 
