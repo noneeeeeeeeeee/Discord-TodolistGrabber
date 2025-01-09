@@ -337,14 +337,12 @@ def update_dependencies():
     print_progress("Dependencies", "Updating any outdated dependencies...")
     try:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "pip"]
-        )
-        subprocess.check_call(
             [
                 sys.executable,
                 "-m",
                 "pip",
                 "install",
+                "-U",
                 "-r",
                 os.path.join(ROOT_DIR, "requirements.txt"),
             ]

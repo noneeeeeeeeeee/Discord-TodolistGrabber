@@ -16,14 +16,13 @@ class Skip(commands.Cog):
         if voice_client and voice_client.is_playing():
             # Stop the current song
             voice_client.stop()
-            await ctx.send(":fast_forward: Skipped the current song.")
 
             guild_id = ctx.guild.id
             if (
                 guild_id in music_player.music_queue
                 and music_player.music_queue[guild_id]
             ):
-                await ctx.send(":notes: Now playing the next song in the queue.")
+                await ctx.send(":fast_forward: Skipped the current song.")
             else:
                 await ctx.send(":x: No more songs in the queue.")
         else:

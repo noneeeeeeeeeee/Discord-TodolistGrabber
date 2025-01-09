@@ -20,13 +20,9 @@ class Disconnect(commands.Cog):
         )
 
     async def _disconnect_after_inactivity(self, ctx):
-        await asyncio.sleep(300)  # 5 minutes
-        music_player = self.bot.get_cog("MusicPlayer")
-        if (
-            ctx.guild.voice_client
-            and not ctx.guild.voice_client.is_playing()
-            and not music_player.now_playing.get(ctx.guild.id)
-        ):
+        await asyncio.sleep(3)  # 5 minutes
+
+        if ctx.guild.voice_client and not ctx.guild.voice_client.is_playing():
             self.disconnect_state.set_intentional()
             await ctx.guild.voice_client.disconnect()
             await ctx.send(":wave: Disconnected due to inactivity.")

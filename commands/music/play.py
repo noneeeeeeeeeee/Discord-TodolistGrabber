@@ -49,6 +49,12 @@ class MusicPlayer(commands.Cog):
                 await ctx.send(":x: You need to be in a voice channel to play music.")
                 return
 
+            if not input:
+                await ctx.send(
+                    ":x: Please provide a valid input. Example: !play <YouTube link, search query, or playlist> or !play search <search query> \n More sources coming soon!"
+                )
+                return
+
             linkType = LinksIdentifier.identify_link(input)
             print(
                 f"Link Type (Soon, the music bot should support more link types): {linkType}"
@@ -61,12 +67,8 @@ class MusicPlayer(commands.Cog):
             elif input.lower().startswith("search"):
                 query = input[len("search") :].strip()
                 await self.search_youtube(ctx, query, top_n=10)
-            elif input:
-                await self.search_youtube(ctx, input, top_n=1)
             else:
-                await ctx.send(
-                    ":x: Please provide a valid input. Example: !play <YouTube link, search query, or playlist> or !play search <search query> \n More sources coming soon!"
-                )
+                await self.search_youtube(ctx, input, top_n=1)
         except commands.errors.MissingRequiredArgument as e:
             await ctx.send(f":x: Missing required argument: {e.param.name}")
         except Exception as e:
@@ -117,11 +119,20 @@ class MusicPlayer(commands.Cog):
                 (author, url, link_or_url, title, duration)
             )
 
+            # Pre-buffer the audio (download or start streaming)
+            ffmpeg_options = {
+                "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                "options": "-vn",
+            }
+            audio_stream = discord.FFmpegPCMAudio(url, **ffmpeg_options)
+
+            # Ensure the voice client is playing the audio once it's ready
             if not guild.voice_client.is_playing():
                 await self.play_now(ctx_or_interaction, guild.voice_client, config)
             else:
                 await self.send_message(
-                    ctx_or_interaction, f"Added **{title}** to the queue."
+                    ctx_or_interaction,
+                    f":white_check_mark: Added **{title}** to the queue.",
                 )
         except youtube_dl.utils.DownloadError as e:
             await self.send_message(ctx_or_interaction, f"Download error: {e}")
@@ -129,6 +140,16 @@ class MusicPlayer(commands.Cog):
         except Exception as e:
             print(f"Error in add_to_queue: {e}")
             await self.send_message(ctx_or_interaction, f":x: An error occurred: {e}")
+
+    async def ensure_voice_ready(self, voice_client):
+        retry_count = 0
+        while not voice_client.is_connected() and retry_count < 5:
+            print("Waiting for voice client to stabilize...")
+            await asyncio.sleep(1)
+            retry_count += 1
+
+        if not voice_client.is_connected():
+            raise Exception("Voice client failed to stabilize.")
 
     async def play_now(self, ctx, voice_client, config):
         guild_id = ctx.guild.id
@@ -148,6 +169,8 @@ class MusicPlayer(commands.Cog):
             "duration": duration,
             "start_time": datetime.now(),
         }
+        print("Now Playing:", self.now_playing[guild_id])
+        await self.ensure_voice_ready(voice_client)
 
         def after_playing(error):
             if error:

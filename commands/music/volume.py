@@ -11,7 +11,7 @@ class Volume(commands.Cog):
     async def volume(self, ctx, volume: int = None):
         if volume is None:
             await ctx.send(
-                f":speaker: Current volume is {int(self.current_volume * 100)}%. (Beta)"
+                f":speaker: Current volume is {int(self.current_volume * 100)}%."
             )
             return
 
