@@ -100,7 +100,7 @@ class NoticeAutoUpdate(commands.Cog):
                     ping_daily_time = config.get("PingDailyTime", "15:00")
 
                     await ping_message.edit(
-                        content=f"# Daily Ping <@&{ping_role}>\n- Today's date: {today.strftime('%a, %d %b %Y')}\n- Next Refresh in: <t:{next_update_timestamp}:R>\n- Next Ping in: <t:{int(self.get_next_ping_time(ping_daily_time).timestamp())}:R> \n- Last API call: {api_call_time}"
+                        content=f"# Daily Ping\n- Today's date: {today.strftime('%a, %d %b %Y')}\n- Next Refresh in: <t:{next_update_timestamp}:R>\n- Next Ping in: <t:{int(self.get_next_ping_time(ping_daily_time).timestamp())}:R> \n- Last API call: {api_call_time}"
                     )
                     print(f"Ping message edited for guild {guild_id} successfully.")
 
@@ -116,31 +116,36 @@ class NoticeAutoUpdate(commands.Cog):
                     )
 
             # Process existing noticeboard messages
-
+            all_messages_valid = True
             for i, message_id in enumerate(noticeboard_edit_ids):
                 retries = 0
                 while retries < 3:
                     try:
                         message = await channel.fetch_message(message_id)
+
+                        # Check if the bot is the author of the message
+                        if message.author != self.bot.user:
+                            raise discord.Forbidden(
+                                message="Cannot edit a message authored by another user."
+                            )
+
                         await message.edit(embed=embeds[i])
                         await asyncio.sleep(2)
                         new_message_ids.append(message_id)
+                        break
+
+                    except discord.Forbidden:
+                        print(
+                            f"Cannot edit message with ID {message_id} for guild {guild_id} as it is authored by another user. Sending new message."
+                        )
+                        all_messages_valid = False
                         break
 
                     except discord.NotFound:
                         print(
                             f"Noticeboard message with ID {message_id} not found for guild {guild_id}. Sending new message."
                         )
-                        try:
-                            new_message = await channel.send(embed=embeds[i])
-                            new_message_ids.append(new_message.id)
-                            print(
-                                f"New noticeboard message sent with ID {new_message.id} for guild {guild_id}."
-                            )
-                        except discord.HTTPException as e:
-                            print(
-                                f"Failed to send new message for guild {guild_id}: {e}"
-                            )
+                        all_messages_valid = False
                         break
 
                     except discord.HTTPException as e:
@@ -155,18 +160,38 @@ class NoticeAutoUpdate(commands.Cog):
                             print(
                                 f"Failed to edit message ID {message_id} for guild {guild_id}: {e}"
                             )
+                            all_messages_valid = False
                             break
 
-            # If there are any message IDs that were not valid, send new messages for those embeds
-            for i in range(len(noticeboard_edit_ids), len(embeds)):
-                try:
-                    new_message = await channel.send(embed=embeds[i])
-                    new_message_ids.append(new_message.id)
-                    print(
-                        f"New noticeboard message sent with ID {new_message.id} for guild {guild_id}."
-                    )
-                except discord.HTTPException as e:
-                    print(f"Failed to send new message for guild {guild_id}: {e}")
+            if not all_messages_valid:
+                # Delete all existing noticeboard messages
+                for message_id in noticeboard_edit_ids:
+                    try:
+                        message = await channel.fetch_message(message_id)
+                        await message.delete()
+                        print(
+                            f"Deleted noticeboard message with ID {message_id} for guild {guild_id}."
+                        )
+                    except discord.NotFound:
+                        print(
+                            f"Noticeboard message with ID {message_id} not found for deletion."
+                        )
+                    except discord.HTTPException as e:
+                        print(
+                            f"Failed to delete message ID {message_id} for guild {guild_id}: {e}"
+                        )
+
+                # Send new noticeboard messages
+                new_message_ids = []
+                for embed in embeds:
+                    try:
+                        new_message = await channel.send(embed=embed)
+                        new_message_ids.append(new_message.id)
+                        print(
+                            f"New noticeboard message sent with ID {new_message.id} for guild {guild_id}."
+                        )
+                    except discord.HTTPException as e:
+                        print(f"Failed to send new message for guild {guild_id}: {e}")
 
             # Update the noticeboardEditID with all valid message IDs
             edit_json_file(guild_id, "noticeboardEditID", new_message_ids)

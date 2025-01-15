@@ -36,15 +36,12 @@ class YouTubeFetcher:
     async def handle_playlist(
         self, playlist_url, music_queue, guild_id, max_duration, max_results=50
     ):
-        """Handles playlist processing by fetching items and adding them to the music queue."""
-        # Parse the playlist URL to extract the playlist ID
         parsed_url = urllib.parse.urlparse(playlist_url)
         query_params = urllib.parse.parse_qs(parsed_url.query)
         playlist_id = query_params.get("list", [None])[0]
         if not playlist_id:
             raise ValueError("Invalid playlist URL. Could not extract the playlist ID.")
 
-        # Fetch playlist items
         try:
             playlist_items = await self.fetch_playlist_items(playlist_id, max_results)
             added_videos = 0
@@ -68,7 +65,6 @@ class YouTubeFetcher:
             raise e
 
     async def fetch_playlist_items(self, playlist_id, max_results=50):
-        """Fetches videos from a YouTube playlist using the YouTube Data API v3."""
         videos = []
         next_page_token = None
 
@@ -93,24 +89,15 @@ class YouTubeFetcher:
 
         return videos
 
-    async def remove_non_songs_using_sponsorblock(self, music_queue, guild_id):
-        """Removes non-song entries from the music queue using the SponsorBlock API."""
-        config = json_get(guild_id)
-        sponsorblockcheck = config.get("RemoveNonSongsUsingSponsorBlock", False)
-        sponsorblock_api = "https://sponsor.ajay.app/api/"
-
-        if not sponsorblockcheck:
-            return
-
     async def process_video_entry(
-        self, video, music_queue, guild_id, track_max_duration, author
+        self, video, music_queue, guild_id, track_max_duration, author=None
     ):
         try:
             video_id = video["id"]
             video_url = f"https://www.youtube.com/watch?v={video_id}"
             info = await self.extract_info(video_url)
 
-            if isinstance(info, tuple):  # Error case
+            if isinstance(info, tuple):
                 return f"{video['title']} - {info[1]}"
 
             if "formats" not in info:
@@ -143,8 +130,7 @@ class YouTubeFetcher:
             return f"{video['title']} - {str(e)}"
 
     async def extract_info(self, url):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.extract_info_sync, url)
+        return await asyncio.to_thread(self.extract_info_sync, url)
 
     def extract_info_sync(self, url):
         try:

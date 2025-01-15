@@ -127,7 +127,8 @@ class NoticeBoard(commands.Cog):
 
             btnview.on_timeout = on_timeout
 
-            await ctx.send("Noticeboard command executed.", view=btnview)
+            await ctx.send(embed=embed, view=btnview)
+            return
 
         # Handle the "edit" action
         if action == "set":
