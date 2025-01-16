@@ -102,7 +102,7 @@ class NoticeBoard(commands.Cog):
                 )
                 truncate_cache()  # Ensure this function deletes the cache files
 
-            btnview = View(timeout=30)
+            btnview = View(timeout=60)
             update_now = Button(label="🔄 Update Now", style=discord.ButtonStyle.green)
             update_now.callback = update_callback
             delete_cache = Button(label="🗑️ Delete Cache", style=discord.ButtonStyle.red)
@@ -110,16 +110,11 @@ class NoticeBoard(commands.Cog):
             btnview.add_item(update_now)
             btnview.add_item(delete_cache)
 
-            btnview = discord.ui.View(timeout=60)  # Set the timeout for the buttons
-
             async def on_timeout():
                 for item in btnview.children:
                     item.disabled = True
                 try:
-                    if ctx.message.author == self.bot.user:
-                        await ctx.message.edit(view=btnview)
-                    else:
-                        print("Cannot edit a message authored by another user.")
+                    await ctx.message.edit(view=btnview)
                 except discord.Forbidden as e:
                     print(f"Failed to edit message: {e}")
                 except Exception as e:
