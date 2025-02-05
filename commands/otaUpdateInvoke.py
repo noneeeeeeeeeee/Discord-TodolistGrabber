@@ -10,7 +10,7 @@ class Update(commands.Cog):
 
     class ConfirmUpdateView(discord.ui.View):
         def __init__(self, author_id):
-            super().__init__(timeout=30.0)  # Timeout after 30 seconds
+            super().__init__(timeout=30.0) 
             self.author_id = author_id
             self.value = None
 
@@ -21,13 +21,13 @@ class Update(commands.Cog):
             # Ensure only the original user can confirm
             if interaction.user.id != self.author_id:
                 await interaction.response.send_message(
-                    "You are not authorized to confirm this update.", ephemeral=True
+                    ":x: You are not authorized to confirm this update.", ephemeral=True
                 )
                 return
 
             self.value = True
             await interaction.response.send_message(
-                "Update confirmed! Starting OTA process."
+                ":green_check_mark: Update confirmed! Starting OTA process."
             )
             self.stop()
 
@@ -38,7 +38,7 @@ class Update(commands.Cog):
             # Ensure only the original user can cancel
             if interaction.user.id != self.author_id:
                 await interaction.response.send_message(
-                    "You are not authorized to cancel this update.", ephemeral=True
+                    ":x: You are not authorized to cancel this update.", ephemeral=True
                 )
                 return
 
@@ -77,7 +77,7 @@ class Update(commands.Cog):
                 view = self.ConfirmUpdateView(ctx.author.id)
                 view.message = await ctx.send(embed=embed, view=view)
 
-                await view.wait()  # Wait for user interaction
+                await view.wait()  
 
                 if view.value:
                     # Run startOTA.py in a separate process
@@ -87,7 +87,7 @@ class Update(commands.Cog):
                         stderr=subprocess.PIPE,
                     )
                     await ctx.send(
-                        "The bot will now shortly shutdown for OTA update. If it doesn't turn back on in a few minutes, please check the logs in the bot folder called ota_logs."
+                        ":warning: The bot will now shortly shutdown for OTA update. If it doesn't turn back on in a few minutes, please check the logs in the bot folder called ota_logs."
                     )
                 else:
                     await ctx.send("OTA update cancelled.")

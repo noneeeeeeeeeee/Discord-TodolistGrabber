@@ -7,7 +7,8 @@ import aiohttp
 class Lyrics(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-
+        
+    # Broken Implementation
     @commands.command(name="ly", aliases=["lyrics"])
     async def display_lyrics(self, ctx):
         music_player = self.bot.get_cog("MusicPlayer")

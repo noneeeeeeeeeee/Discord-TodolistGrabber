@@ -10,6 +10,7 @@ class Disconnect(commands.Cog):
         self.bot = bot
         self.disconnect_task = {}
         self.disconnect_state = disconnect_state
+        self.clear_queue = ClearQueue(bot)
 
     async def schedule_disconnect(self, ctx):
         """Schedules a disconnect after 5 minutes of inactivity."""
@@ -26,7 +27,7 @@ class Disconnect(commands.Cog):
             self.disconnect_state.set_intentional()
             await ctx.guild.voice_client.disconnect()
             await ctx.send(":wave: Disconnected due to inactivity.")
-            await self.clear_queue(ctx)
+            await self.clear_queue.clear(ctx)
             # Remove the task from the dictionary
             del self.disconnect_task[ctx.guild.id]
 
@@ -41,7 +42,7 @@ class Disconnect(commands.Cog):
             self.disconnect_state.set_intentional()
             await ctx.guild.voice_client.disconnect()
             await ctx.send(":wave: Disconnected from the voice channel.")
-            await self.clear_queue(ctx)
+            await self.clear_queue.clear(ctx)
             # Cancel any active disconnect task
             if self.disconnect_task.get(ctx.guild.id):
                 self.disconnect_task[ctx.guild.id].cancel()
@@ -73,32 +74,7 @@ class Disconnect(commands.Cog):
                     await channel.send(
                         ":wave: The bot has disconnected since the channel is empty."
                     )
-                await self.clear_queue(member.guild)
-
-    async def clear_queue(self, guild_or_ctx):
-        """Clears the music queue and stops all music-related tasks.
-        Args:
-            guild_or_ctx: Can be either a discord.Guild or Context object
-        """
-        music_player = self.bot.get_cog("MusicPlayer")
-        if music_player:
-            # Get guild_id regardless of parameter type
-            guild_id = (
-                guild_or_ctx.id
-                if hasattr(guild_or_ctx, "id")
-                else guild_or_ctx.guild.id
-            )
-
-            if guild_id in music_player.music_queue:
-                music_player.music_queue[guild_id].clear()
-            if guild_id in music_player.now_playing:
-                del music_player.now_playing[guild_id]
-            if guild_or_ctx.voice_client and guild_or_ctx.voice_client.is_playing():
-                guild_or_ctx.voice_client.stop()
-
-    async def cog_command_error(self, ctx, error):
-        """Handles errors that occur within the cog's commands."""
-        await ctx.send(f"An error occurred: {str(error)}")
+                await self.clear_queue.clear(member.guild)
 
 
 async def setup(bot):

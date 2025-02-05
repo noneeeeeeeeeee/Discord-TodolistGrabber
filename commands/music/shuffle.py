@@ -25,7 +25,10 @@ class Shuffle(commands.Cog):
         queue = music_player.music_queue[guild_id]
         random.shuffle(queue)
         await ctx.send(":twisted_rightwards_arrows: The queue has been shuffled.")
-
+    @shuffle.error
+    async def shuffle_error(self, ctx, error):
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(f":clock1: This command is on cooldown. Try again in {error.retry_after:.2f} seconds.")
 
 async def setup(bot):
     await bot.add_cog(Shuffle(bot))

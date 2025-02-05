@@ -28,7 +28,7 @@ class Volume(commands.Cog):
                     if voice_client.is_paused():
                         voice_client.resume()
                     voice_client.source.volume = volume / 100
-                    self.current_volume = volume / 100  # Store the current volume level
+                    self.current_volume = volume / 100  
                 if volume == 0:
                     await ctx.send(":mute: Volume set to 0%. Music now paused.")
                 else:
