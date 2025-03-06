@@ -223,10 +223,14 @@ class NoticeAutoUpdate(commands.Cog):
                 summary_json = json.loads(summary)
                 self.daily_readings = {
                     "date": datetime.now().strftime("%B %d, %Y"),
-                    "motivational_quote": summary_json["motivational_quote"],
-                    "summary_paragraph": summary_json["summary_paragraph"],
-                    "title": summary_json["title"],
-                    "link": summary_json["link"],
+                    "motivational_quote": summary_json.get(
+                        "motivational_quote", "No motivational quote available."
+                    ),
+                    "summary_paragraph": summary_json.get(
+                        "summary_paragraph", "No summary available."
+                    ),
+                    "title": summary_json.get("title", "No title available."),
+                    "link": summary_json.get("link", "No link available."),
                 }
             except Exception as e:
                 print(f"Error fetching daily readings: {e}")

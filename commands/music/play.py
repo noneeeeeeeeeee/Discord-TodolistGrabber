@@ -21,19 +21,7 @@ class MusicPlayer(commands.Cog):
         self.executor = ThreadPoolExecutor(
             max_workers=4
         )  # Adjust the number of workers as needed
-        
-    class MusicPlayerState(Enum):
-        STOPPED = 0  # When the player isn't playing anything
-        PLAYING = 1  # The player is actively playing music.
-        PAUSED = 2  # The player is paused on a song.
-        WAITING = (
-            3  # The player has finished its song but is still downloading the next one
-        )
-        DEAD = 4  # The player has been killed.
 
-        def __str__(self) -> str:
-            return self.name
-        
     @commands.hybrid_command(
         name="play", aliases=["p"], description="Play a song or add to queue"
     )
@@ -201,12 +189,10 @@ class MusicPlayer(commands.Cog):
 
         ffmpeg_options = {
             "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            "options": "-vn ",
+            "options": "-vn",
         }
-        voice_client.play(
-            discord.FFmpegPCMAudio(url, **ffmpeg_options),
-            after=after_playing,
-        )
+        source = discord.FFmpegPCMAudio(url, **ffmpeg_options)
+        voice_client.play(source, after=after_playing)
 
         # Apply the stored volume level
         volume_cog = self.bot.get_cog("Volume")
