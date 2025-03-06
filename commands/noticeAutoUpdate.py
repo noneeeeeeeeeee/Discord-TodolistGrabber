@@ -4,10 +4,42 @@ import json
 import os
 from datetime import datetime, timedelta
 import asyncio
+import google.generativeai as genai
 from modules.setconfig import json_get, check_guild_config_available, edit_json_file
 from modules.cache import cache_data, cache_read_latest
+from catholic_mass_readings import USCCB, models
 from modules.readversion import read_current_version
 from modules.enviromentfilegenerator import check_and_load_env_file
+
+# Configure the Gemini API
+gemini_api_key = os.getenv("GeminiApiKey")
+if gemini_api_key:
+    try:
+        genai.configure(api_key=gemini_api_key)
+    except Exception as e:
+        print(
+            f"An error occurred while configuring the Gemini API: {str(e)} \n The daily readings module will now be disabled."
+        )
+        gemini_api_key = None
+
+
+async def fetch_daily_readings():
+    async with USCCB() as usccb:
+        mass = await usccb.get_mass(datetime.today().date(), models.MassType.DEFAULT)
+        return mass
+
+
+async def summarize_readings(readings):
+    prompt = f"Summarize the following daily readings and provide a motivational quote with a link embed, put the readings in a json format following: link, title, date, motivational_quote, summary_paragraph. \n The motivational quote should be plaintext and should be gotten from the daily readings. The JSON should instantly start with a curly bracket, and not formatted as ```json. The following below is the reading: \n\n{readings}"
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        summary = (
+            response.text if response.text else "No valid response from Gemini API."
+        )
+    except Exception as e:
+        summary = f"An error occurred while contacting the Gemini API: {str(e)}"
+    return summary
 
 
 class NoticeAutoUpdate(commands.Cog):
@@ -18,9 +50,12 @@ class NoticeAutoUpdate(commands.Cog):
         self.guild_update_info = {}
         self.startup_ping_sent = {}
         self.ping_message_being_updated = {}
+        self.daily_readings = None
         self.ping_message_lock = asyncio.Lock()
         self.update_noticeboard.start()
         self.send_ping_message_loop.start()
+        self.fetch_daily_readings_task.start()
+
         check_and_load_env_file()
 
     @tasks.loop(seconds=3600)
@@ -95,12 +130,18 @@ class NoticeAutoUpdate(commands.Cog):
                     ping_message = await channel.fetch_message(pingmessage_edit_id)
 
                     # Calculate timestamps
-                    next_update_timestamp = int(next_update_time.timestamp())
                     ping_daily_time = config.get("PingDailyTime", "15:00")
 
-                    await ping_message.edit(
-                        content=f"# Daily Ping <@&{ping_role}>\n- Today's date: {today.strftime('%a, %d %b %Y')}\n- Next Refresh in: <t:{next_update_timestamp}:R>\n- Next Ping in: <t:{int(self.get_next_ping_time(ping_daily_time).timestamp())}:R> \n- Last API call: {api_call_time}"
+                    ping_message = await channel.fetch_message(pingmessage_edit_id)
+                    new_ping_message_content = await self.send_ping_message(
+                        channel,
+                        config.get("PingRoleId", "NotSet"),
+                        today,
+                        self.get_next_ping_time(ping_daily_time),
+                        next_update_time,
+                        api_call_time,
                     )
+                    await ping_message.edit(content=new_ping_message_content)
                     print(f"Ping message edited for guild {guild_id} successfully.")
 
                 except discord.NotFound:
@@ -173,6 +214,30 @@ class NoticeAutoUpdate(commands.Cog):
                 f"Updated noticeboardEditID for guild {guild_id} with new valid message IDs: {new_message_ids}"
             )
 
+    @tasks.loop(hours=24)
+    async def fetch_daily_readings_task(self):
+        if gemini_api_key:
+            try:
+                readings = await fetch_daily_readings()
+                summary = await summarize_readings(readings)
+                summary_json = json.loads(summary)
+                self.daily_readings = {
+                    "date": datetime.now().strftime("%B %d, %Y"),
+                    "motivational_quote": summary_json["motivational_quote"],
+                    "summary_paragraph": summary_json["summary_paragraph"],
+                    "title": summary_json["title"],
+                    "link": summary_json["link"],
+                }
+            except Exception as e:
+                print(f"Error fetching daily readings: {e}")
+                self.daily_readings = None
+        else:
+            self.daily_readings = None
+
+    @fetch_daily_readings_task.before_loop
+    async def before_fetch_daily_readings_task(self):
+        await self.bot.wait_until_ready()
+
     async def edit_with_retries(self, message, **kwargs):
         """Attempts to edit a message with retries for handling rate limits."""
         max_retries = 5
@@ -199,7 +264,6 @@ class NoticeAutoUpdate(commands.Cog):
             ping_daily_time = config.get("PingDailyTime", "15:00")
             noticeboard_channel_id = config.get("NoticeBoardChannelId", "Default")
             interval = config.get("NoticeBoardUpdateInterval", "null")
-
             if (
                 noticeboard_channel_id == "Default"
                 or noticeboard_channel_id is None
@@ -237,7 +301,9 @@ class NoticeAutoUpdate(commands.Cog):
 
             ping_time = datetime.strptime(ping_daily_time, "%H:%M").time()
             ping_datetime = datetime.combine(today, ping_time)
+
             if self.first_start:
+
                 await asyncio.sleep(5)
                 await self.handle_ping_message(
                     channel, guild_id, today, ping_daily_time, now
@@ -253,7 +319,8 @@ class NoticeAutoUpdate(commands.Cog):
             )
 
     async def handle_ping_message(self, channel, guild_id, today, ping_daily_time, now):
-        """Handles sending or updating the ping message."""
+        print("Handling ping message...")
+        """Handles sending the ping message."""
         async with self.ping_message_lock:
             self.ping_message_being_updated[guild_id] = True
             try:
@@ -280,10 +347,12 @@ class NoticeAutoUpdate(commands.Cog):
                     print(
                         f"No ping message ID for guild {guild_id}. Sending a new ping message."
                     )
+                    new_ping_message = await channel.send(new_ping_message)
                     self.sent_message_ids[guild_id]["ping"] = new_ping_message.id
                     edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
                 else:
                     await self.delete_message_with_retries(channel, pingmessage_edit_id)
+                    new_ping_message = await channel.send(new_ping_message)
                     self.sent_message_ids[guild_id]["ping"] = new_ping_message.id
                     edit_json_file(guild_id, "pingmessageEditID", new_ping_message.id)
                     print(
@@ -332,17 +401,39 @@ class NoticeAutoUpdate(commands.Cog):
         await self.bot.wait_until_ready()
 
     async def send_ping_message(
-        self, channel, ping_role, today, next_ping_time, next_update_time, api_call_time
+        self,
+        channel,
+        ping_role,
+        today,
+        next_ping_time,
+        next_update_time,
+        api_call_time,
     ):
         next_update_timestamp = (
             int(next_update_time.timestamp())
             if isinstance(next_update_time, datetime)
             else "N/A"
         )
-        ping_message = await channel.send(
-            f"# Daily Ping <@&{ping_role}>\n- Today's date: {today.strftime('%a, %d %b %Y')}\n- Next Refresh in: <t:{next_update_timestamp}:R>\n- Next Ping in: <t:{int(next_ping_time.timestamp())}:R> \n- Last API call: {api_call_time}"
+
+        # Use the stored daily readings
+        daily_readings_info = ""
+        if self.daily_readings:
+            daily_readings_info = (
+                f"- Daily Motivational Quote: {self.daily_readings['motivational_quote']}\n"
+                f"      - Read the Full Text here: [{self.daily_readings['title']}](<{self.daily_readings['link']}>)\n"
+            )
+
+        ping_message_content = (
+            f"# Daily Ping <@&{ping_role}>\n"
+            f"- Today's date: {today.strftime('%a, %d %b %Y')}\n"
+            f"- Next Refresh in: <t:{next_update_timestamp}:R>\n"
+            f"- Next Ping in: <t:{int(next_ping_time.timestamp())}:R>\n"
         )
-        return ping_message
+
+        if daily_readings_info:
+            ping_message_content += daily_readings_info
+
+        return ping_message_content
 
     @update_noticeboard.before_loop
     async def before_update_noticeboard(self):
