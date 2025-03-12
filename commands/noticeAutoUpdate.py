@@ -221,17 +221,7 @@ class NoticeAutoUpdate(commands.Cog):
                 readings = await fetch_daily_readings()
                 summary = await summarize_readings(readings)
                 summary_json = json.loads(summary)
-                self.daily_readings = {
-                    "date": datetime.now().strftime("%B %d, %Y"),
-                    "motivational_quote": summary_json.get(
-                        "motivational_quote", "No motivational quote available."
-                    ),
-                    "summary_paragraph": summary_json.get(
-                        "summary_paragraph", "No summary available."
-                    ),
-                    "title": summary_json.get("title", "No title available."),
-                    "link": summary_json.get("link", "No link available."),
-                }
+                self.daily_readings = summary_json
             except Exception as e:
                 print(f"Error fetching daily readings: {e}")
                 self.daily_readings = None
@@ -295,7 +285,12 @@ class NoticeAutoUpdate(commands.Cog):
 
             ping_date_str = config.get("pingDateTime", None)
             if ping_date_str is not None:
-                ping_date = datetime.strptime(ping_date_str, "%Y-%m-%d").date()
+                try:
+                    ping_date = datetime.strptime(ping_date_str, "%Y-%m-%d").date()
+                except:
+                    print(
+                        "Date time is not parsable, it will now override the time and send another ping message anyways"
+                    )
                 if ping_date == today:
                     continue
             else:
@@ -422,10 +417,14 @@ class NoticeAutoUpdate(commands.Cog):
         # Use the stored daily readings
         daily_readings_info = ""
         if self.daily_readings:
-            daily_readings_info = (
-                f"- Daily Motivational Quote: {self.daily_readings['motivational_quote']}\n"
-                f"      - Read the Full Text here: [{self.daily_readings['title']}](<{self.daily_readings['link']}>)\n"
-            )
+            try:
+                reading = self.daily_readings["readings"][0]
+                daily_readings_info = (
+                    f"- Daily Motivational Quote: {reading['motivational_quote']}\n"
+                    f"      - Read the Full Text here: [{reading['title']}](<{reading['link']}>)\n"
+                )
+            except (KeyError, IndexError) as e:
+                print(f"Error accessing daily readings: {e}")
 
         ping_message_content = (
             f"# Daily Ping <@&{ping_role}>\n"
@@ -484,8 +483,8 @@ class NoticeAutoUpdate(commands.Cog):
         )
         tasks_found = False
 
-        for date, tasks in task_data.items():
-            if date == "Status" or not self.is_valid_date(date):
+        for date, tasks in task_data.get("data", {}).items():
+            if date == "unknown-due" or not self.is_valid_date(date):
                 continue
 
             task_date = datetime.strptime(date, "%A, %d-%m-%Y").date()
@@ -534,14 +533,12 @@ class NoticeAutoUpdate(commands.Cog):
             description="Tasks you have to do",
             color=discord.Color.blue(),
         )
-        unknown_due_tasks = []
+        unknown_due_tasks = task_data.get("data", {}).get("unknown-due", [])
 
         today = datetime.now().date()  # Get today's date
 
-        for date, tasks in task_data.items():
-            if date == "Status" or not self.is_valid_date(date):
-                if date == "unknown-due":
-                    unknown_due_tasks = tasks
+        for date, tasks in task_data.get("data", {}).items():
+            if date == "unknown-due" or not self.is_valid_date(date):
                 continue
 
             # Parse task date and calculate "Due in X day(s)"
@@ -599,8 +596,8 @@ class NoticeAutoUpdate(commands.Cog):
             title="Assignments Due Tomorrow", color=discord.Color.orange()
         )
 
-        for date, tasks in task_data.items():
-            if date in ["Status", "api-version", "unknown-due"]:
+        for date, tasks in task_data.get("data", {}).items():
+            if date == "unknown-due":
                 continue
             try:
                 task_date = datetime.strptime(date, "%A, %d-%m-%Y")
