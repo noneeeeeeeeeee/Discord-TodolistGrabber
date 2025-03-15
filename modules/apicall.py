@@ -13,7 +13,7 @@ def fetch_api_data(week=None, status=False):
     api = f"{base_url}?auth={auth_key}"
 
     try:
-        response = requests.get(api, headers=headers, timeout=10)
+        response = requests.post(api, headers=headers, timeout=10)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         return f"Error: {e}"
