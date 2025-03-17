@@ -9,7 +9,10 @@ def fetch_api_data(week=None, status=False):
     check_and_load_env_file()
     base_url = os.getenv("API_URL")
     auth_key = os.getenv("AUTH_URL")
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
     api = f"{base_url}?auth={auth_key}"
 
     try:
@@ -32,3 +35,6 @@ def fetch_api_data(week=None, status=False):
         return json.dumps(response_json)
     else:
         return response.text
+
+
+print(fetch_api_data())
