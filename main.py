@@ -2,7 +2,11 @@ import discord
 from discord.ext import commands
 import os
 import json
+import sys  # Add this import
 from modules.enviromentfilegenerator import check_and_load_env_file
+
+# Add the modules directory to the Python module search path
+sys.path.append(os.path.join(os.path.dirname(__file__), "modules"))
 
 intents = discord.Intents.default()
 intents.message_content = True
