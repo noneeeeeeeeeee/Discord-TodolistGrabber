@@ -1,0 +1,121 @@
+server: # REST and WS server
+  port: 2333
+  address: 0.0.0.0
+  http2:
+    enabled: false
+
+lavalink:
+  # ——— PLUGINS ———
+  plugins:
+    # LavaSrc: Spotify, Apple Music & Deezer support
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.5.0"
+      repository: "https://maven.lavalink.dev/releases" # default release repo :contentReference[oaicite:3]{index=3}
+
+    # YouTube-Source plugin v4 (supports music.youtube.com)
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.12.0"
+      repository: "https://maven.lavalink.dev/releases" # v2 plugin for Lavalink v4 :contentReference[oaicite:4]{index=4}
+
+    # SponsorBlock: skip sponsor, intro/outro, music_offtopic, etc.
+    - dependency: "com.github.topi314.sponsorblock:sponsorblock-plugin:3.0.1"
+      repository: "https://maven.lavalink.dev/releases"
+      snapshot: false # set to true if you want snapshot builds :contentReference[oaicite:5]{index=5}
+
+  server:
+    password: "youshallnotpass"
+    sources:
+      youtube: false # handled by youtube-source plugin
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      nico: true
+      http: false # disable raw HTTP for safety
+      local: false
+
+    filters:
+      volume: true
+      equalizer: false
+      karaoke: false
+      timescale: false
+      tremolo: false
+      vibrato: false
+      distortion: false
+      rotation: false
+      channelMix: false
+      lowPass: false
+
+    nonAllocatingFrameBuffer: false
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: true
+    gc-warnings: true
+
+metrics:
+  prometheus:
+    enabled: false
+    endpoint: /metrics
+
+sentry:
+  dsn: ""
+  environment: ""
+
+logging:
+  file:
+    path: ./logs/
+  level:
+    root: INFO
+    lavalink: INFO
+  request:
+    enabled: true
+    includeClientInfo: true
+    includeHeaders: false
+    includeQueryString: true
+    includePayload: true
+    maxPayloadLength: 10000
+  logback:
+    rollingpolicy:
+      max-file-size: 1GB
+      max-history: 30
+
+# ——— PLUGIN-SPECIFIC CONFIG ———
+plugins:
+  # YouTube-Source plugin settings
+  youtube:
+    enabled: true
+    allowSearch: true # supports ytsearch: and ytmsearch:
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
+    clients:
+      - MUSIC
+      - WEB
+      - WEBEMBEDDED
+
+  # LavaSrc: search & direct providers for non-YouTube sources
+  lavasrc:
+    providers:
+      - 'ytsearch:"%ISRC%"' # ISRC-based YouTube search
+      - "ytsearch:%QUERY%"
+      - "scsearch:%QUERY%" # SoundCloud
+      - "spsearch:%QUERY%" # Spotify search
+      - "sprec:%QUERY%" # Spotify recommendation
+      - "ymsearch:%QUERY%" # YouTube Music search
+      - "amsearch:%QUERY%" # Apple Music search
+      - "dzisrc:%ISRC%" # Deezer by ISRC
+    sources:
+      spotify: true
+      applemusic: true
+      deezer: false
+
+  # SponsorBlock plugin: will skip segments based on categories
+  sponsorblock:
+    enabled: false
+    # You’ll need to PUT the desired categories via REST:
+    #   PUT /v4/sessions/{sessionId}/players/{guildId}/sponsorblock/categories
+    #   ["music_offtopic"]     # skip non-music sections only

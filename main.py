@@ -2,17 +2,15 @@ import discord
 from discord.ext import commands
 import os
 import json
-import sys  # Add this import
+import sys
 from modules.enviromentfilegenerator import check_and_load_env_file
-
-# Add the modules directory to the Python module search path
-sys.path.append(os.path.join(os.path.dirname(__file__), "modules"))
+import subprocess
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
-CONFIG_DIR = "./config"  # Directory where guild setup status is stored
+CONFIG_DIR = "./config"
 
 
 class MyBot(commands.Bot):
@@ -22,7 +20,29 @@ class MyBot(commands.Bot):
     async def setup_hook(self):
         """Load cogs and sync commands."""
         await load_commands()
+        try:
+            await self.load_extension("modules.music.music_player")
+            print("MusicPlayer extension loaded")
+        except Exception as e:
+            print(f"Failed to load MusicPlayer cog: {e}")
         await self.tree.sync()
+
+        lavalink_dir = os.getenv("LAVALINK_DIR")
+        if lavalink_dir:
+            lavalink_dir = os.path.abspath(lavalink_dir)
+
+        if lavalink_dir and os.path.isdir(lavalink_dir):
+            jar_name = "Lavalink.jar"
+            jar_path = os.path.join(lavalink_dir, jar_name)
+            if os.path.isfile(jar_path):
+                self.lavalink_process = subprocess.Popen(
+                    ["java", "-jar", jar_name],
+                    cwd=lavalink_dir,
+                )
+            else:
+                print(f"{jar_name} not found in {lavalink_dir}.")
+        else:
+            print("LAVALINK_DIR is not set or does not exist. Skipping Lavalink setup.")
 
 
 async def load_commands():
