@@ -10,8 +10,6 @@ def check_and_load_env_file():
             "API_URL=https://example.com/api\n"
             "DiscordBotToken=YOUR_DISCORD_BOT_TOKEN\n"
             "GeminiApiKey=YOUR_GEMINI_API_KEY\n"
-            "DEV_CHANNEL=THE_CHANNEL_YOU_WANT_DEV_LOGS_TO_BE_AT\n"
-            "DEV_GUILD=YOUR_DISCORD_SERVER\n"
             "OWNER_ID=YOUR_DISCORD_ID\n"
         )
         with open(env_path, "w") as env_file:

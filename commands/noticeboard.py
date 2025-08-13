@@ -69,6 +69,10 @@ class NoticeBoard(commands.Cog):
             )
             embed.add_field(name="Daily Ping Time", value=ping_daily_time, inline=False)
 
+            btnview = View(timeout=60)
+            update_now = Button(label="🔄 Update Now", style=discord.ButtonStyle.green)
+            delete_cache = Button(label="🗑️ Delete Cache", style=discord.ButtonStyle.red)
+
             async def update_callback(interaction):
                 if interaction.user != ctx.author:
                     await interaction.response.send_message(
@@ -76,12 +80,11 @@ class NoticeBoard(commands.Cog):
                     )
                     return
                 await interaction.response.send_message(
-                    "Updating noticeboard now...", ephemeral=True, delete_after=10
+                    "Updating noticeboard now...", ephemeral=True
                 )
-                # Trigger the update manually
                 cog = self.bot.get_cog("NoticeAutoUpdate")
                 if cog:
-                    await cog.update_noticeboard()
+                    await cog.run_update_noticeboard_once(guild_id)
 
             async def delete_cache_callback(interaction):
                 if interaction.user != ctx.author:
@@ -90,123 +93,38 @@ class NoticeBoard(commands.Cog):
                     )
                     return
                 await interaction.response.send_message(
-                    "Deleting cache...", ephemeral=True, delete_after=10
+                    "Deleting cache...", ephemeral=True
                 )
                 truncate_cache()  # Ensure this function deletes the cache files
 
-            btnview = View(timeout=60)
-            update_now = Button(label="🔄 Update Now", style=discord.ButtonStyle.green)
             update_now.callback = update_callback
-            delete_cache = Button(label="🗑️ Delete Cache", style=discord.ButtonStyle.red)
             delete_cache.callback = delete_cache_callback
             btnview.add_item(update_now)
             btnview.add_item(delete_cache)
+
+            # Send and retain the bot's panel message for safe edits later
+            panel_msg = await ctx.send(embed=embed, view=btnview)
 
             async def on_timeout():
                 for item in btnview.children:
                     item.disabled = True
                 try:
-                    await ctx.message.edit(view=btnview)
+                    await panel_msg.edit(view=btnview)
                 except discord.Forbidden as e:
                     print(f"Failed to edit message: {e}")
                 except Exception as e:
                     print(f"An unexpected error occurred: {e}")
 
             btnview.on_timeout = on_timeout
-
-            await ctx.send(embed=embed, view=btnview)
             return
 
-        # Handle the "edit" action
         if action == "set":
-            if field == "channelid":
-                await ctx.send(
-                    "Please send the channel id you would like to set as the NoticeBoard channel (e.g., `1234567890123456789`)."
-                )
-
-                def check_channel(m):
-                    return m.author == ctx.author and (
-                        m.channel_mentions or m.content.isdigit()
-                    )
-
-                try:
-                    channel_msg = await self.bot.wait_for(
-                        "message", check=check_channel, timeout=60.0
-                    )
-                    if channel_msg.channel_mentions:
-                        channel_id = channel_msg.channel_mentions[0].id
-                    else:
-                        channel_id = int(channel_msg.content)
-
-                    edit_noticeboard_config(guild_id, channel_id)
-                    await ctx.send(
-                        f"NoticeBoard Channel has been set to <#{channel_id}>."
-                    )
-                except (ValueError, discord.NotFound):
-                    await ctx.send("Invalid channel mentioned or ID provided.")
-                except discord.HTTPException:
-                    await ctx.send(
-                        "Something went wrong while setting the channel. Please try again."
-                    )
-
-            elif field == "interval":
-                await ctx.send(
-                    "Please provide the update interval in seconds for the NoticeBoard."
-                )
-
-                def check_interval(m):
-                    return m.author == ctx.author and m.content.isdigit()
-
-                try:
-                    interval_msg = await self.bot.wait_for(
-                        "message", check=check_interval, timeout=60.0
-                    )
-                    interval = int(interval_msg.content)
-
-                    edit_noticeboard_config(guild_id, None, interval)
-                    if os.getenv("DEV_GUILD") == guild_id:
-                        await ctx.send(
-                            f"NoticeBoard update interval has been set to {interval} seconds."
-                        )
-                    else:
-                        await ctx.send(
-                            f"NoticeBoard update interval has been set to {interval} seconds, although it will not take effect, since it is not in the owners guild, if you have an issue with the check time, please contact the bot hoster."
-                        )
-                except ValueError:
-                    await ctx.send(
-                        "Invalid interval provided. Please enter a valid number of seconds."
-                    )
-                except discord.HTTPException:
-                    await ctx.send(
-                        "Something went wrong while setting the interval. Please try again."
-                    )
-            elif field == "pingtime":
-                await ctx.send(
-                    "Please provide the time of day to send the daily ping in 24-hour format (e.g., `18:00`)."
-                )
-
-                def check_ping_time(m):
-                    return m.author == ctx.author and len(m.content.split(":")) == 2
-
-                try:
-                    ping_time_msg = await self.bot.wait_for(
-                        "message", check=check_ping_time, timeout=60.0
-                    )
-                    ping_time = ping_time_msg.content
-
-                    edit_noticeboard_config(guild_id, None, None, ping_time)
-                    await ctx.send(f"Daily ping time has been set to {ping_time}.")
-                except discord.HTTPException:
-                    await ctx.send(
-                        "Something went wrong while setting the ping time. Please try again."
-                    )
-            else:
-                await ctx.send(
-                    "Unknown field. You can use `set ChannelId` or `set Interval`."
-                )
+            await ctx.send(
+                "Unknown field. Use /settings to update the settings, This command has been deprecated."
+            )
         else:
             await ctx.send(
-                "Unknown action. You can use the `edit` action to modify settings."
+                "Unknown action. Use /settings for editing noticeboard settings."
             )
 
 

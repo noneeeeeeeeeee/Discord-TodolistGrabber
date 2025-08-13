@@ -375,19 +375,6 @@ def _get_by_path(obj: dict, path: str, default=None):
     return cur
 
 
-def _central_guild_id() -> int:
-    """
-    Central server guild ID is read from .env:
-    - CENTRAL_GUILD (preferred)
-    - fallback DEV_GUILD if CENTRAL_GUILD is unset
-    """
-    try:
-        val = os.getenv("CENTRAL_GUILD") or os.getenv("DEV_GUILD") or "0"
-        return int(val)
-    except Exception:
-        return 0
-
-
 def create_default_config(
     guild_id,
     default_admin_role_id,
@@ -477,7 +464,7 @@ def edit_noticeboard_config(
         json.dump(config_data, config_file, indent=4)
 
 
-def edit_json_file(guild_id, key, value):
+def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
     config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")
 
@@ -496,10 +483,11 @@ def edit_json_file(guild_id, key, value):
     except ValueError as e:
         raise
 
-    # Central propagation: if access is 3 or 4 and edited in central guild
+    # Owner-based central propagation: if access is 3 or 4 and the actor is OWNER_ID
     meta = get_setting_meta(key)
-    central_id = _central_guild_id()
-    if meta and meta.get("access") in (3, 4) and int(guild_id) == central_id:
+    owner_env = os.getenv("OWNER_ID")
+    is_owner = owner_env is not None and str(actor_user_id) == str(owner_env)
+    if meta and meta.get("access") in (3, 4) and is_owner:
         for fname in os.listdir(config_dir):
             if not fname.endswith(".json"):
                 continue
@@ -555,6 +543,18 @@ def check_admin_role(guild_id, user_roles):
 
 def json_get(guild_id):
     config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
+    config_file_path = os.path.join(config_dir, f"{guild_id}.json")
+    with open(config_file_path, "r") as config_file:
+        data = json.load(config_file)
+
+    # auto-migrate and persist if needed
+    migrated = _migrate_flat_to_modules(data)
+    # apply schema defaults/migrations
+    migrated, changed_schema = _ensure_schema_defaults(migrated)
+    if migrated is not data or changed_schema:
+        with open(config_file_path, "w") as config_file:
+            json.dump(migrated, config_file, indent=4)
+    return migrated
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")
     with open(config_file_path, "r") as config_file:
         data = json.load(config_file)

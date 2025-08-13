@@ -64,37 +64,34 @@ def _access_label(v: int) -> str:
     }.get(int(v or 0), "Editable")
 
 
-def _is_central_guild(guild_id: int) -> bool:
+def _is_owner(user_id: int) -> bool:
     try:
-        central = int(os.getenv("CENTRAL_GUILD") or os.getenv("DEV_GUILD") or 0)
+        return str(user_id) == str(os.getenv("OWNER_ID") or "")
     except Exception:
-        central = 0
-    return int(guild_id or 0) == central
+        return False
 
 
-def _can_view(meta: dict, is_central: bool) -> bool:
+def _can_view(meta: dict, is_owner: bool) -> bool:
     access = int(meta.get("access", 0))
     if access == 2:
         return False
-    if access == 4 and not is_central:
+    if access == 4 and not is_owner:
         return False
     return True
 
 
-def _can_edit(meta: dict, is_central: bool) -> bool:
+def _can_edit(meta: dict, is_owner: bool) -> bool:
     access = int(meta.get("access", 0))
     if access == 0:
         return True
-    if access == 3 and is_central:
-        return True
-    if access == 4 and is_central:
+    if access in (3, 4) and is_owner:
         return True
     return False
 
 
 class SettingsView(View):
     def __init__(self, bot: commands.Bot, ctx: commands.Context, schema, cfg):
-        super().__init__(timeout=180)
+        super().__init__(timeout=60)  # 1 minute timeout
         self.bot = bot
         self.ctx = ctx
         self.schema = schema
@@ -102,7 +99,7 @@ class SettingsView(View):
         self.cfg = cfg
         self.selected_section = None
         self.selected_path = None
-        self.is_central = _is_central_guild(ctx.guild.id)
+        self.is_owner = _is_owner(ctx.author.id)
 
         self.section_select = Select(placeholder="Choose module/section")
         for section in self.flat.keys():
@@ -159,7 +156,7 @@ class SettingsView(View):
 
         visible_paths = []
         for path, meta in self.flat[self.selected_section].items():
-            if _can_view(meta, self.is_central):
+            if _can_view(meta, self.is_owner):
                 visible_paths.append((path, meta))
 
         if not visible_paths:
@@ -191,7 +188,7 @@ class SettingsView(View):
         meta = self.current_meta() or {}
         t = meta.get("type", "str")
         is_bool = t == "bool"
-        can_edit = _can_edit(meta, self.is_central)
+        can_edit = _can_edit(meta, self.is_owner)
         self.toggle_btn.disabled = not (is_bool and can_edit)
         self.set_value_btn.disabled = not (can_edit and not is_bool)
         self.reset_btn.disabled = not can_edit
@@ -203,7 +200,12 @@ class SettingsView(View):
         cur = _safe_get(self.cfg, self.selected_path)
         try:
             new_val = not bool(cur)
-            edit_json_file(self.ctx.guild.id, self.selected_path, new_val)
+            edit_json_file(
+                self.ctx.guild.id,
+                self.selected_path,
+                new_val,
+                actor_user_id=self.ctx.author.id,
+            )
             self.cfg = json_get(self.ctx.guild.id)
             await interaction.response.edit_message(
                 embed=self._embed(message="Toggled successfully."), view=self
@@ -252,7 +254,12 @@ class SettingsView(View):
                 raw_value = raw_input
             # Let setconfig coerce and validate
             coerced = coerce_value_for_path(self.selected_path, raw_value)
-            edit_json_file(self.ctx.guild.id, self.selected_path, coerced)
+            edit_json_file(
+                self.ctx.guild.id,
+                self.selected_path,
+                coerced,
+                actor_user_id=self.ctx.author.id,
+            )
             self.cfg = json_get(self.ctx.guild.id)
             await self.message.edit(
                 embed=self._embed(message="Value updated."), view=self
@@ -264,7 +271,12 @@ class SettingsView(View):
         meta = self.current_meta() or {}
         default = meta.get("default", None)
         try:
-            edit_json_file(self.ctx.guild.id, self.selected_path, default)
+            edit_json_file(
+                self.ctx.guild.id,
+                self.selected_path,
+                default,
+                actor_user_id=self.ctx.author.id,
+            )
             self.cfg = json_get(self.ctx.guild.id)
             await interaction.response.edit_message(
                 embed=self._embed(message="Reset to default."), view=self
@@ -277,6 +289,14 @@ class SettingsView(View):
     async def on_refresh(self, interaction: discord.Interaction):
         self.cfg = json_get(self.ctx.guild.id)
         await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except Exception:
+            pass
 
     def _embed(self, message: str = None, error: str = None):
         title = "Settings Menu"

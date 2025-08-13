@@ -40,12 +40,6 @@ class NoticeAutoUpdate(commands.Cog):
         self.send_ping_message_loop.start()
         self.fetch_daily_readings_task.start()
 
-    def _dev_guild_id(self) -> int:
-        try:
-            return int(os.getenv("DEV_GUILD") or 0)
-        except ValueError:
-            return 0
-
     def has_assignments_tomorrow(self, task_data: dict) -> bool:
         today = datetime.now().date()
         tomorrow = today + timedelta(days=1)
@@ -67,111 +61,117 @@ class NoticeAutoUpdate(commands.Cog):
                 return True
         return False
 
-    @tasks.loop(seconds=3600)
-    async def update_noticeboard(self):
-        today = datetime.now()
-        for guild in self.bot.guilds:
-            guild_id = guild.id
+    async def _update_noticeboard_for_guild(self, guild: discord.Guild):
+        """Run a single noticeboard update for the provided guild."""
+        guild_id = guild.id
+        try:
+            config = json_get(guild_id)
+        except Exception as e:
+            print(f"Error getting config for guild {guild_id}: {e}")
+            return
+
+        nb_cfg = config.get("Noticeboard", {})
+        noticeboard_channel_id = nb_cfg.get("ChannelId", "Default")
+        noticeboard_edit_ids = nb_cfg.get("NoticeboardEditIDs", [])
+        interval_cfg = nb_cfg.get("UpdateInterval", None)
+
+        if noticeboard_channel_id in ("Default", None, "null"):
+            print(f"Noticeboard channel ID not set for guild {guild_id}. Skipping.")
+            return
+
+        channel = guild.get_channel(int(noticeboard_channel_id))
+        if channel is None:
+            print(f"Channel not found for guild {guild_id}.")
+            return
+
+        version = read_current_version()
+        new_message_ids = []
+
+        # Refresh and read tasks
+        try:
+            cache_data("all")
+            task_data_str = cache_read_latest("all")
+        except Exception as e:
+            print(f"Error refreshing/reading cache for guild {guild_id}: {e}")
+            return
+
+        if not task_data_str:
+            print("Error: No task data found in the cache.")
+            return
+
+        try:
+            task_data = json.loads(task_data_str)
+            api_call_time = task_data.get("api-call-time", "Unknown")
+        except json.JSONDecodeError:
+            print(
+                f"Error: Unable to decode cached data. Raw data: {task_data_str[:200]}..."
+            )
+            return
+
+        if not isinstance(task_data, dict):
+            print(
+                f"Error: Expected task data to be a dictionary but got {type(task_data)}."
+            )
+            return
+
+        embeds = [
+            self.create_notice_embed(task_data, version),
+            self.create_weekly_embed(task_data, version, api_call_time),
+            self.create_due_tomorrow_embed(task_data, version),
+        ]
+
+        # Edit existing (limit to embeds len)
+        for i, message_id in enumerate(noticeboard_edit_ids[: len(embeds)]):
             try:
-                config = json_get(guild_id)
-            except Exception as e:
-                print(f"Error getting config for guild {guild_id}: {e}")
-                continue
-
-            nb_cfg = config.get("Noticeboard", {})
-            noticeboard_channel_id = nb_cfg.get("ChannelId", "Default")
-            noticeboard_edit_ids = nb_cfg.get("NoticeboardEditIDs", [])
-            interval_cfg = nb_cfg.get("UpdateInterval", None)
-            # Compute effective interval
-            dev_gid = self._dev_guild_id()
-            if guild_id == dev_gid and interval_cfg is None:
-                # In dev guild, respect 'unset' as 'skip auto-updates'
-                continue
-            interval = interval_cfg or 3600
-
-            # keep loop cadence aligned with config (applies globally)
-            try:
-                self.update_noticeboard.change_interval(seconds=interval)
-            except Exception:
-                pass
-
-            if noticeboard_channel_id in ("Default", None, "null"):
-                print(f"Noticeboard channel ID not set for guild {guild_id}. Skipping.")
-                continue
-
-            channel = guild.get_channel(int(noticeboard_channel_id))
-            if channel is None:
-                print(f"Channel not found for guild {guild_id}.")
-                continue
-
-            version = read_current_version()
-            new_message_ids = []
-
-            # Fetch task data
-            try:
-                cache_data("all")
-                task_data_str = cache_read_latest("all")
-            except Exception as e:
-                print(f"Error refreshing/reading cache for guild {guild_id}: {e}")
-                continue
-
-            if not task_data_str:
-                print("Error: No task data found in the cache.")
-                continue
-
-            try:
-                task_data = json.loads(task_data_str)
-                api_call_time = task_data.get("api-call-time", "Unknown")
-            except json.JSONDecodeError:
-                print(
-                    f"Error: Unable to decode cached data. Raw data: {task_data_str[:200]}..."
-                )
-                continue
-
-            if not isinstance(task_data, dict):
-                print(
-                    f"Error: Expected task data to be a dictionary but got {type(task_data)}."
-                )
-                continue
-
-            embeds = [
-                self.create_notice_embed(task_data, version),
-                self.create_weekly_embed(task_data, version, api_call_time),
-                self.create_due_tomorrow_embed(task_data, version),
-            ]
-
-            # Edit or send messages for each embed
-            # Limit edits to available embeds to avoid IndexError if extra IDs exist
-            for i, message_id in enumerate(noticeboard_edit_ids[: len(embeds)]):
-                try:
-                    message = await channel.fetch_message(message_id)
-                    await message.edit(embed=embeds[i])
-                    await asyncio.sleep(1)
-                    new_message_ids.append(message_id)
-                except discord.NotFound:
-                    try:
-                        new_message = await channel.send(embed=embeds[i])
-                        new_message_ids.append(new_message.id)
-                    except discord.HTTPException as e:
-                        print(f"Failed to send new message for guild {guild_id}: {e}")
-                except discord.HTTPException as e:
-                    print(
-                        f"Failed to edit message ID {message_id} for guild {guild_id}: {e}"
-                    )
-
-            # For any remaining embeds without a corresponding message ID, send new messages
-            for i in range(len(new_message_ids), len(embeds)):
+                message = await channel.fetch_message(message_id)
+                await message.edit(embed=embeds[i])
+                await asyncio.sleep(1)
+                new_message_ids.append(message_id)
+            except discord.NotFound:
                 try:
                     new_message = await channel.send(embed=embeds[i])
                     new_message_ids.append(new_message.id)
                 except discord.HTTPException as e:
                     print(f"Failed to send new message for guild {guild_id}: {e}")
-
-            # Persist new valid message IDs
-            if new_message_ids:
-                edit_json_file(
-                    guild_id, "Noticeboard.NoticeboardEditIDs", new_message_ids
+            except discord.HTTPException as e:
+                print(
+                    f"Failed to edit message ID {message_id} for guild {guild_id}: {e}"
                 )
+
+        # Send any missing
+        for i in range(len(new_message_ids), len(embeds)):
+            try:
+                new_message = await channel.send(embed=embeds[i])
+                new_message_ids.append(new_message.id)
+            except discord.HTTPException as e:
+                print(f"Failed to send new message for guild {guild_id}: {e}")
+
+        if new_message_ids:
+            edit_json_file(guild_id, "Noticeboard.NoticeboardEditIDs", new_message_ids)
+
+    async def run_update_noticeboard_once(self, guild_id: int):
+        """Public: trigger an immediate update for a single guild."""
+        guild = self.bot.get_guild(int(guild_id))
+        if not guild:
+            print(f"Guild {guild_id} not found for manual update.")
+            return
+        await self._update_noticeboard_for_guild(guild)
+
+    @tasks.loop(seconds=3600)
+    async def update_noticeboard(self):
+        today = datetime.now()
+        for guild in self.bot.guilds:
+            # keep loop cadence alignment
+            try:
+                config = json_get(guild.id)
+                interval_cfg = config.get("Noticeboard", {}).get("UpdateInterval", None)
+                interval = interval_cfg or 3600
+                self.update_noticeboard.change_interval(seconds=interval)
+            except Exception:
+                pass
+
+            # Run the actual update for this guild
+            await self._update_noticeboard_for_guild(guild)
 
     @tasks.loop(hours=24)
     async def fetch_daily_readings_task(self):
@@ -223,11 +223,7 @@ class NoticeAutoUpdate(commands.Cog):
             smart_ping = nb_cfg.get("SmartPingMode", True)
             noticeboard_channel_id = nb_cfg.get("ChannelId", "Default")
             interval_cfg = nb_cfg.get("UpdateInterval", None)
-            dev_gid = self._dev_guild_id()
             if noticeboard_channel_id in ("Default", None, "null"):
-                continue
-            if guild_id == dev_gid and interval_cfg is None:
-                # disable pings/updates in dev guild when interval unset
                 continue
 
             channel = guild.get_channel(int(noticeboard_channel_id))
