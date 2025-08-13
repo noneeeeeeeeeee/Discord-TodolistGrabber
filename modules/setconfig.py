@@ -1,6 +1,392 @@
 import os
 import json
 
+# Add typing and helpers
+from typing import Any, Dict, Tuple
+import re
+from datetime import datetime
+
+# Central settings schema with identifiers, types, defaults, and per-setting access control
+# access values:
+# 0: Editable
+# 1: Not Editable (visible)
+# 2: Hidden (non editable in any server)
+# 3: Central Server only Editable (visible to all)
+# 4: Central Server only Editable and Hidden to Non-Central Servers
+SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "General": {
+        "DefaultAdmin": {
+            "type": "role",
+            "default": None,
+            "access": 0,
+            "description": "Default Admin Role ID in the Settings",
+        },
+        "DefaultRoleId": {
+            "type": "role",
+            "default": None,
+            "access": 0,
+            "description": "Default member role ID",
+        },
+    },
+    "Noticeboard": {
+        "Enabled": {"type": "bool", "default": True, "access": 0},
+        "ChannelId": {"type": "channel|Default", "default": "Default", "access": 0},
+        "UpdateInterval": {
+            "type": "int|null",
+            "default": None,
+            "min": 300,
+            "max": 86400,
+            "access": 0,
+            "description": "Seconds (5m - 24h)",
+        },
+        "PingRoleId": {"type": "role|null", "default": None, "access": 0},
+        "PingDailyTime": {
+            "type": "time",
+            "default": "15:00",
+            "access": 3,  # central-only editable; propagate on central edit
+        },
+        "SmartPingMode": {
+            "type": "bool",
+            "default": True,
+            "access": 0,  # enable smart gating of pings by default
+            "description": "Skip daily ping if no work tomorrow/week",
+        },
+        "NoticeboardEditIDs": {"type": "list[int]", "default": [], "access": 2},
+        "PingMessageEditID": {"type": "int|null", "default": None, "access": 2},
+        "PingDate": {"type": "date|null", "default": None, "access": 2},
+        "PingDayBlacklist": {
+            "type": "list[str]",
+            "default": ["Friday", "Saturday"],
+            "access": 0,
+            "choices": [
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday",
+                "Sunday",
+            ],
+        },
+    },
+    "Music": {
+        "Enabled": {"type": "bool", "default": False, "access": 0},
+        "DJRole": {"type": "role|null", "default": None, "access": 0},
+        "DJRoleRequired": {"type": "bool", "default": True, "access": 0},
+        "Volume": {
+            "type": "float",
+            "default": 0.5,
+            "min": 0.0,
+            "max": 1.0,
+            "access": 0,
+        },
+        "QueueLimit": {
+            "type": "int",
+            "default": 10,
+            "min": 1,
+            "max": 1000,
+            "access": 0,
+        },
+        "QueueLimitEnabled": {"type": "bool", "default": True, "access": 0},
+        "PlayerStick": {"type": "bool", "default": True, "access": 0},
+        "TrackMaxDuration": {
+            "type": "int",
+            "default": 600,
+            "min": 10,
+            "max": 43200,
+            "access": 0,
+        },
+        "RemoveNonSongsUsingSponsorBlock": {
+            "type": "bool",
+            "default": True,
+            "access": 0,
+        },
+        "PlaylistAddLimit": {
+            "type": "int",
+            "default": 10,
+            "min": 1,
+            "max": 1000,
+            "access": 0,
+        },
+    },
+    "GoogleClassroom": {
+        "Enabled": {"type": "bool", "default": False, "access": 0},
+        "DefaultChannelId": {
+            "type": "channel|Default",
+            "default": "Default",
+            "access": 0,
+        },
+    },
+}
+
+
+def _flatten_schema() -> Dict[str, Dict[str, Any]]:
+    flat: Dict[str, Dict[str, Any]] = {}
+    for section, fields in SETTINGS_SCHEMA.items():
+        for key, meta in fields.items():
+            flat[f"{section}.{key}"] = {"section": section, "key": key, **meta}
+    return flat
+
+
+_FLAT_SCHEMA = _flatten_schema()
+
+
+def get_settings_schema() -> Dict[str, Dict[str, Any]]:
+    # Return full schema; UI will filter by 'access'
+    return SETTINGS_SCHEMA
+
+
+def get_setting_meta(path: str) -> Dict[str, Any]:
+    return _FLAT_SCHEMA.get(path, {})
+
+
+def _is_null(value: Any) -> bool:
+    return value is None
+
+
+def _coerce_time(s: str) -> str:
+    if not isinstance(s, str):
+        raise ValueError("time must be a string HH:MM")
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", s):
+        raise ValueError("time must be in 24h HH:MM format")
+    return s
+
+
+def _coerce_date(s: str) -> str:
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        raise ValueError("date must be string YYYY-MM-DD or null")
+    # accept YYYY-MM-DD
+    datetime.strptime(s, "%Y-%m-%d")
+    return s
+
+
+def _coerce_int(val: Any) -> int:
+    if isinstance(val, bool):
+        raise ValueError("int cannot be bool")
+    return int(val)
+
+
+def _coerce_float(val: Any) -> float:
+    if isinstance(val, bool):
+        raise ValueError("float cannot be bool")
+    return float(val)
+
+
+def _within(meta: Dict[str, Any], val: Any) -> Any:
+    if "min" in meta and val < meta["min"]:
+        raise ValueError(f"value must be >= {meta['min']}")
+    if "max" in meta and val > meta["max"]:
+        raise ValueError(f"value must be <= {meta['max']}")
+    if "choices" in meta and isinstance(meta["choices"], list):
+        # allow list[str] choice members too
+        if isinstance(val, list):
+            invalid = [x for x in val if x not in meta["choices"]]
+            if invalid:
+                raise ValueError(f"invalid choices: {', '.join(map(str, invalid))}")
+        elif val not in meta["choices"]:
+            raise ValueError(
+                f"value must be one of: {', '.join(map(str, meta['choices']))}"
+            )
+    return val
+
+
+def _coerce_list_int(v: Any) -> list:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [int(x) for x in v]
+    raise ValueError("expected list[int]")
+
+
+def _coerce_list_str(v: Any) -> list:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x) for x in v]
+    # Support comma-separated input "Mon,Tue"
+    if isinstance(v, str):
+        return [s.strip() for s in v.split(",") if s.strip()]
+    raise ValueError("expected list[str]")
+
+
+def _coerce_channel_or_default(v: Any) -> Any:
+    if v == "Default":
+        return "Default"
+    if v in ("null", "None", None):
+        return "Default"
+    return int(v)
+
+
+def _coerce_role_or_null(v: Any) -> Any:
+    if v in (None, "null", "None"):
+        return None
+    return int(v)
+
+
+def coerce_value_for_path(path: str, raw_value: Any) -> Any:
+    meta = get_setting_meta(path)
+    if not meta:
+        # not in schema, store as-is
+        return raw_value
+    t = meta.get("type", "str")
+    try:
+        if t == "bool":
+            if isinstance(raw_value, str):
+                if raw_value.lower() in ("true", "1", "yes", "on"):
+                    val = True
+                elif raw_value.lower() in ("false", "0", "no", "off"):
+                    val = False
+                else:
+                    raise ValueError("expected boolean (true/false)")
+            else:
+                val = bool(raw_value)
+            return val
+        if t == "int":
+            return _within(meta, _coerce_int(raw_value))
+        if t == "float":
+            return _within(meta, _coerce_float(raw_value))
+        if t == "int|null":
+            if _is_null(raw_value) or (
+                isinstance(raw_value, str) and raw_value.lower() in ("null", "none", "")
+            ):
+                return None
+            return _within(meta, _coerce_int(raw_value))
+        if t == "role":
+            return int(raw_value)
+        if t == "role|null":
+            return _coerce_role_or_null(raw_value)
+        if t == "channel|Default":
+            return _coerce_channel_or_default(raw_value)
+        if t == "time":
+            return _coerce_time(raw_value)
+        if t == "date|null":
+            return _coerce_date(raw_value)
+        if t == "list[int]":
+            return _coerce_list_int(raw_value)
+        if t == "list[str]":
+            val = _coerce_list_str(raw_value)
+            return _within(meta, val)
+        # default to string
+        return str(raw_value)
+    except Exception as e:
+        raise ValueError(f"Invalid value for {path}: {e}")
+
+
+def _ensure_schema_defaults(config_data: dict) -> Tuple[dict, bool]:
+    """
+    Ensure all schema-defined keys exist with proper types/defaults; returns (config, changed).
+    """
+    changed = False
+    for path, meta in _FLAT_SCHEMA.items():
+        # navigate and ensure presence
+        cur = config_data
+        keys = path.split(".")
+        for k in keys[:-1]:
+            if k not in cur or not isinstance(cur[k], dict):
+                cur[k] = {}
+                changed = True
+            cur = cur[k]
+        leaf = keys[-1]
+        if leaf not in cur:
+            cur[leaf] = meta.get("default")
+            changed = True
+        else:
+            # attempt to coerce to valid type/range
+            try:
+                coerced = coerce_value_for_path(path, cur[leaf])
+                if coerced != cur[leaf]:
+                    cur[leaf] = coerced
+                    changed = True
+                # Range check
+                _within(meta, cur[leaf])
+            except Exception:
+                cur[leaf] = meta.get("default")
+                changed = True
+    return config_data, changed
+
+
+def _migrate_flat_to_modules(config_data: dict) -> dict:
+    # Detect if already modular
+    if any(
+        k in config_data for k in ("General", "Noticeboard", "Music", "GoogleClassroom")
+    ):
+        return config_data
+
+    # Build new modular structure
+    mod = {
+        "General": {
+            "DefaultAdmin": config_data.get("DefaultAdmin"),
+            "DefaultRoleId": config_data.get("DefaultRoleId"),
+        },
+        "Noticeboard": {
+            "Enabled": config_data.get("NoticeboardEnabled", True),
+            "ChannelId": config_data.get("NoticeBoardChannelId", "Default"),
+            "UpdateInterval": config_data.get("NoticeBoardUpdateInterval", None),
+            "PingRoleId": config_data.get("PingRoleId"),
+            "PingDailyTime": config_data.get("PingDailyTime", "15:00"),
+            "SmartPingMode": config_data.get("SmartPingMode", True),
+            "NoticeboardEditIDs": config_data.get("noticeboardEditID", []),
+            "PingMessageEditID": config_data.get("pingmessageEditID", None),
+            "PingDate": config_data.get("pingDateTime", None),
+            "PingDayBlacklist": config_data.get(
+                "pingDayBlacklist", ["Friday", "Saturday"]
+            ),
+        },
+        "Music": {
+            "Enabled": config_data.get("MusicEnabled", False),
+            "DJRole": config_data.get("MusicDJRole"),
+            "DJRoleRequired": config_data.get("MusicDJRoleRequired", True),
+            "Volume": config_data.get("MusicVolume", 0.5),
+            "QueueLimit": config_data.get("MusicQueueLimit", 10),
+            "QueueLimitEnabled": config_data.get("MusicQueueLimitEnabled", True),
+            "PlayerStick": config_data.get("MusicPlayerStick", True),
+            "TrackMaxDuration": config_data.get("TrackMaxDuration", 600),
+            "RemoveNonSongsUsingSponsorBlock": config_data.get(
+                "RemoveNonSongsUsingSponsorBlock", True
+            ),
+            "PlaylistAddLimit": config_data.get("PlaylistAddLimit", 10),
+        },
+        "GoogleClassroom": {
+            "Enabled": config_data.get("GoogleClassroomEnabled", False),
+            "DefaultChannelId": config_data.get("DefaultChannelId", "Default"),
+        },
+    }
+    return mod
+
+
+def _set_by_path(obj: dict, path: str, value):
+    keys = path.split(".")
+    cur = obj
+    for k in keys[:-1]:
+        if k not in cur or not isinstance(cur[k], dict):
+            cur[k] = {}
+        cur = cur[k]
+    cur[keys[-1]] = value
+
+
+def _get_by_path(obj: dict, path: str, default=None):
+    cur = obj
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _central_guild_id() -> int:
+    """
+    Central server guild ID is read from .env:
+    - CENTRAL_GUILD (preferred)
+    - fallback DEV_GUILD if CENTRAL_GUILD is unset
+    """
+    try:
+        val = os.getenv("CENTRAL_GUILD") or os.getenv("DEV_GUILD") or "0"
+        return int(val)
+    except Exception:
+        return 0
+
 
 def create_default_config(
     guild_id,
@@ -13,38 +399,49 @@ def create_default_config(
     os.makedirs(config_dir, exist_ok=True)
 
     config_data = {
-        "DefaultAdmin": default_admin_role_id,
-        "_comment2": "Noticeboard Config",
-        "NoticeboardEnabled": True,
-        "DefaultRoleId": default_role_id,
-        "NoticeBoardChannelId": "Default",
-        "NoticeBoardUpdateInterval": None,
-        "PingRoleId": default_ping_role_id,
-        "PingDailyTime": "15:00",
-        "noticeboardEditID": [],
-        "pingmessageEditID": None,
-        "pingDateTime": None,
-        "pingDayBlacklist": ["Friday", "Saturday"],
-        "_comment1": "Music Config",
-        "MusicEnabled": False,
-        "MusicDJRole": music_dj_role,
-        "MusicDJRoleRequired": True,
-        "MusicVolume": 0.5,
-        "MusicQueueLimit": 10,
-        "MusicQueueLimitEnabled": True,
-        "MusicPlayerStick": True,
-        "TrackMaxDuration": 600,
-        "RemoveNonSongsUsingSponsorBlock": True,
-        "PlaylistAddLimit": 10,
-        "_comment3": "Google Classroom Config",
-        "GoogleClassroomEnabled": False,
-        "DefaultChannelId": "Default",
-        " ": None,
+        "General": {
+            "DefaultAdmin": default_admin_role_id,
+            "DefaultRoleId": default_role_id,
+        },
+        "Noticeboard": {
+            "Enabled": True,
+            "ChannelId": "Default",
+            "UpdateInterval": None,
+            "PingRoleId": default_ping_role_id,
+            "PingDailyTime": "15:00",
+            "SmartPingMode": True,
+            "NoticeboardEditIDs": [],
+            "PingMessageEditID": None,
+            "PingDate": None,
+            "PingDayBlacklist": ["Friday", "Saturday"],
+        },
+        "Music": {
+            "Enabled": False,
+            "DJRole": music_dj_role,
+            "DJRoleRequired": True,
+            "Volume": 0.5,
+            "QueueLimit": 10,
+            "QueueLimitEnabled": True,
+            "PlayerStick": True,
+            "TrackMaxDuration": 600,
+            "RemoveNonSongsUsingSponsorBlock": True,
+            "PlaylistAddLimit": 10,
+        },
+        "GoogleClassroom": {
+            "Enabled": False,
+            "DefaultChannelId": "Default",
+        },
     }
 
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")
     with open(config_file_path, "w") as config_file:
         json.dump(config_data, config_file, indent=4)
+    # Apply schema defaults to new file
+    with open(config_file_path, "r") as config_file:
+        cfg = json.load(config_file)
+    cfg, _ = _ensure_schema_defaults(cfg)
+    with open(config_file_path, "w") as config_file:
+        json.dump(cfg, config_file, indent=4)
 
 
 def edit_noticeboard_config(
@@ -62,14 +459,19 @@ def edit_noticeboard_config(
     with open(config_file_path, "r") as config_file:
         config_data = json.load(config_file)
 
+    # migrate if needed
+    config_data = _migrate_flat_to_modules(config_data)
+
     if noticeboard_channelid is not None:
-        config_data["NoticeBoardChannelId"] = noticeboard_channelid
+        _set_by_path(config_data, "Noticeboard.ChannelId", noticeboard_channelid)
 
     if noticeboard_updateinterval is not None:
-        config_data["NoticeBoardUpdateInterval"] = noticeboard_updateinterval
+        _set_by_path(
+            config_data, "Noticeboard.UpdateInterval", noticeboard_updateinterval
+        )
 
     if PingDailyTime is not None:
-        config_data["PingDailyTime"] = PingDailyTime
+        _set_by_path(config_data, "Noticeboard.PingDailyTime", PingDailyTime)
 
     with open(config_file_path, "w") as config_file:
         json.dump(config_data, config_file, indent=4)
@@ -84,11 +486,46 @@ def edit_json_file(guild_id, key, value):
 
     with open(config_file_path, "r") as config_file:
         config_data = json.load(config_file)
-    try:
-        config_data[key] = value
-    except KeyError:
-        raise KeyError(f"Key {key} does not exist in the config file.")
 
+    # migrate before editing
+    config_data = _migrate_flat_to_modules(config_data)
+
+    # coerce based on schema if we know about this key
+    try:
+        coerced_value = coerce_value_for_path(key, value)
+    except ValueError as e:
+        raise
+
+    # Central propagation: if access is 3 or 4 and edited in central guild
+    meta = get_setting_meta(key)
+    central_id = _central_guild_id()
+    if meta and meta.get("access") in (3, 4) and int(guild_id) == central_id:
+        for fname in os.listdir(config_dir):
+            if not fname.endswith(".json"):
+                continue
+            fp = os.path.join(config_dir, fname)
+            try:
+                with open(fp, "r") as f:
+                    cfg = json.load(f)
+                cfg = _migrate_flat_to_modules(cfg)
+                if "." in key:
+                    _set_by_path(cfg, key, coerced_value)
+                else:
+                    cfg[key] = coerced_value
+                cfg, _ = _ensure_schema_defaults(cfg)
+                with open(fp, "w") as f:
+                    json.dump(cfg, f, indent=4)
+            except Exception:
+                continue
+        return
+
+    # Normal per-guild edit
+    if "." in key:
+        _set_by_path(config_data, key, coerced_value)
+    else:
+        config_data[key] = coerced_value
+
+    config_data, _ = _ensure_schema_defaults(config_data)
     with open(config_file_path, "w") as config_file:
         json.dump(config_data, config_file, indent=4)
 
@@ -108,9 +545,11 @@ def check_admin_role(guild_id, user_roles):
 
     with open(config_file_path, "r") as config_file:
         config_data = json.load(config_file)
-        default_admin_role_id = config_data["DefaultAdmin"]
+        config_data = _migrate_flat_to_modules(config_data)
+        default_admin_role_id = _get_by_path(
+            config_data, "General.DefaultAdmin", config_data.get("DefaultAdmin")
+        )
 
-        # Check if any of the user's roles match the default admin role
         return any(role_id == default_admin_role_id for role_id in user_roles)
 
 
@@ -118,4 +557,13 @@ def json_get(guild_id):
     config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")
     with open(config_file_path, "r") as config_file:
-        return json.load(config_file)
+        data = json.load(config_file)
+
+    # auto-migrate and persist if needed
+    migrated = _migrate_flat_to_modules(data)
+    # apply schema defaults/migrations
+    migrated, changed_schema = _ensure_schema_defaults(migrated)
+    if migrated is not data or changed_schema:
+        with open(config_file_path, "w") as config_file:
+            json.dump(migrated, config_file, indent=4)
+    return migrated

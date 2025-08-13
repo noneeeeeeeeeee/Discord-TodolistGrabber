@@ -6,4 +6,3 @@ PyNaCl
 yt-dlp
 isolate
 catholic_mass_readings
-lavalink

@@ -13,7 +13,6 @@ def check_and_load_env_file():
             "DEV_CHANNEL=THE_CHANNEL_YOU_WANT_DEV_LOGS_TO_BE_AT\n"
             "DEV_GUILD=YOUR_DISCORD_SERVER\n"
             "OWNER_ID=YOUR_DISCORD_ID\n"
-            "LAVALINK_DIR=./lavalink\n"
         )
         with open(env_path, "w") as env_file:
             env_file.write(example_env_content)

@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from modules.readversion import read_current_version
+from modules.setconfig import json_get, check_guild_config_available
 
 
 class Help(commands.Cog):
@@ -11,54 +12,38 @@ class Help(commands.Cog):
     @commands.command()
     @commands.cooldown(1, 10, commands.BucketType.user)  # Add 10-second cooldown
     async def help(self, ctx):
-        """Traditional text command help."""
+        guild_id = getattr(ctx.guild, "id", None)
+        cfg = (
+            json_get(guild_id)
+            if guild_id and check_guild_config_available(guild_id)
+            else {}
+        )
+        nb_enabled = cfg.get("Noticeboard", {}).get("Enabled", True)
+        music_enabled = cfg.get("Music", {}).get("Enabled", False)
+
         embed = discord.Embed(
             title="Help Menu",
-            description="Commands with (hybrid) are available as slash commands. The rest are legacy text commands. It is recommended to use the slash commands. \n A dynamic settings menu will be coming and also a new dynamic menu in v3.0, for now, please refer to the non-exsistent documentation for the help menu list for new commands!",
             color=discord.Color.blue(),
         )
-
-        embed.add_field(name="!help (hybrid)", value="This Command", inline=False)
+        # General
         embed.add_field(
-            name="!ping (hybrid)",
-            value="Response time from the bot to discord",
+            name="General",
+            value="/help\n/ping\n/settings",
             inline=False,
         )
-        embed.add_field(name="!apistatus", value="Check if the API is up", inline=False)
+        # Noticeboard
         embed.add_field(
-            name="!noticeboard", value="Open the NoticeBoard setup menu", inline=False
-        )
-        embed.add_field(name="!askgemini(hybrid)", value="Ask Gemini!", inline=False)
-        embed.add_field(
-            name="!settings (soon)", value="Opens the Settings Menu", inline=False
-        )
-        embed.add_field(name="!setup", value="Open the Setup Wizard", inline=False)
-        embed.add_field(name="!play(hybrid)", value="Plays Music", inline=False)
-        embed.add_field(
-            name="!dc / !disconnect(hybrid)",
-            value="Disconnect the music bot",
+            name=f"{'✅' if nb_enabled else '❌'} Noticeboard",
+            value="!noticeboard",
             inline=False,
         )
-        embed.add_field(name="!queue(hybrid)", value="Displays the queue", inline=False)
+        # Music
         embed.add_field(
-            name="!clearqueue(hybrid)", value="Clears the Queue", inline=False
-        )
-        embed.add_field(name="!volume(hybrid)", value="Sets The Volume", inline=False)
-        embed.add_field(
-            name="!pauseplay / !pause / !resume / !pp(hybrid)",
-            value="Pause/Plays the music",
-            inline=False,
-        )
-        embed.add_field(
-            name="!skip / !s(hybrid)", value="Skips the Music", inline=False
-        )
-        embed.add_field(
-            name="!nowplaying / !np(hybrid)",
-            value="Dispays the Currently playing song",
+            name=f"{'✅' if music_enabled else '❌'} Music",
+            value="/play, /queue, /pauseplay, /skip, /dc, /volume",
             inline=False,
         )
         embed.set_footer(text="Bot Version: " + read_current_version())
-
         await ctx.send(embed=embed)
 
     @app_commands.command(name="help", description="Displays the help menu.")
@@ -66,26 +51,31 @@ class Help(commands.Cog):
         1, 10, commands.BucketType.user
     )  # Add 10-second cooldown for slash command as well
     async def help_slash(self, interaction: discord.Interaction):
-        """Slash command help."""
+        guild_id = getattr(interaction.guild, "id", None)
+        cfg = (
+            json_get(guild_id)
+            if guild_id and check_guild_config_available(guild_id)
+            else {}
+        )
+        nb_enabled = cfg.get("Noticeboard", {}).get("Enabled", True)
+        music_enabled = cfg.get("Music", {}).get("Enabled", False)
+
         embed = discord.Embed(
             title="Help Menu",
-            description="Commands with (hybrid) are available as slash commands. The rest are legacy text commands. It is recommended to use the slash commands.",
             color=discord.Color.blue(),
         )
-
-        embed.add_field(name="!help (hybrid)", value="This Command", inline=False)
+        embed.add_field(name="General", value="/help\n/ping\n/settings", inline=False)
         embed.add_field(
-            name="!ping (hybrid)",
-            value="Response time from the bot to discord",
+            name=f"{'✅' if nb_enabled else '❌'} Noticeboard",
+            value="!noticeboard",
             inline=False,
         )
-        embed.add_field(name="!apistatus", value="Check if the API is up", inline=False)
         embed.add_field(
-            name="!noticeboard", value="Open the NoticeBoard setup menu", inline=False
+            name=f"{'✅' if music_enabled else '❌'} Music",
+            value="/play, /queue, /pauseplay, /skip, /dc, /volume",
+            inline=False,
         )
-        embed.add_field(name="!setup", value="Open the Setup Wizard", inline=False)
         embed.set_footer(text="Bot Version: " + read_current_version())
-
         await interaction.response.send_message(embed=embed)
 
     # Handle the cooldown error for both text and slash commands

@@ -27,23 +27,6 @@ class MyBot(commands.Bot):
             print(f"Failed to load MusicPlayer cog: {e}")
         await self.tree.sync()
 
-        lavalink_dir = os.getenv("LAVALINK_DIR")
-        if lavalink_dir:
-            lavalink_dir = os.path.abspath(lavalink_dir)
-
-        if lavalink_dir and os.path.isdir(lavalink_dir):
-            jar_name = "Lavalink.jar"
-            jar_path = os.path.join(lavalink_dir, jar_name)
-            if os.path.isfile(jar_path):
-                self.lavalink_process = subprocess.Popen(
-                    ["java", "-jar", jar_name],
-                    cwd=lavalink_dir,
-                )
-            else:
-                print(f"{jar_name} not found in {lavalink_dir}.")
-        else:
-            print("LAVALINK_DIR is not set or does not exist. Skipping Lavalink setup.")
-
 
 async def load_commands():
     """Load all cogs from the commands directory."""

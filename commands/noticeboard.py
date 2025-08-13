@@ -43,39 +43,31 @@ class NoticeBoard(commands.Cog):
 
         if not action or not field:
             json_file = json_get(guild_id)
-            noticeboard_channel_id = json_file.get("NoticeBoardChannelId", "Default")
-            noticeboard_update_interval = json_file.get(
-                "NoticeBoardUpdateInterval", None
-            )
-            ping_daily_time = json_file.get("PingDailyTime", "Not Set")
+            nb = json_file.get("Noticeboard", {})
+            noticeboard_channel_id = nb.get("ChannelId", "Default")
+            noticeboard_update_interval = nb.get("UpdateInterval", None)
+            ping_daily_time = nb.get("PingDailyTime", "Not Set")
 
             if noticeboard_update_interval is None:
                 noticeboard_update_interval = "Not set"
 
             if noticeboard_channel_id == "Default":
-                noticeboard_channel_id = "Not Set"
+                display_channel = "Not Set"
+            else:
+                display_channel = f"<#{noticeboard_channel_id}>"
 
-            config_data = {
-                "NoticeBoardChannelId": noticeboard_channel_id,
-                "NoticeBoardUpdateInterval": noticeboard_update_interval,
-                "PingDailyTime": ping_daily_time,
-            }
             embed = discord.Embed(
                 title="Noticeboard Configuration",
                 description="Below are the current configurations for the noticeboard. \n Use `!noticeboard set <field>` to modify the settings.",
                 color=discord.Color.blue(),
             )
-
-            noticeboard_CId = config_data["NoticeBoardChannelId"]
-            embed.add_field(name="Channel", value=f"<#{noticeboard_CId}>", inline=False)
+            embed.add_field(name="Channel", value=display_channel, inline=False)
             embed.add_field(
                 name="Update Interval (seconds)",
-                value=config_data["NoticeBoardUpdateInterval"],
+                value=noticeboard_update_interval,
                 inline=False,
             )
-            embed.add_field(
-                name="Daily Ping Time", value=config_data["PingDailyTime"], inline=False
-            )
+            embed.add_field(name="Daily Ping Time", value=ping_daily_time, inline=False)
 
             async def update_callback(interaction):
                 if interaction.user != ctx.author:
