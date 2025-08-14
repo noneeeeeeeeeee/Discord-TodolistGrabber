@@ -13,7 +13,6 @@ import wavelink
 LOG = logging.getLogger(__name__)
 
 MAIN_GUILD = os.getenv("MAIN_GUILD")
-
 LAVALINK_HOST = os.getenv("LAVALINK_HOST", "127.0.0.1")
 LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
 LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
@@ -46,6 +45,7 @@ class MusicPlayer(commands.Cog):
         self._idle_tasks: Dict[int, asyncio.Task] = {}
         self.connection_cooldowns: Dict[int, float] = {}
         self._node_ready = asyncio.Event()
+        self._node_help_printed = False
         self._bootstrap_node.start()
 
     def cog_unload(self):
@@ -77,28 +77,15 @@ class MusicPlayer(commands.Cog):
     @tasks.loop(count=1)
     async def _bootstrap_node(self):
         await self.bot.wait_until_ready()
-        # Try to connect to configured node
         ok = await self._try_connect_node()
-        if not ok and LAVALINK_AUTO_START:
-            # Start local node then connect
-            try:
-                from .lavalink.manager import ensure_local_node
-
-                started = await ensure_local_node(
-                    host=LAVALINK_HOST,
-                    port=LAVALINK_PORT,
-                    password=LAVALINK_PASSWORD,
-                    secure=LAVALINK_SECURE,
-                )
-                if started:
-                    ok = await self._try_connect_node(retry_delay=2.0, attempts=10)
-            except Exception as e:
-                LOG.error("Failed to start local Lavalink node: %s", e)
-
         if ok:
             self._node_ready.set()
         else:
             LOG.error("Lavalink node unavailable. Music features will be limited.")
+            # Print setup instructions once
+            if not self._node_help_printed:
+                self._print_lavalink_setup_help()
+                self._node_help_printed = True
 
     @_bootstrap_node.before_loop
     async def _before_bootstrap(self):
@@ -261,8 +248,54 @@ class MusicPlayer(commands.Cog):
         if t:
             t.cancel()
 
+    def _print_lavalink_setup_help(self):
+        # Console guidance for manual setup
+        jar_dir = os.path.join(os.path.dirname(__file__), "lavalink")
+        app_yml_path = os.path.join(jar_dir, "application.yml")
+        print("\n========== Lavalink Setup Required ==========")
+        print("Lavalink node not reachable. Please set up Lavalink manually:")
+        print("1) Install Java 17+")
+        print("2) Download Lavalink.jar from:")
+        print("   https://github.com/lavalink-devs/Lavalink/releases/latest")
+        print(f"3) Place Lavalink.jar in: {jar_dir}")
+        print(
+            f"4) Create application.yml next to the jar (path: {app_yml_path}) with content similar to:"
+        )
+        print("------------------------------------------------------------")
+        print(
+            f"""server:
+  port: {LAVALINK_PORT}
+  address: 0.0.0.0
+
+lavalink:
+  server:
+    password: "{LAVALINK_PASSWORD}"
+    sources:
+      youtube: true
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      http: true
+      local: false
+"""
+        )
+        print("------------------------------------------------------------")
+        print(f"5) Run Lavalink from that folder:  java -jar Lavalink.jar")
+        print(
+            f"6) Ensure your .env matches the node: HOST={LAVALINK_HOST} PORT={LAVALINK_PORT} PASSWORD and SECURE\n"
+        )
+
     # ---- public API for commands ----
     async def enqueue(self, guild: discord.Guild, item: Dict[str, Any]) -> bool:
+        # Return fast if node isn’t ready instead of waiting indefinitely
+        if not self._node_ready.is_set():
+            # try a short wait and then fail fast
+            try:
+                await asyncio.wait_for(self._node_ready.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                return False
+
         player = (
             guild.voice_client
             if isinstance(guild.voice_client, wavelink.Player)

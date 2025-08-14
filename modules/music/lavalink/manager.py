@@ -1,21 +1,12 @@
 import os
-import asyncio
 import socket
 import subprocess
-import sys
 import time
-from typing import Optional
-import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LL_DIR = BASE_DIR  # modules/music/lavalink
 JAR_NAME = "Lavalink.jar"
 APP_YML = "application.yml"
-
-DL_URL = os.getenv(
-    "LAVALINK_DOWNLOAD_URL",
-    "https://github.com/lavalink-devs/Lavalink/releases/latest/download/Lavalink.jar",
-)
 JAVA = os.getenv("LAVALINK_JAVA_PATH", "java")
 
 
@@ -27,8 +18,28 @@ def _is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
-def _write_application_yml(host: str, port: int, password: str, secure: bool) -> None:
-    yml = f"""server:
+def _wait_for_port(host: str, port: int, timeout: float = 45.0) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        if _is_port_open(host, port):
+            return True
+        time.sleep(1)
+    return False
+
+
+def _print_manual_setup_instructions(host: str, port: int, password: str):
+    jar_dir = LL_DIR
+    app_yml_path = os.path.join(jar_dir, APP_YML)
+    print("\n========== Lavalink Setup Required ==========")
+    print("A Lavalink node is not running or misconfigured.")
+    print("Please download Lavalink.jar and place it here:")
+    print(f" - {jar_dir}")
+    print(
+        f"Create an application.yml next to the jar (path: {app_yml_path}) with at least:"
+    )
+    print("------------------------------------------------------------")
+    print(
+        f"""server:
   port: {port}
   address: 0.0.0.0
 
@@ -43,61 +54,58 @@ lavalink:
       vimeo: true
       http: true
       local: false
-    bufferDurationMs: 400
-    frameBufferDurationMs: 5000
-    resamplingQuality: HIGH
-    trackStuckThresholdMs: 10000
-    useSeekGhosting: true
-    youtubeConfig:
-      - allowSearch: true
-    plugins: []
 """
-    with open(os.path.join(LL_DIR, APP_YML), "w", encoding="utf-8") as f:
-        f.write(yml)
-
-
-def _download_lavalink_jar(path: str) -> None:
-    os.makedirs(LL_DIR, exist_ok=True)
-    with urllib.request.urlopen(DL_URL, timeout=60) as r, open(path, "wb") as f:
-        f.write(r.read())
-
-
-async def _wait_for_port(host: str, port: int, timeout: float = 30.0) -> bool:
-    start = time.time()
-    while time.time() - start < timeout:
-        if _is_port_open(host, port):
-            return True
-        await asyncio.sleep(1)
-    return False
+    )
+    print("------------------------------------------------------------")
+    print("Optionally you can run it manually:")
+    print("  java -jar Lavalink.jar")
+    print("The bot will auto-start it on launch when both files exist.\n")
 
 
 async def ensure_local_node(host: str, port: int, password: str, secure: bool) -> bool:
     """
-    Ensure a Lavalink.jar is present and running on (host, port).
-    Returns True if a node is running (started or already available).
+    Start a local Lavalink if Lavalink.jar and application.yml are present.
+    Returns True if a node is running (already or started), else prints instructions and returns False.
     """
-    # If already running, done
+    # Already running?
     if _is_port_open(host, port):
         return True
 
-    os.makedirs(LL_DIR, exist_ok=True)
     jar_path = os.path.join(LL_DIR, JAR_NAME)
-    if not os.path.exists(jar_path):
-        _download_lavalink_jar(jar_path)
+    yml_path = os.path.join(LL_DIR, APP_YML)
 
-    _write_application_yml(host, port, password, secure)
+    if not os.path.exists(jar_path) or not os.path.exists(yml_path):
+        _print_manual_setup_instructions(host, port, password)
+        return False
 
-    # Start Lavalink
-    creationflags = 0
+    # Launch Lavalink detached
     start_kwargs = {}
     if os.name == "nt":
-        creationflags = (
+        start_kwargs["creationflags"] = (
             subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
         )
-        start_kwargs["creationflags"] = creationflags
         start_kwargs["close_fds"] = True
 
-    # Launch process detached
+    try:
+        subprocess.Popen(
+            [JAVA, "-jar", JAR_NAME],
+            cwd=LL_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **start_kwargs,
+        )
+    except Exception as e:
+        print(f"Failed to launch local Lavalink: {e}")
+        _print_manual_setup_instructions(host, port, password)
+        return False
+
+    # Wait for it to be ready
+    ok = _wait_for_port(host, port, timeout=45.0)
+    if not ok:
+        print(
+            "Lavalink did not open the port in time. Please check application.yml and Java installation."
+        )
+    return ok
     subprocess.Popen(
         [JAVA, "-jar", JAR_NAME],
         cwd=LL_DIR,

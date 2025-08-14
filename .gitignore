@@ -8,3 +8,4 @@ __pycache__
 *.pyc
 lavalink_server/*
 !lavalink_server/application.yml
+*.jar
