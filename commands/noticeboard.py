@@ -9,7 +9,13 @@ from modules.setconfig import (
     check_admin_role,
     json_get,
 )
-from modules.cache import truncate_cache  # Make sure you have this function implemented
+from modules.cache import (
+    truncate_cache,
+    cache_read_latest,
+)  # Make sure you have this function implemented
+
+check_and_load_env_file()
+OWNER_ID = os.getenv("OWNER_ID")
 
 
 class NoticeBoard(commands.Cog):
@@ -73,6 +79,13 @@ class NoticeBoard(commands.Cog):
             update_now = Button(label="🔄 Update Now", style=discord.ButtonStyle.green)
             delete_cache = Button(label="🗑️ Delete Cache", style=discord.ButtonStyle.red)
 
+            show_delete_cache = False
+            try:
+                if OWNER_ID and str(ctx.author.id) == str(OWNER_ID):
+                    show_delete_cache = True
+            except Exception:
+                show_delete_cache = False
+
             async def update_callback(interaction):
                 if interaction.user != ctx.author:
                     await interaction.response.send_message(
@@ -98,9 +111,10 @@ class NoticeBoard(commands.Cog):
                 truncate_cache()  # Ensure this function deletes the cache files
 
             update_now.callback = update_callback
-            delete_cache.callback = delete_cache_callback
             btnview.add_item(update_now)
-            btnview.add_item(delete_cache)
+            if show_delete_cache:
+                delete_cache.callback = delete_cache_callback
+                btnview.add_item(delete_cache)
 
             # Send and retain the bot's panel message for safe edits later
             panel_msg = await ctx.send(embed=embed, view=btnview)
@@ -126,6 +140,89 @@ class NoticeBoard(commands.Cog):
             await ctx.send(
                 "Unknown action. Use /settings for editing noticeboard settings."
             )
+
+    @commands.hybrid_command(
+        name="workhistory",
+        description="Show past week's work and upcoming dues.",
+    )
+    async def workhistory(self, ctx: commands.Context):
+        """
+        Summarize the past week's and upcoming tasks from the latest cached snapshot.
+        """
+        guild_id = ctx.guild.id if ctx.guild else None
+        if not guild_id or not check_guild_config_available(guild_id):
+            await ctx.send("Config not found. Please run !setup first.")
+            return
+
+        # read latest task cache (all)
+        try:
+            task_data_str = cache_read_latest("all")
+            if not task_data_str:
+                await ctx.send("No cached task data available.")
+                return
+            task_data = json.loads(task_data_str)
+        except Exception:
+            await ctx.send("Failed to read cached data.")
+            return
+
+        # Build summary for the last 7 days and upcoming 7 days
+        from datetime import datetime, timedelta
+
+        today = datetime.now().date()
+        week_ago = today - timedelta(days=7)
+        upcoming_limit = today + timedelta(days=7)
+
+        past_lines = []
+        upcoming_lines = []
+
+        for date_str, tasks in task_data.get("data", {}).items():
+            if date_str == "unknown-due":
+                continue
+            try:
+                d = datetime.strptime(date_str, "%A, %d-%m-%Y").date()
+            except Exception:
+                continue
+            if week_ago <= d <= today:
+                for t in tasks:
+                    past_lines.append(
+                        f"{d.strftime('%d %b')} — [{t['task']}] {t['subject']}: {t['description']}"
+                    )
+            if today < d <= upcoming_limit:
+                for t in tasks:
+                    upcoming_lines.append(
+                        f"{d.strftime('%d %b')} — [{t['task']}] {t['subject']}: {t['description']}"
+                    )
+
+        embed = discord.Embed(
+            title="Work History (7d past / 7d upcoming)", color=discord.Color.blue()
+        )
+        if past_lines:
+            embed.add_field(
+                name="Past 7 days",
+                value="\n".join(past_lines[:25]),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="Past 7 days",
+                value="No completed/recorded work.",
+                inline=False,
+            )
+
+        if upcoming_lines:
+            embed.add_field(
+                name="Upcoming (next 7 days)",
+                value="\n".join(upcoming_lines[:25]),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="Upcoming (next 7 days)",
+                value="No upcoming work.",
+                inline=False,
+            )
+
+        await ctx.send(embed=embed)
 
 
 async def setup(bot):

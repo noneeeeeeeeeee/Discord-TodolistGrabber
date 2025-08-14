@@ -24,6 +24,7 @@ except Exception:
 
 # Configure env early
 check_and_load_env_file()
+MAIN_GUILD = os.getenv("MAIN_GUILD")
 
 
 class NoticeAutoUpdate(commands.Cog):
@@ -31,11 +32,12 @@ class NoticeAutoUpdate(commands.Cog):
         self.bot = bot
         self.sent_message_ids = {}
         self.first_start = True
-        self.guild_update_info = {}
+        self.guild_update_info = {}  # store last_update timestamps per guild
         self.startup_ping_sent = {}
         self.ping_message_being_updated = {}
         self.daily_readings = None
         self.ping_message_lock = asyncio.Lock()
+        # run once every 30 minutes; we'll decide per-guild if it's time to update
         self.update_noticeboard.start()
         self.send_ping_message_loop.start()
         self.fetch_daily_readings_task.start()
@@ -148,6 +150,10 @@ class NoticeAutoUpdate(commands.Cog):
 
         if new_message_ids:
             edit_json_file(guild_id, "Noticeboard.NoticeboardEditIDs", new_message_ids)
+        # mark last update time
+        self.guild_update_info.setdefault(guild_id, {})[
+            "last_update"
+        ] = datetime.utcnow()
 
     async def run_update_noticeboard_once(self, guild_id: int):
         """Public: trigger an immediate update for a single guild."""
@@ -157,21 +163,45 @@ class NoticeAutoUpdate(commands.Cog):
             return
         await self._update_noticeboard_for_guild(guild)
 
-    @tasks.loop(seconds=3600)
+    @tasks.loop(minutes=30)
     async def update_noticeboard(self):
-        today = datetime.now()
+        """
+        Runs every 30 minutes. For each guild, consult its configured UpdateInterval (min 1800s).
+        Only update the guild if the configured interval has elapsed since last update.
+        This staggers updates across guilds and honors per-guild minimum interval.
+        """
+        now = datetime.utcnow()
         for guild in self.bot.guilds:
-            # keep loop cadence alignment
             try:
                 config = json_get(guild.id)
-                interval_cfg = config.get("Noticeboard", {}).get("UpdateInterval", None)
-                interval = interval_cfg or 3600
-                self.update_noticeboard.change_interval(seconds=interval)
-            except Exception:
-                pass
+                nb_cfg = config.get("Noticeboard", {})
+                # Support FollowMain: if enabled and MAIN_GUILD is provided, use main guild's noticeboard settings
+                if nb_cfg.get("FollowMain") and MAIN_GUILD:
+                    try:
+                        main_cfg = json_get(int(MAIN_GUILD))
+                        nb_cfg = main_cfg.get("Noticeboard", nb_cfg)
+                    except Exception:
+                        pass
 
-            # Run the actual update for this guild
-            await self._update_noticeboard_for_guild(guild)
+                interval_cfg = nb_cfg.get("UpdateInterval", None)
+                # enforce minimum of 1800 seconds
+                interval = max(
+                    interval_cfg if isinstance(interval_cfg, int) else 1800, 1800
+                )
+
+                last_update = self.guild_update_info.get(guild.id, {}).get(
+                    "last_update"
+                )
+                if (
+                    last_update is None
+                    or (now - last_update).total_seconds() >= interval
+                ):
+                    # perform update (this is rate-sensitive; we avoid doing every guild each loop)
+                    await self._update_noticeboard_for_guild(guild)
+                    # small delay between guild updates to reduce rate-limit pressure
+                    await asyncio.sleep(1)
+            except Exception:
+                continue
 
     @tasks.loop(hours=24)
     async def fetch_daily_readings_task(self):
@@ -208,27 +238,32 @@ class NoticeAutoUpdate(commands.Cog):
 
     @tasks.loop(minutes=10)
     async def send_ping_message_loop(self):
+        """
+        Runs every 10 minutes and checks each guild whether ping should be sent.
+        If the guild's scheduled PingDailyTime has passed and PingDate is not today, send the ping.
+        Honors FollowMain override and PingDayBlacklist.
+        """
         now = datetime.now()
         today = now.date()
         for guild in self.bot.guilds:
             guild_id = guild.id
             try:
                 config = json_get(guild_id)
-            except Exception as e:
-                print(f"Error getting config for guild {guild_id}: {e}")
+                nb_cfg = config.get("Noticeboard", {})
+                # FollowMain handling
+                if nb_cfg.get("FollowMain") and MAIN_GUILD:
+                    try:
+                        main_cfg = json_get(int(MAIN_GUILD))
+                        nb_cfg = main_cfg.get("Noticeboard", nb_cfg)
+                    except Exception:
+                        pass
+            except Exception:
                 continue
 
-            nb_cfg = config.get("Noticeboard", {})
             ping_daily_time = nb_cfg.get("PingDailyTime", "15:00")
             smart_ping = nb_cfg.get("SmartPingMode", True)
             noticeboard_channel_id = nb_cfg.get("ChannelId", "Default")
-            interval_cfg = nb_cfg.get("UpdateInterval", None)
             if noticeboard_channel_id in ("Default", None, "null"):
-                continue
-
-            channel = guild.get_channel(int(noticeboard_channel_id))
-            if channel is None:
-                print(f"Channel not found for guild {guild_id}.")
                 continue
 
             # Daily blacklist
@@ -243,7 +278,12 @@ class NoticeAutoUpdate(commands.Cog):
                     if datetime.strptime(ping_date_str, "%Y-%m-%d").date() == today:
                         continue
                 except Exception:
-                    print("Unparsable PingDate; a new ping may be sent.")
+                    pass
+
+            # Prepare channel
+            channel = guild.get_channel(int(noticeboard_channel_id))
+            if channel is None:
+                continue
 
             # Smart gating: only when enabled
             if smart_ping:
@@ -261,23 +301,18 @@ class NoticeAutoUpdate(commands.Cog):
                 ):
                     continue
 
-            # Time window check (±10 minutes)
+            # Parse scheduled ping time for today
             try:
                 ping_time = datetime.strptime(ping_daily_time, "%H:%M").time()
             except ValueError:
-                print(
-                    f"Invalid PingDailyTime '{ping_daily_time}' for guild {guild_id}. Skipping."
+                # invalid time; skip
+                continue
+            scheduled_dt = datetime.combine(today, ping_time)
+            # If scheduled time is in the past (i.e., missed) or now >= scheduled_dt, and not yet pinged => send
+            if now >= scheduled_dt:
+                await self.handle_ping_message(
+                    channel, guild_id, today, ping_daily_time, now
                 )
-                continue
-            ping_datetime = datetime.combine(today, ping_time)
-            time_diff_minutes = abs((now - ping_datetime).total_seconds()) / 60
-            if time_diff_minutes > 10 and not self.first_start:
-                continue
-
-            await self.handle_ping_message(
-                channel, guild_id, today, ping_daily_time, now
-            )
-            self.first_start = False
 
     async def handle_ping_message(self, channel, guild_id, today, ping_daily_time, now):
         """Handles sending or editing the ping message reliably."""

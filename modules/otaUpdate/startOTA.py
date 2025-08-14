@@ -347,6 +347,13 @@ def update_dependencies():
                 os.path.join(ROOT_DIR, "requirements.txt"),
             ]
         )
+        # Ensure wavelink is available (Lavalink client)
+        try:
+            import wavelink  # noqa: F401
+        except Exception:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "-U", "wavelink>=2.6.0"]
+            )
         print_progress("Dependencies", "Dependencies updated successfully.")
     except subprocess.CalledProcessError as e:
         log_error("Dependencies", "Failed to update dependencies.", e)

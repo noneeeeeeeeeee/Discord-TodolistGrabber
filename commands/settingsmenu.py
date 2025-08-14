@@ -310,6 +310,13 @@ class SettingsView(View):
         )
         if self.selected_section:
             embed.add_field(name="Module", value=self.selected_section, inline=True)
+            # Provide extra guidance for Music settings
+            if self.selected_section == "Music":
+                embed.add_field(
+                    name="Music Settings",
+                    value="Configure DJ role, volume, queue limits and playlist behaviour here. Central-only settings (owner) propagate to all guilds.",
+                    inline=False,
+                )
         if self.selected_path:
             meta = self.current_meta() or {}
             cur_val = _safe_get(self.cfg, self.selected_path)

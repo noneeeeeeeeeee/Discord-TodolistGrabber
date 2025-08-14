@@ -11,8 +11,8 @@ from datetime import datetime
 # 0: Editable
 # 1: Not Editable (visible)
 # 2: Hidden (non editable in any server)
-# 3: Central Server only Editable (visible to all)
-# 4: Central Server only Editable and Hidden to Non-Central Servers
+# 3: Central Server only Editable (visible to all) (Bot Owner Can only Edit)
+# 4: Central Server only Editable and Hidden to Non-Central Servers (Bot Owner Can only Edit)
 SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
     "General": {
         "DefaultAdmin": {
@@ -34,22 +34,28 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
         "UpdateInterval": {
             "type": "int|null",
             "default": None,
-            "min": 300,
+            "min": 1800,
             "max": 86400,
             "access": 0,
-            "description": "Seconds (5m - 24h)",
+            "description": "Seconds (30m - 24h)",
         },
         "PingRoleId": {"type": "role|null", "default": None, "access": 0},
         "PingDailyTime": {
             "type": "time",
             "default": "15:00",
-            "access": 3,  # central-only editable; propagate on central edit
+            "access": 3,
         },
         "SmartPingMode": {
             "type": "bool",
             "default": True,
-            "access": 0,  # enable smart gating of pings by default
+            "access": 0,
             "description": "Skip daily ping if no work tomorrow/week",
+        },
+        "FollowMain": {
+            "type": "bool",
+            "default": False,
+            "access": 0,
+            "description": "If true, follow MAIN_GUILD noticeboard config",
         },
         "NoticeboardEditIDs": {"type": "list[int]", "default": [], "access": 2},
         "PingMessageEditID": {"type": "int|null", "default": None, "access": 2},
@@ -85,16 +91,34 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "default": 10,
             "min": 1,
             "max": 1000,
-            "access": 0,
+            "access": 3,
         },
-        "QueueLimitEnabled": {"type": "bool", "default": True, "access": 0},
-        "PlayerStick": {"type": "bool", "default": True, "access": 0},
+        "MaxConcurrentInstances": {
+            "type": "int",
+            "default": 5,
+            "min": 1,
+            "max": 50,
+            "access": 4,
+            "description": "Central-only: maximum simultaneous music voice instances across all guilds.",
+        },
+        "QueueLimitEnabled": {
+            "type": "bool",
+            "default": True,
+            "access": 1,
+            "description": "If true, the queue limit will be enforced.",
+        },
+        "PlayerStick": {
+            "type": "bool",
+            "default": False,
+            "access": 1,
+            "description": "If true, the player will stick to the current channel.",
+        },
         "TrackMaxDuration": {
             "type": "int",
             "default": 600,
             "min": 10,
             "max": 43200,
-            "access": 0,
+            "access": 3,
         },
         "RemoveNonSongsUsingSponsorBlock": {
             "type": "bool",
@@ -106,11 +130,11 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "default": 10,
             "min": 1,
             "max": 1000,
-            "access": 0,
+            "access": 3,
         },
     },
     "GoogleClassroom": {
-        "Enabled": {"type": "bool", "default": False, "access": 0},
+        "Enabled": {"type": "bool", "default": False, "access": 1},
         "DefaultChannelId": {
             "type": "channel|Default",
             "default": "Default",
@@ -327,6 +351,7 @@ def _migrate_flat_to_modules(config_data: dict) -> dict:
             "PingRoleId": config_data.get("PingRoleId"),
             "PingDailyTime": config_data.get("PingDailyTime", "15:00"),
             "SmartPingMode": config_data.get("SmartPingMode", True),
+            "FollowMain": config_data.get("FollowMain", False),
             "NoticeboardEditIDs": config_data.get("noticeboardEditID", []),
             "PingMessageEditID": config_data.get("pingmessageEditID", None),
             "PingDate": config_data.get("pingDateTime", None),
@@ -340,6 +365,7 @@ def _migrate_flat_to_modules(config_data: dict) -> dict:
             "DJRoleRequired": config_data.get("MusicDJRoleRequired", True),
             "Volume": config_data.get("MusicVolume", 0.5),
             "QueueLimit": config_data.get("MusicQueueLimit", 10),
+            "MaxConcurrentInstances": config_data.get("MaxConcurrentInstances", 5),
             "QueueLimitEnabled": config_data.get("MusicQueueLimitEnabled", True),
             "PlayerStick": config_data.get("MusicPlayerStick", True),
             "TrackMaxDuration": config_data.get("TrackMaxDuration", 600),
@@ -373,62 +399,6 @@ def _get_by_path(obj: dict, path: str, default=None):
             return default
         cur = cur[k]
     return cur
-
-
-def create_default_config(
-    guild_id,
-    default_admin_role_id,
-    default_role_id,
-    default_ping_role_id,
-    music_dj_role,
-):
-    config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
-    os.makedirs(config_dir, exist_ok=True)
-
-    config_data = {
-        "General": {
-            "DefaultAdmin": default_admin_role_id,
-            "DefaultRoleId": default_role_id,
-        },
-        "Noticeboard": {
-            "Enabled": True,
-            "ChannelId": "Default",
-            "UpdateInterval": None,
-            "PingRoleId": default_ping_role_id,
-            "PingDailyTime": "15:00",
-            "SmartPingMode": True,
-            "NoticeboardEditIDs": [],
-            "PingMessageEditID": None,
-            "PingDate": None,
-            "PingDayBlacklist": ["Friday", "Saturday"],
-        },
-        "Music": {
-            "Enabled": False,
-            "DJRole": music_dj_role,
-            "DJRoleRequired": True,
-            "Volume": 0.5,
-            "QueueLimit": 10,
-            "QueueLimitEnabled": True,
-            "PlayerStick": True,
-            "TrackMaxDuration": 600,
-            "RemoveNonSongsUsingSponsorBlock": True,
-            "PlaylistAddLimit": 10,
-        },
-        "GoogleClassroom": {
-            "Enabled": False,
-            "DefaultChannelId": "Default",
-        },
-    }
-
-    config_file_path = os.path.join(config_dir, f"{guild_id}.json")
-    with open(config_file_path, "w") as config_file:
-        json.dump(config_data, config_file, indent=4)
-    # Apply schema defaults to new file
-    with open(config_file_path, "r") as config_file:
-        cfg = json.load(config_file)
-    cfg, _ = _ensure_schema_defaults(cfg)
-    with open(config_file_path, "w") as config_file:
-        json.dump(cfg, config_file, indent=4)
 
 
 def edit_noticeboard_config(

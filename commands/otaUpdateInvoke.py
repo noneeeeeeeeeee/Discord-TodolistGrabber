@@ -10,7 +10,7 @@ class Update(commands.Cog):
 
     class ConfirmUpdateView(discord.ui.View):
         def __init__(self, author_id):
-            super().__init__(timeout=30.0) 
+            super().__init__(timeout=30.0)
             self.author_id = author_id
             self.value = None
 
@@ -57,7 +57,6 @@ class Update(commands.Cog):
         try:
             # Check for updates
             result = check.check_update()
-            print(f"Update check result: {result}")
 
             update_available = result.get("status") == "update-available"
             current_version = result.get("current_version", "Unknown")
@@ -77,10 +76,9 @@ class Update(commands.Cog):
                 view = self.ConfirmUpdateView(ctx.author.id)
                 view.message = await ctx.send(embed=embed, view=view)
 
-                await view.wait()  
+                await view.wait()
 
                 if view.value:
-                    # Run startOTA.py in a separate process
                     subprocess.Popen(
                         ["python", "modules/otaUpdate/startOTA.py"],
                         stdout=subprocess.PIPE,

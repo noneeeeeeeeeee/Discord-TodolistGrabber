@@ -11,6 +11,11 @@ def check_and_load_env_file():
             "DiscordBotToken=YOUR_DISCORD_BOT_TOKEN\n"
             "GeminiApiKey=YOUR_GEMINI_API_KEY\n"
             "OWNER_ID=YOUR_DISCORD_ID\n"
+            "MAIN_GUILD=YOUR_MAIN_GUILD_ID\n"
+            "LAVALINK_HOST=127.0.0.1\n"
+            "LAVALINK_PORT=2333\n"
+            "LAVALINK_PASSWORD=youshallnotpass\n"
+            "LAVALINK_SECURE=false\n"
         )
         with open(env_path, "w") as env_file:
             env_file.write(example_env_content)

@@ -126,6 +126,7 @@ import asyncio
 from pathlib import Path
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+from datetime import datetime, timedelta
 
 _gemini_model = None
 _gemini_configured = False
@@ -150,10 +151,27 @@ def _get_gemini_model():
     return _gemini_model
 
 
+def _clean_usccb_cache(cache_dir: Path, max_age_days: int = 3) -> None:
+    """
+    Remove cached USCCB files older than max_age_days.
+    """
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+        for p in cache_dir.glob("usccb_*.txt"):
+            try:
+                mtime = datetime.utcfromtimestamp(p.stat().st_mtime)
+                if mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 async def fetch_usccb_daily_readings(date=None) -> Optional[str]:
     """
     Fetch the USCCB daily readings page for the given date (or today if None).
-    This function caches the raw extracted reading text per-day in .cache/usccb_{YYYY-MM-DD}.txt
+    This function caches the extracted reading text per-day in .cache/usccb_{YYYY-MM-DD}.txt
     and uses a Firefox-on-Windows user-agent to avoid being blocked.
     Returns the extracted reading text on success, or None on failure.
     """
@@ -165,8 +183,9 @@ async def fetch_usccb_daily_readings(date=None) -> Optional[str]:
     # allow passing datetime.date or datetime.datetime
     if hasattr(date, "date"):
         date = date.date()
+
     # Build URL using DDMMYY format as requested
-    url_date = date.strftime("%m%d%y")
+    url_date = date.strftime("%d%m%y")
     url = f"https://bible.usccb.org/bible/readings/{url_date}.cfm"
 
     # Prepare cache location (project root .cache)
@@ -174,12 +193,14 @@ async def fetch_usccb_daily_readings(date=None) -> Optional[str]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"usccb_{date.isoformat()}.txt"
 
+    # Cleanup old cache files (older than 3 days)
+    _clean_usccb_cache(cache_dir, max_age_days=3)
+
     # Return cached if present
     if cache_file.exists():
         try:
             return cache_file.read_text(encoding="utf-8")
         except Exception:
-            # fall through to re-fetch
             pass
 
     # Synchronous request executed in threadpool to keep API async
@@ -223,7 +244,6 @@ async def fetch_usccb_daily_readings(date=None) -> Optional[str]:
                 main_elem = elem
                 break
 
-        # If not found, attempt to find a div with "reading" or "bible" in class name
         if main_elem is None:
             re_match = re.compile(r"(reading|bible|scripture|lectionary|daily)", re.I)
             for div in soup.find_all("div"):
@@ -232,21 +252,16 @@ async def fetch_usccb_daily_readings(date=None) -> Optional[str]:
                     main_elem = div
                     break
 
-        # Final fallback: whole page
         if main_elem is None:
             text = soup.get_text("\n\n", strip=True)
         else:
-            # Clean the text: preserve paragraphs separated by blank lines
             text = main_elem.get_text("\n\n", strip=True)
 
-        # Minimal cleaning: collapse excessive blank lines
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
-        # Save to cache
         try:
             cache_file.write_text(text, encoding="utf-8")
         except Exception:
-            # cache failures are non-fatal
             pass
 
         return text
@@ -258,7 +273,6 @@ async def fetch_usccb_daily_readings(date=None) -> Optional[str]:
 def _strip_code_fences(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
-        # remove leading code fence like ```json or ```
         first_nl = t.find("\n")
         if first_nl != -1:
             t = t[first_nl + 1 :]
