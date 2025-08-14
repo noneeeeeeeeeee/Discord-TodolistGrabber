@@ -91,7 +91,7 @@ def _can_edit(meta: dict, is_owner: bool) -> bool:
 
 class SettingsView(View):
     def __init__(self, bot: commands.Bot, ctx: commands.Context, schema, cfg):
-        super().__init__(timeout=60)  # 1 minute timeout
+        super().__init__(timeout=60)
         self.bot = bot
         self.ctx = ctx
         self.schema = schema

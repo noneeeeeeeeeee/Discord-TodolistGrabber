@@ -58,7 +58,7 @@ class NoticeBoard(commands.Cog):
 
             embed = discord.Embed(
                 title="Noticeboard Configuration",
-                description="Below are the current configurations for the noticeboard. \n Use `!noticeboard set <field>` to modify the settings.",
+                description="Below are the current configurations for the noticeboard. To edit them use /settings category:noticeboard to edit.",
                 color=discord.Color.blue(),
             )
             embed.add_field(name="Channel", value=display_channel, inline=False)

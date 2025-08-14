@@ -118,11 +118,14 @@ def to_lines(items: Iterable[Mapping[str, Any]]) -> List[str]:
     return lines
 
 
-# --- additions for USCCB readings summarization ---
 import os
 import json
+import re
+import requests
+import asyncio
+from pathlib import Path
+from bs4 import BeautifulSoup
 import google.generativeai as genai
-from catholic_mass_readings import USCCB, models
 
 _gemini_model = None
 _gemini_configured = False
@@ -147,13 +150,109 @@ def _get_gemini_model():
     return _gemini_model
 
 
-async def fetch_usccb_daily_readings():
+async def fetch_usccb_daily_readings(date=None) -> Optional[str]:
     """
-    Fetch today's mass readings using USCCB.
+    Fetch the USCCB daily readings page for the given date (or today if None).
+    This function caches the raw extracted reading text per-day in .cache/usccb_{YYYY-MM-DD}.txt
+    and uses a Firefox-on-Windows user-agent to avoid being blocked.
+    Returns the extracted reading text on success, or None on failure.
     """
-    async with USCCB() as usccb:
-        mass = await usccb.get_mass(datetime.today().date(), models.MassType.DEFAULT)
-        return mass
+    # determine date
+    if date is None:
+        from datetime import date as _date
+
+        date = _date.today()
+    # allow passing datetime.date or datetime.datetime
+    if hasattr(date, "date"):
+        date = date.date()
+    # Build URL using DDMMYY format as requested
+    url_date = date.strftime("%m%d%y")
+    url = f"https://bible.usccb.org/bible/readings/{url_date}.cfm"
+
+    # Prepare cache location (project root .cache)
+    cache_dir = Path(__file__).resolve().parents[1] / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"usccb_{date.isoformat()}.txt"
+
+    # Return cached if present
+    if cache_file.exists():
+        try:
+            return cache_file.read_text(encoding="utf-8")
+        except Exception:
+            # fall through to re-fetch
+            pass
+
+    # Synchronous request executed in threadpool to keep API async
+    def _sync_fetch():
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) Gecko/20100101 Firefox/117.0",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.text
+
+    loop = asyncio.get_running_loop()
+    try:
+        html = await loop.run_in_executor(None, _sync_fetch)
+    except Exception as e:
+        print(f"USCCB fetch failed for {url}: {e}")
+        return None
+
+    # Try to extract the main readings text using a list of fallback selectors
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Candidate selectors to find the main reading content
+        selectors = [
+            "div#maincontent",
+            "div#content",
+            "main",
+            "article",
+            "div.container",
+            "div.row",
+            "div.col-md-9",
+            "div.b-article__content",
+        ]
+
+        main_elem = None
+        for sel in selectors:
+            elem = soup.select_one(sel)
+            if elem and elem.get_text(strip=True):
+                main_elem = elem
+                break
+
+        # If not found, attempt to find a div with "reading" or "bible" in class name
+        if main_elem is None:
+            re_match = re.compile(r"(reading|bible|scripture|lectionary|daily)", re.I)
+            for div in soup.find_all("div"):
+                cl = " ".join(div.get("class") or [])
+                if re_match.search(cl) and div.get_text(strip=True):
+                    main_elem = div
+                    break
+
+        # Final fallback: whole page
+        if main_elem is None:
+            text = soup.get_text("\n\n", strip=True)
+        else:
+            # Clean the text: preserve paragraphs separated by blank lines
+            text = main_elem.get_text("\n\n", strip=True)
+
+        # Minimal cleaning: collapse excessive blank lines
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+        # Save to cache
+        try:
+            cache_file.write_text(text, encoding="utf-8")
+        except Exception:
+            # cache failures are non-fatal
+            pass
+
+        return text
+    except Exception as e:
+        print(f"Failed to parse USCCB HTML for {url}: {e}")
+        return None
 
 
 def _strip_code_fences(text: str) -> str:
@@ -187,6 +286,8 @@ async def summarize_usccb_readings(readings) -> Optional[dict]:
         resp = model.generate_content(prompt)
         text = resp.text or ""
         text = _strip_code_fences(text)
+        print(f"Gemini response: {text}")
         return json.loads(text)
     except Exception:
+        print("failed")
         return None

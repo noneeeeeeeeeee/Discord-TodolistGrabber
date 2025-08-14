@@ -5,4 +5,4 @@ google-generativeai
 PyNaCl
 yt-dlp
 isolate
-catholic_mass_readings
+beautifulsoup4

@@ -439,7 +439,7 @@ class NoticeAutoUpdate(commands.Cog):
 
                 formatted_date = task_date.strftime("%d %b %Y")
                 task_list = [
-                    f"{idx}. {task['subject']} [{task['task']}] - {task['description']}"
+                    f"{idx}. [{task['task']}] {task['subject']} - {task['description']}"
                     for idx, task in enumerate(tasks, start=1)
                 ]
 
@@ -492,7 +492,7 @@ class NoticeAutoUpdate(commands.Cog):
 
             formatted_date = task_date.strftime("%d %b %Y")
             task_list = [
-                f"{idx}. {task['subject']} [{task['task']}] - {task['description']}"
+                f"{idx}. [{task['task']}] {task['subject']}  - {task['description']}"
                 for idx, task in enumerate(tasks, start=1)
             ]
 
@@ -510,7 +510,7 @@ class NoticeAutoUpdate(commands.Cog):
 
         if unknown_due_tasks:
             unknown_task_list = [
-                f"{idx}. {task['subject']} [{task['task']}] - {task['description']}"
+                f"{idx}. [{task['task']}] {task['subject']} - {task['description']}"
                 for idx, task in enumerate(unknown_due_tasks, start=1)
             ]
             embed.add_field(
