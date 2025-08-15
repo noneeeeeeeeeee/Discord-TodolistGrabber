@@ -2,9 +2,11 @@ from discord.ext import commands, tasks
 import discord
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
-from modules.setconfig import json_get, check_guild_config_available, edit_json_file
+import inspect
+from zoneinfo import ZoneInfo
+from modules.setconfig import json_get, edit_json_file
 from modules.cache import cache_data, cache_read_latest
 from modules.readversion import read_current_version
 from modules.enviromentfilegenerator import check_and_load_env_file
@@ -13,38 +15,59 @@ from modules.enviromentfilegenerator import check_and_load_env_file
 try:
     from modules.summarize_readings import (
         fetch_usccb_daily_readings,
-        summarize_usccb_readings,
+        summarize_usccb_daily_readings,
     )
 
     _HAVE_DAILY_READINGS = True
 except Exception:
     _HAVE_DAILY_READINGS = False
     fetch_usccb_daily_readings = None
-    summarize_usccb_readings = None
+    summarize_usccb_daily_readings = None
 
 # Configure env early
 check_and_load_env_file()
 MAIN_GUILD = os.getenv("MAIN_GUILD")
+LOCAL_TZ_NAME = (
+    os.getenv("LOCAL_TZ") or os.getenv("LOCAL_REGION") or os.getenv("TIMEZONE") or "UTC"
+)
 
 
 class NoticeAutoUpdate(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.sent_message_ids = {}
-        self.first_start = True
-        self.guild_update_info = {}  # store last_update timestamps per guild
-        self.startup_ping_sent = {}
+        self.guild_update_info = {}
         self.ping_message_being_updated = {}
         self.daily_readings = None
         self.ping_message_lock = asyncio.Lock()
-        # Track current heartbeat and configure loops
+        self.ping_last_refreshed_ts: dict[int, str] = {}
         self.heartbeat_seconds = self.get_global_heartbeat()
-        # run loops; initial interval will be adjusted to heartbeat
-        self.update_noticeboard.change_interval(seconds=self.heartbeat_seconds)
-        self.send_ping_message_loop.change_interval(seconds=self.heartbeat_seconds)
-        self.update_noticeboard.start()
-        self.send_ping_message_loop.start()
-        self.fetch_daily_readings_task.start()
+        if _HAVE_DAILY_READINGS:
+            try:
+                self.fetch_daily_readings_task.start()
+            except Exception:
+                pass
+        # Debug: startup info
+        self._dbg(
+            f"Initialized. Heartbeat={self.heartbeat_seconds}s, TZ={LOCAL_TZ_NAME}"
+        )
+
+    def _dbg(self, msg: str):
+        """Lightweight debug print with local timestamp."""
+        try:
+            ts = self.local_now().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[NoticeAutoUpdate {ts}] {msg}")
+
+    def _local_tz(self) -> ZoneInfo:
+        try:
+            return ZoneInfo(LOCAL_TZ_NAME or "UTC")
+        except Exception:
+            return ZoneInfo("UTC")
+
+    def local_now(self) -> datetime:
+        return datetime.now(self._local_tz())
 
     def get_global_heartbeat(self) -> int:
         """Returns the current global heartbeat (seconds), defaulting to 1800."""
@@ -67,21 +90,31 @@ class NoticeAutoUpdate(commands.Cog):
             return 1800
 
     def ensure_heartbeat_interval(self):
-        """Adjust loop intervals if GlobalHeartbeat changed."""
+        """Adjust internal state to current GlobalHeartbeat."""
         hb = self.get_global_heartbeat()
         if getattr(self, "heartbeat_seconds", None) != hb:
+            self._dbg(
+                f"Heartbeat interval change detected: {getattr(self, 'heartbeat_seconds', None)} -> {hb}"
+            )
             self.heartbeat_seconds = hb
-            self.update_noticeboard.change_interval(seconds=hb)
-            self.send_ping_message_loop.change_interval(seconds=hb)
+
+    def _effective_interval(self, nb_cfg: dict) -> int:
+        """Return effective update interval (max of per-guild UpdateInterval and global heartbeat)."""
+        raw = nb_cfg.get("UpdateInterval", None)
+        hb = self.heartbeat_seconds or self.get_global_heartbeat()
+        try:
+            return max(int(raw), hb) if isinstance(raw, int) else hb
+        except Exception:
+            return hb
 
     def has_assignments_tomorrow(self, task_data: dict) -> bool:
-        today = datetime.now().date()
+        today = self.local_now().date()
         tomorrow = today + timedelta(days=1)
         target = tomorrow.strftime("%A, %d-%m-%Y")
         return bool(task_data.get("data", {}).get(target, []))
 
     def has_assignments_this_week(self, task_data: dict) -> bool:
-        today = datetime.now().date()
+        today = self.local_now().date()
         week_start = today - timedelta(days=today.weekday())
         week_end = week_start + timedelta(days=6)
         for date_str, tasks in task_data.get("data", {}).items():
@@ -95,21 +128,64 @@ class NoticeAutoUpdate(commands.Cog):
                 return True
         return False
 
+    @tasks.loop(hours=6)
+    async def fetch_daily_readings_task(self):
+        """Fetch and summarize daily readings periodically (optional)."""
+        if not _HAVE_DAILY_READINGS:
+            return
+        try:
+            self._dbg("Fetching daily readings...")
+            # Fetch readings (sync or async)
+            data = None
+            if callable(fetch_usccb_daily_readings):
+                if inspect.iscoroutinefunction(fetch_usccb_daily_readings):
+                    data = await fetch_usccb_daily_readings()
+                else:
+                    data = fetch_usccb_daily_readings()
+            # Summarize (sync or async)
+            summary = None
+            if callable(summarize_usccb_daily_readings):
+                if inspect.iscoroutinefunction(summarize_usccb_daily_readings):
+                    summary = await summarize_usccb_daily_readings(data)
+                else:
+                    summary = summarize_usccb_daily_readings(data)
+            # Store for use in ping messages
+            if isinstance(summary, dict):
+                self.daily_readings = summary
+            self._dbg("Daily readings fetch complete.")
+        except Exception:
+            # Keep previous daily_readings on error
+            self._dbg(
+                "Daily readings fetch failed; keeping previous.",
+            )
+            pass
+
+    @fetch_daily_readings_task.before_loop
+    async def _before_fetch_daily_readings(self):
+        try:
+            await self.bot.wait_until_ready()
+        except Exception:
+            pass
+
     async def _update_noticeboard_for_guild(self, guild: discord.Guild):
         """Run a single noticeboard update for the provided guild."""
         guild_id = guild.id
+        self._dbg(f"[NB] Begin update for guild={guild_id}")
         try:
             config = json_get(guild_id)
         except Exception as e:
+            self._dbg(f"[NB] Config load failed for guild={guild_id}: {e}")
             print(f"Error getting config for guild {guild_id}: {e}")
             return
 
         nb_cfg = config.get("Noticeboard", {})
         noticeboard_channel_id = nb_cfg.get("ChannelId", "Default")
         noticeboard_edit_ids = nb_cfg.get("NoticeboardEditIDs", [])
-        interval_cfg = nb_cfg.get("UpdateInterval", None)
 
         if noticeboard_channel_id in ("Default", None, "null"):
+            self._dbg(
+                f"[NB] Skipping: Noticeboard.ChannelId not set for guild={guild_id}"
+            )
             print(f"Noticeboard channel ID not set for guild {guild_id}. Skipping.")
             return
 
@@ -119,20 +195,32 @@ class NoticeAutoUpdate(commands.Cog):
             return
 
         version = read_current_version()
+        last_update_local = self.local_now()
         new_message_ids = []
+        success_count = 0
 
-        # Refresh and read tasks
+        # Refresh and read tasks robustly
+        task_data_str = None
         try:
+            # Try to refresh cache; if it fails, continue with last known cache
             cache_data("all")
+        except Exception as e:
+            self._dbg(
+                f"[NB] Cache refresh failed for guild={guild_id}: {e}. Will attempt last cache."
+            )
+            print(
+                f"[NoticeUpdate] Refresh failed for guild {guild_id}: {e}. Using last cache."
+            )
+        try:
             task_data_str = cache_read_latest("all")
         except Exception as e:
-            print(f"Error refreshing/reading cache for guild {guild_id}: {e}")
+            self._dbg(f"[NB] Cache read failed for guild={guild_id}: {e}")
+            print(f"[NoticeUpdate] Failed reading cache for guild {guild_id}: {e}")
             return
-
         if not task_data_str:
+            self._dbg(f"[NB] No cache available for guild={guild_id}")
             print("Error: No task data found in the cache.")
             return
-
         try:
             task_data = json.loads(task_data_str)
             api_call_time = task_data.get("api-call-time", "Unknown")
@@ -141,8 +229,11 @@ class NoticeAutoUpdate(commands.Cog):
                 "api_call_time"
             ] = api_call_time
         except json.JSONDecodeError:
+            self._dbg(
+                f"[NB] Invalid cached JSON for guild={guild_id}, skipping this tick."
+            )
             print(
-                f"Error: Unable to decode cached data. Raw data: {task_data_str[:200]}..."
+                "[NoticeUpdate] Invalid cached JSON; skipping this heartbeat for noticeboard."
             )
             return
 
@@ -153,9 +244,11 @@ class NoticeAutoUpdate(commands.Cog):
             return
 
         embeds = [
-            self.create_notice_embed(task_data, version),
-            self.create_weekly_embed(task_data, version, api_call_time),
-            self.create_due_tomorrow_embed(task_data, version),
+            self.create_notice_embed(task_data, version, last_update_local),
+            self.create_weekly_embed(
+                task_data, version, api_call_time, last_update_local
+            ),
+            self.create_due_tomorrow_embed(task_data, version, last_update_local),
         ]
 
         # Edit existing (limit to embeds len)
@@ -163,33 +256,85 @@ class NoticeAutoUpdate(commands.Cog):
             try:
                 message = await channel.fetch_message(message_id)
                 await message.edit(embed=embeds[i])
+                self._dbg(
+                    f"[NB] Edited noticeboard message idx={i} id={message_id} guild={guild_id}"
+                )
                 await asyncio.sleep(1)
                 new_message_ids.append(message_id)
+                success_count += 1
             except discord.NotFound:
                 try:
                     new_message = await channel.send(embed=embeds[i])
+                    self._dbg(
+                        f"[NB] Re-sent missing noticeboard message idx={i} new_id={new_message.id} guild={guild_id}"
+                    )
                     new_message_ids.append(new_message.id)
+                    success_count += 1
                 except discord.HTTPException as e:
+                    self._dbg(
+                        f"[NB] Send failed for noticeboard idx={i} guild={guild_id}: {e}"
+                    )
                     print(f"Failed to send new message for guild {guild_id}: {e}")
             except discord.HTTPException as e:
-                print(
-                    f"Failed to edit message ID {message_id} for guild {guild_id}: {e}"
-                )
+                # Fallback: try sending a new message if edit failed
+                try:
+                    new_message = await channel.send(embed=embeds[i])
+                    self._dbg(
+                        f"[NB] Edit failed; sent new message idx={i} new_id={new_message.id} guild={guild_id}"
+                    )
+                    new_message_ids.append(new_message.id)
+                    success_count += 1
+                except discord.HTTPException as ee:
+                    self._dbg(f"[NB] Edit+send failed idx={i} guild={guild_id}: {ee}")
+                    print(f"Failed to edit/send message for guild {guild_id}: {ee}")
 
-        # Send any missing
+        # Send any missing (based on collected successes)
         for i in range(len(new_message_ids), len(embeds)):
             try:
                 new_message = await channel.send(embed=embeds[i])
                 new_message_ids.append(new_message.id)
+                success_count += 1
             except discord.HTTPException as e:
                 print(f"Failed to send new message for guild {guild_id}: {e}")
 
-        if new_message_ids:
-            edit_json_file(guild_id, "Noticeboard.NoticeboardEditIDs", new_message_ids)
-        # mark last update time
-        self.guild_update_info.setdefault(guild_id, {})[
-            "last_update"
-        ] = datetime.utcnow()
+        # If none succeeded, attempt a full re-post of all 3 embeds
+        if success_count == 0:
+            try:
+                forced_ids = []
+                for i, emb in enumerate(embeds):
+                    msg = await channel.send(embed=emb)
+                    forced_ids.append(msg.id)
+                new_message_ids = forced_ids
+                success_count = len(forced_ids)
+                self._dbg(f"[NB] Forced re-post of all embeds guild={guild_id}")
+            except Exception as e:
+                self._dbg(f"[NB] Forced re-post failed guild={guild_id}: {e}")
+
+        # Persist IDs only if we have all embeds, otherwise keep current IDs
+        if len(new_message_ids) == len(embeds):
+            try:
+                edit_json_file(
+                    guild_id, "Noticeboard.NoticeboardEditIDs", new_message_ids
+                )
+                self._dbg(
+                    f"[NB] Persisted NoticeboardEditIDs count={len(new_message_ids)} guild={guild_id}"
+                )
+            except Exception:
+                pass
+        # Update "last_update" and LastUpdateTs only on success
+        if success_count > 0:
+            self.guild_update_info.setdefault(guild_id, {})[
+                "last_update"
+            ] = last_update_local
+            try:
+                edit_json_file(
+                    guild_id,
+                    "Noticeboard.LastUpdateTs",
+                    last_update_local.isoformat(),
+                )
+            except Exception:
+                pass
+        self._dbg(f"[NB] Completed update for guild={guild_id}")
 
     async def run_update_noticeboard_once(self, guild_id: int):
         """Public: trigger an immediate update for a single guild."""
@@ -199,21 +344,18 @@ class NoticeAutoUpdate(commands.Cog):
             return
         await self._update_noticeboard_for_guild(guild)
 
-    @tasks.loop(minutes=30)
-    async def update_noticeboard(self):
-        """
-        Runs on GlobalHeartbeat. For each guild, update only if its effective interval has elapsed.
-        """
-        # Ensure loop interval tracks GlobalHeartbeat dynamically
+    # Public: called by GlobalHeartbeat to process one heartbeat tick for updates
+    async def process_noticeboard_tick(self):
+        self._dbg("[HB] process_noticeboard_tick invoked")
+        # Ensure heartbeat reflects current config
         self.ensure_heartbeat_interval()
-
-        now = datetime.utcnow()
+        # Use local-aware timestamps consistently
+        now = self.local_now()
         for guild in self.bot.guilds:
             try:
                 config = json_get(guild.id)
                 original_nb_cfg = config.get("Noticeboard", {})
                 nb_cfg = original_nb_cfg
-                # Support FollowMain
                 if original_nb_cfg.get("FollowMain") and MAIN_GUILD:
                     try:
                         main_cfg = json_get(int(MAIN_GUILD))
@@ -221,21 +363,18 @@ class NoticeAutoUpdate(commands.Cog):
                     except Exception:
                         pass
 
-                # Compute effective interval: floor by GlobalHeartbeat
-                heartbeat = self.heartbeat_seconds or self.get_global_heartbeat()
-                raw_interval = nb_cfg.get("UpdateInterval", None)
-                if isinstance(raw_interval, int):
-                    interval = max(raw_interval, heartbeat)
-                else:
-                    interval = heartbeat
+                interval = self._effective_interval(nb_cfg)
 
-                # Persist bump if this guild's own setting is below the heartbeat (and not following main)
                 if not original_nb_cfg.get("FollowMain"):
                     own_raw = original_nb_cfg.get("UpdateInterval", None)
-                    if isinstance(own_raw, int) and own_raw < heartbeat:
+                    if isinstance(own_raw, int) and own_raw < (
+                        self.heartbeat_seconds or self.get_global_heartbeat()
+                    ):
                         try:
                             edit_json_file(
-                                guild.id, "Noticeboard.UpdateInterval", heartbeat
+                                guild.id,
+                                "Noticeboard.UpdateInterval",
+                                self.heartbeat_seconds,
                             )
                         except Exception:
                             pass
@@ -243,113 +382,215 @@ class NoticeAutoUpdate(commands.Cog):
                 last_update = self.guild_update_info.get(guild.id, {}).get(
                     "last_update"
                 )
+                # Normalize any previously stored naive datetime to local-aware
+                if last_update is not None and last_update.tzinfo is None:
+                    last_update = last_update.replace(tzinfo=self._local_tz())
                 if (
                     last_update is None
                     or (now - last_update).total_seconds() >= interval
                 ):
+                    self._dbg(
+                        f"[HB] Triggering noticeboard update guild={guild.id} interval={interval}s"
+                    )
                     await self._update_noticeboard_for_guild(guild)
                     await asyncio.sleep(1)
-            except Exception:
+                else:
+                    remaining = interval - (now - last_update).total_seconds()
+                    self._dbg(
+                        f"[HB] Skipping NB update guild={guild.id}; {int(remaining)}s remaining"
+                    )
+            except Exception as e:
+                self._dbg(f"[HB] NB tick error guild={getattr(guild,'id','?')}: {e}")
                 continue
 
-    @tasks.loop(minutes=10)
-    async def send_ping_message_loop(self):
-        """
-        Runs on GlobalHeartbeat. Checks each guild whether ping should be sent.
-        """
-        # Ensure loop interval tracks GlobalHeartbeat dynamically
+    async def process_ping_tick(self):
+        self._dbg("[HB] process_ping_tick invoked")
         self.ensure_heartbeat_interval()
-
-        now = datetime.now()
+        now = self.local_now()
         today = now.date()
         for guild in self.bot.guilds:
             guild_id = guild.id
             try:
                 config = json_get(guild_id)
                 nb_cfg = config.get("Noticeboard", {})
-                # FollowMain handling
                 if nb_cfg.get("FollowMain") and MAIN_GUILD:
                     try:
                         main_cfg = json_get(int(MAIN_GUILD))
                         nb_cfg = main_cfg.get("Noticeboard", nb_cfg)
                     except Exception:
                         pass
-            except Exception:
+            except Exception as e:
+                self._dbg(f"[HB] Ping tick: config error guild={guild_id}: {e}")
                 continue
 
             ping_daily_time = nb_cfg.get("PingDailyTime", "15:00")
             smart_ping = nb_cfg.get("SmartPingMode", True)
             noticeboard_channel_id = nb_cfg.get("ChannelId", "Default")
             if noticeboard_channel_id in ("Default", None, "null"):
+                self._dbg(f"[Ping] Skip: no channel set guild={guild_id}")
                 continue
 
-            # Daily blacklist
-            blacklist = set(nb_cfg.get("PingDayBlacklist", []))
+            # Refresh/edit existing ping content on LastUpdateTs (no re-ping)
+            try:
+                last_update_iso = nb_cfg.get("LastUpdateTs")
+                pingmessage_edit_id = nb_cfg.get("PingMessageEditID", None)
+                if last_update_iso and pingmessage_edit_id:
+                    if self.ping_last_refreshed_ts.get(guild_id) != last_update_iso:
+                        self._dbg(
+                            f"[Ping] Refreshing ping content due to LastUpdateTs change guild={guild_id}"
+                        )
+                        channel = guild.get_channel(int(noticeboard_channel_id))
+                        if channel is not None:
+                            try:
+                                msg = await channel.fetch_message(pingmessage_edit_id)
+                                interval = self._effective_interval(nb_cfg)
+                                new_content = await self.send_ping_message(
+                                    channel,
+                                    nb_cfg.get("PingRoleId", "NotSet"),
+                                    today,
+                                    self.get_next_ping_time(ping_daily_time),
+                                    now + timedelta(seconds=interval),
+                                    self.guild_update_info.get(guild_id, {}).get(
+                                        "api_call_time", "Unknown"
+                                    ),
+                                )
+                                await self.edit_with_retries(
+                                    msg, content=new_content, embed=None
+                                )
+                                self.ping_last_refreshed_ts[guild_id] = last_update_iso
+                            except (discord.NotFound, discord.HTTPException):
+                                pass
+            except Exception:
+                pass
+
+            # Blacklist day check
+            bl_raw = nb_cfg.get("PingDayBlacklist", None)
+            blacklist = set(bl_raw or [])
             if today.strftime("%A") in blacklist:
+                self._dbg(f"[Ping] Skip: day blacklisted guild={guild_id}")
                 continue
 
-            # Check if ping already sent today
-            ping_date_str = nb_cfg.get("PingDate", None)
-            if ping_date_str:
+            last_ping_ts = nb_cfg.get("LastPingTs", None)
+            if last_ping_ts:
                 try:
-                    if datetime.strptime(ping_date_str, "%Y-%m-%d").date() == today:
+                    lp = datetime.fromisoformat(last_ping_ts)
+                    if lp.tzinfo is None:
+                        # Assume local tz for legacy naive timestamps
+                        lp = lp.replace(tzinfo=self._local_tz())
+                    if lp.astimezone(self._local_tz()).date() == today:
+                        self._dbg(f"[Ping] Skip: already pinged today guild={guild_id}")
                         continue
                 except Exception:
                     pass
 
-            # Prepare channel
             channel = guild.get_channel(int(noticeboard_channel_id))
             if channel is None:
+                self._dbg(
+                    f"[Ping] Skip: channel not found guild={guild_id} id={noticeboard_channel_id}"
+                )
                 continue
 
-            # Smart gating: only when enabled
+            # Smart gating (optional)
             if smart_ping:
                 try:
                     task_data_str = cache_read_latest("all")
                     if not task_data_str:
+                        self._dbg(f"[Ping] Smart skip: no cache guild={guild_id}")
                         continue
                     task_data = json.loads(task_data_str)
-                except Exception:
+                except Exception as e:
+                    self._dbg(
+                        f"[Ping] Smart skip: cache read/parse failed guild={guild_id}: {e}"
+                    )
                     continue
-
                 if not (
                     self.has_assignments_tomorrow(task_data)
                     or self.has_assignments_this_week(task_data)
                 ):
+                    self._dbg(f"[Ping] Smart skip: no upcoming work guild={guild_id}")
                     continue
 
-            # Parse scheduled ping time for today
+            # Build today's scheduled ping datetime in local tz
             try:
                 ping_time = datetime.strptime(ping_daily_time, "%H:%M").time()
             except ValueError:
-                # invalid time; skip
+                self._dbg(
+                    f"[Ping] Invalid PingDailyTime='{ping_daily_time}' guild={guild_id}"
+                )
                 continue
-            scheduled_dt = datetime.combine(today, ping_time)
-            # If scheduled time is in the past (i.e., missed) or now >= scheduled_dt, and not yet pinged => send
+            scheduled_dt = datetime.combine(today, ping_time).replace(
+                tzinfo=self._local_tz()
+            )
+
+            # If now >= scheduled and not yet pinged today: delete old, send new
             if now >= scheduled_dt:
+                self._dbg(
+                    f"[Ping] Due: sending ping guild={guild_id} now={now.time()} scheduled={scheduled_dt.time()}"
+                )
+                old_id = nb_cfg.get("PingMessageEditID", None)
+                if old_id:
+                    try:
+                        old_msg = await channel.fetch_message(old_id)
+                        await old_msg.delete()
+                        self._dbg(
+                            f"[Ping] Deleted old ping message id={old_id} guild={guild_id}"
+                        )
+                    except (discord.NotFound, discord.HTTPException):
+                        self._dbg(
+                            f"[Ping] Old ping message missing/unreachable id={old_id} guild={guild_id}"
+                        )
+                        pass
                 await self.handle_ping_message(
                     channel, guild_id, today, ping_daily_time, now
                 )
+            else:
+                pass  # no verbose [Ping] debug
+
+    async def edit_with_retries(
+        self, msg: discord.Message, content=None, embed=None, attempts: int = 3
+    ) -> bool:
+        """Edit a message with simple retry/backoff. Returns True on success."""
+        delay = 1.5
+        for i in range(attempts):
+            try:
+                await msg.edit(content=content, embed=embed)
+                self._dbg(f"[MsgEdit] Success on attempt {i+1} for message id={msg.id}")
+                return True
+            except discord.NotFound:
+                self._dbg(f"[MsgEdit] NotFound for message id={getattr(msg,'id','?')}")
+                return False
+            except discord.HTTPException as e:
+                self._dbg(f"[MsgEdit] HTTPException on attempt {i+1}: {e}")
+                await asyncio.sleep(delay)
+                delay *= 2
+            except Exception as e:
+                self._dbg(f"[MsgEdit] Unexpected error: {e}")
+                return False
+        return False
 
     async def handle_ping_message(self, channel, guild_id, today, ping_daily_time, now):
         """Handles sending or editing the ping message reliably."""
         async with self.ping_message_lock:
             self.ping_message_being_updated[guild_id] = True
             try:
+                # build content
                 config = json_get(guild_id)
                 nb_cfg = config.get("Noticeboard", {})
                 pingmessage_edit_id = nb_cfg.get("PingMessageEditID", None)
+                # Prepare last ping (previous) if available
+                last_ping_iso = nb_cfg.get("LastPingTs")
+                last_ping_dt = None
+                try:
+                    if last_ping_iso:
+                        last_ping_dt = datetime.fromisoformat(last_ping_iso)
+                        if last_ping_dt.tzinfo is None:
+                            last_ping_dt = last_ping_dt.replace(tzinfo=self._local_tz())
+                except Exception:
+                    last_ping_dt = None
 
                 # Use effective interval (floor by GlobalHeartbeat)
-                heartbeat = self.heartbeat_seconds or self.get_global_heartbeat()
-                raw_interval = nb_cfg.get("UpdateInterval", None)
-                interval = (
-                    heartbeat
-                    if not isinstance(raw_interval, int)
-                    else max(raw_interval, heartbeat)
-                )
+                interval = self._effective_interval(nb_cfg)
                 next_update_time = now + timedelta(seconds=interval)
-
                 api_call_time = self.guild_update_info.get(guild_id, {}).get(
                     "api_call_time", "Unknown"
                 )
@@ -361,33 +602,66 @@ class NoticeAutoUpdate(commands.Cog):
                     self.get_next_ping_time(ping_daily_time),
                     next_update_time,
                     api_call_time,
+                    last_ping_dt=last_ping_dt,
                 )
 
                 if pingmessage_edit_id:
                     try:
                         msg = await channel.fetch_message(pingmessage_edit_id)
-                        await self.edit_with_retries(
+                        ok = await self.edit_with_retries(
                             msg, content=new_content, embed=None
                         )
+                        if not ok:
+                            new_msg = await channel.send(new_content)
+                            edit_json_file(
+                                guild_id, "Noticeboard.PingMessageEditID", new_msg.id
+                            )
+                            self.sent_message_ids.setdefault(guild_id, {})[
+                                "ping"
+                            ] = new_msg.id
+                            self._dbg(
+                                f"[Ping] Edit failed; sent new ping message id={new_msg.id} guild={guild_id}"
+                            )
                     except discord.NotFound:
+                        new_msg = await channel.send(new_content)
+                        edit_json_file(
+                            guild_id, "Noticeboard.PingMessageEditID", new_msg.id
+                        )
+                        self.sent_message_ids.setdefault(guild_id, {})[
+                            "ping"
+                        ] = new_msg.id
+                        self._dbg(
+                            f"[Ping] Previous ping not found; sent new id={new_msg.id} guild={guild_id}"
+                        )
+                    except discord.HTTPException as e:
+                        self._dbg(
+                            f"[Ping] HTTPException while editing/sending ping guild={guild_id}: {e}"
+                        )
+                        pass
+                else:
+                    try:
                         msg = await channel.send(new_content)
                         edit_json_file(
                             guild_id, "Noticeboard.PingMessageEditID", msg.id
                         )
                         self.sent_message_ids.setdefault(guild_id, {})["ping"] = msg.id
-                else:
-                    msg = await channel.send(new_content)
-                    edit_json_file(guild_id, "Noticeboard.PingMessageEditID", msg.id)
-                    self.sent_message_ids.setdefault(guild_id, {})["ping"] = msg.id
+                        self._dbg(
+                            f"[Ping] Sent fresh ping message id={msg.id} guild={guild_id}"
+                        )
+                    except discord.HTTPException as e:
+                        self._dbg(f"[Ping] Send failed guild={guild_id}: {e}")
+                        pass
             finally:
-                edit_json_file(
-                    guild_id, "Noticeboard.PingDate", today.strftime("%Y-%m-%d")
-                )
+                # Mark last ping time using LastPingTs (local-aware)
+                try:
+                    edit_json_file(
+                        guild_id,
+                        "Noticeboard.LastPingTs",
+                        self.local_now().isoformat(),
+                    )
+                except Exception:
+                    pass
                 self.ping_message_being_updated[guild_id] = False
-
-    @send_ping_message_loop.before_loop
-    async def before_send_ping_message_loop(self):
-        await self.bot.wait_until_ready()
 
     async def send_ping_message(
         self,
@@ -397,12 +671,19 @@ class NoticeAutoUpdate(commands.Cog):
         next_ping_time,
         next_update_time,
         api_call_time,
+        last_ping_dt: datetime | None = None,
     ):
         next_update_timestamp = (
             int(next_update_time.timestamp())
             if isinstance(next_update_time, datetime)
             else "N/A"
         )
+        last_ping_line = ""
+        try:
+            if isinstance(last_ping_dt, datetime):
+                last_ping_line = f"- Last Ping: <t:{int(last_ping_dt.timestamp())}:R>\n"
+        except Exception:
+            pass
 
         daily_readings_info = ""
         if isinstance(self.daily_readings, dict):
@@ -424,28 +705,23 @@ class NoticeAutoUpdate(commands.Cog):
             f"- Today's date: {today.strftime('%a, %d %b %Y')}\n"
             f"- Next Refresh in: <t:{next_update_timestamp}:R>\n"
             f"- Next Ping in: <t:{int(next_ping_time.timestamp())}:R>\n"
+            f"{last_ping_line}"
         )
-
         if daily_readings_info:
             ping_message_content += daily_readings_info
-
         return ping_message_content
 
-    @update_noticeboard.before_loop
-    async def before_update_noticeboard(self):
-        await self.bot.wait_until_ready()
-        print("Bot is ready and before_loop is complete.")
-
     def get_next_update_time(self, interval_seconds):
-        current_time = datetime.now()
+        current_time = self.local_now()
         next_update = current_time + timedelta(seconds=interval_seconds)
         return next_update
 
     def get_next_ping_time(self, ping_daily_time):
-        today = datetime.now()
-        target_time_str = f"{today.strftime('%Y-%m-%d')} {ping_daily_time}"
-        next_ping_time = datetime.strptime(target_time_str, "%Y-%m-%d %H:%M")
-        if next_ping_time < today:
+        now_local = self.local_now()
+        target_time_str = f"{now_local.strftime('%Y-%m-%d')} {ping_daily_time}"
+        naive = datetime.strptime(target_time_str, "%Y-%m-%d %H:%M")
+        next_ping_time = naive.replace(tzinfo=self._local_tz())
+        if next_ping_time < now_local:
             next_ping_time += timedelta(days=1)
         return next_ping_time
 
@@ -464,8 +740,10 @@ class NoticeAutoUpdate(commands.Cog):
         except ValueError:
             return False
 
-    def create_weekly_embed(self, task_data, version, api_call_time):
-        today = datetime.now().date()
+    def create_weekly_embed(
+        self, task_data, version, api_call_time, last_update_dt: datetime | None = None
+    ):
+        today = self.local_now().date()
         week_start = today - timedelta(days=today.weekday())
         week_end = week_start + timedelta(days=6)
         embed = discord.Embed(
@@ -517,10 +795,16 @@ class NoticeAutoUpdate(commands.Cog):
 
         if not tasks_found:
             embed.description = "No Assignments this week! 🎉"
-        embed.set_footer(text=f"Bot Version: {version}")
+        try:
+            ts = int((last_update_dt or self.local_now()).timestamp())
+            embed.set_footer(text=f"Bot Version: {version} • Updated: <t:{ts}:R>")
+        except Exception:
+            embed.set_footer(text=f"Bot Version: {version}")
         return embed
 
-    def create_notice_embed(self, task_data, version):
+    def create_notice_embed(
+        self, task_data, version, last_update_dt: datetime | None = None
+    ):
         embed = discord.Embed(
             title="Notice Board",
             description="Tasks you have to do",
@@ -528,7 +812,7 @@ class NoticeAutoUpdate(commands.Cog):
         )
         unknown_due_tasks = task_data.get("data", {}).get("unknown-due", [])
 
-        today = datetime.now().date()  # Get today's date
+        today = self.local_now().date()  # Get today's date
 
         for date, tasks in task_data.get("data", {}).items():
             if date == "unknown-due" or not self.is_valid_date(date):
@@ -578,11 +862,17 @@ class NoticeAutoUpdate(commands.Cog):
                 inline=False,
             )
 
-        embed.set_footer(text=f"Bot Version: {version}")
+        try:
+            ts = int((last_update_dt or self.local_now()).timestamp())
+            embed.set_footer(text=f"Bot Version: {version} • Updated: <t:{ts}:R>")
+        except Exception:
+            embed.set_footer(text=f"Bot Version: {version}")
         return embed
 
-    def create_due_tomorrow_embed(self, task_data, version):
-        today = datetime.now()
+    def create_due_tomorrow_embed(
+        self, task_data, version, last_update_dt: datetime | None = None
+    ):
+        today = self.local_now()
         tomorrow = today + timedelta(days=1)
         next_due = None
         embed = discord.Embed(
@@ -593,7 +883,8 @@ class NoticeAutoUpdate(commands.Cog):
             if date == "unknown-due":
                 continue
             try:
-                task_date = datetime.strptime(date, "%A, %d-%m-%Y")
+                task_naive = datetime.strptime(date, "%A, %d-%m-%Y")
+                task_date = task_naive.replace(tzinfo=self._local_tz())
             except ValueError:
                 print(f"Skipping invalid date format: {date}")
                 continue
@@ -616,7 +907,11 @@ class NoticeAutoUpdate(commands.Cog):
             else:
                 embed.description = "Nice! There are no assignments due tomorrow!"
 
-        embed.set_footer(text=f"Bot Version: {version}")
+        try:
+            ts = int((last_update_dt or self.local_now()).timestamp())
+            embed.set_footer(text=f"Bot Version: {version} • Updated: <t:{ts}:R>")
+        except Exception:
+            embed.set_footer(text=f"Bot Version: {version}")
         return embed
 
     async def send_initial_messages(self, channel, guild_id):
@@ -625,11 +920,12 @@ class NoticeAutoUpdate(commands.Cog):
             version = read_current_version()
             task_data_str = cache_read_latest("all")
             task_data = json.loads(task_data_str)
-            notice_embed = self.create_notice_embed(task_data, version)
+            lu = self.local_now()
+            notice_embed = self.create_notice_embed(task_data, version, lu)
             this_week_embed = self.create_weekly_embed(
-                task_data, version, datetime.now().strftime("%Y-%m-%d")
+                task_data, version, self.local_now().strftime("%Y-%m-%d"), lu
             )
-            due_tomorrow_embed = self.create_due_tomorrow_embed(task_data, version)
+            due_tomorrow_embed = self.create_due_tomorrow_embed(task_data, version, lu)
 
             # Send the noticeboard messages
             notice_message = await channel.send(embed=notice_embed)

@@ -27,7 +27,6 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "access": 0,
             "description": "Default member role ID",
         },
-        # New: Central-only heartbeat (seconds). Acts as a floor for per-guild intervals.
         "GlobalHeartbeat": {
             "type": "int",
             "default": 1800,  # 30 minutes
@@ -35,6 +34,17 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "max": 86400,  # up to 24 hours
             "access": 4,
             "description": "Central-only: how often the bot checks for updates/pings (seconds). Acts as a floor for per-guild schedules.",
+        },
+        "GlobalHeartbeatEnabled": {
+            "type": "bool",
+            "default": True,
+            "access": 4,
+            "description": "Central-only: enable or disable the global heartbeat loop.",
+        },
+        "LastHeartbeatTs": {
+            "type": "str",
+            "default": None,
+            "access": 2,
         },
     },
     "Noticeboard": {
@@ -46,7 +56,7 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "min": 1800,
             "max": 86400,
             "access": 0,
-            "description": "Seconds (30m - 24h)",
+            "description": "Set the update frequency, in seconds. Range (GlobalHeartbeat - 86400)",
         },
         "PingRoleId": {"type": "role|null", "default": None, "access": 0},
         "PingDailyTime": {
@@ -62,15 +72,16 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "FollowMain": {
             "type": "bool",
-            "default": False,
+            "default": True,
             "access": 0,
             "description": "If true, follow MAIN_GUILD noticeboard config",
         },
         "NoticeboardEditIDs": {"type": "list[int]", "default": [], "access": 2},
         "PingMessageEditID": {"type": "int|null", "default": None, "access": 2},
-        "PingDate": {"type": "date|null", "default": None, "access": 2},
+        "LastUpdateTs": {"type": "str", "default": None, "access": 2},
+        "LastPingTs": {"type": "str", "default": None, "access": 2},
         "PingDayBlacklist": {
-            "type": "list[str]",
+            "type": "list[str]|null",
             "default": ["Friday", "Saturday"],
             "access": 0,
             "choices": [
@@ -165,7 +176,6 @@ _FLAT_SCHEMA = _flatten_schema()
 
 
 def get_settings_schema() -> Dict[str, Dict[str, Any]]:
-    # Return full schema; UI will filter by 'access'
     return SETTINGS_SCHEMA
 
 
@@ -208,6 +218,8 @@ def _coerce_float(val: Any) -> float:
 
 
 def _within(meta: Dict[str, Any], val: Any) -> Any:
+    if val is None:
+        return val
     if "min" in meta and val < meta["min"]:
         raise ValueError(f"value must be >= {meta['min']}")
     if "max" in meta and val > meta["max"]:
@@ -301,6 +313,14 @@ def coerce_value_for_path(path: str, raw_value: Any) -> Any:
         if t == "list[str]":
             val = _coerce_list_str(raw_value)
             return _within(meta, val)
+        if t == "list[str]|null":
+            if raw_value is None or (
+                isinstance(raw_value, str)
+                and raw_value.strip().lower() in ("null", "none", "")
+            ):
+                return None
+            val = _coerce_list_str(raw_value)
+            return _within(meta, val)
         # default to string
         return str(raw_value)
     except Exception as e:
@@ -340,57 +360,6 @@ def _ensure_schema_defaults(config_data: dict) -> Tuple[dict, bool]:
     return config_data, changed
 
 
-def _migrate_flat_to_modules(config_data: dict) -> dict:
-    # Detect if already modular
-    if any(
-        k in config_data for k in ("General", "Noticeboard", "Music", "GoogleClassroom")
-    ):
-        return config_data
-
-    # Build new modular structure
-    mod = {
-        "General": {
-            "DefaultAdmin": config_data.get("DefaultAdmin"),
-            "DefaultRoleId": config_data.get("DefaultRoleId"),
-        },
-        "Noticeboard": {
-            "Enabled": config_data.get("NoticeboardEnabled", True),
-            "ChannelId": config_data.get("NoticeBoardChannelId", "Default"),
-            "UpdateInterval": config_data.get("NoticeBoardUpdateInterval", None),
-            "PingRoleId": config_data.get("PingRoleId"),
-            "PingDailyTime": config_data.get("PingDailyTime", "15:00"),
-            "SmartPingMode": config_data.get("SmartPingMode", True),
-            "FollowMain": config_data.get("FollowMain", False),
-            "NoticeboardEditIDs": config_data.get("noticeboardEditID", []),
-            "PingMessageEditID": config_data.get("pingmessageEditID", None),
-            "PingDate": config_data.get("pingDateTime", None),
-            "PingDayBlacklist": config_data.get(
-                "pingDayBlacklist", ["Friday", "Saturday"]
-            ),
-        },
-        "Music": {
-            "Enabled": config_data.get("MusicEnabled", False),
-            "DJRole": config_data.get("MusicDJRole"),
-            "DJRoleRequired": config_data.get("MusicDJRoleRequired", True),
-            "Volume": config_data.get("MusicVolume", 0.5),
-            "QueueLimit": config_data.get("MusicQueueLimit", 10),
-            "MaxConcurrentInstances": config_data.get("MaxConcurrentInstances", 5),
-            "QueueLimitEnabled": config_data.get("MusicQueueLimitEnabled", True),
-            "PlayerStick": config_data.get("MusicPlayerStick", True),
-            "TrackMaxDuration": config_data.get("TrackMaxDuration", 600),
-            "RemoveNonSongsUsingSponsorBlock": config_data.get(
-                "RemoveNonSongsUsingSponsorBlock", True
-            ),
-            "PlaylistAddLimit": config_data.get("PlaylistAddLimit", 10),
-        },
-        "GoogleClassroom": {
-            "Enabled": config_data.get("GoogleClassroomEnabled", False),
-            "DefaultChannelId": config_data.get("DefaultChannelId", "Default"),
-        },
-    }
-    return mod
-
-
 def _set_by_path(obj: dict, path: str, value):
     keys = path.split(".")
     cur = obj
@@ -425,9 +394,6 @@ def edit_noticeboard_config(
     with open(config_file_path, "r") as config_file:
         config_data = json.load(config_file)
 
-    # migrate if needed
-    config_data = _migrate_flat_to_modules(config_data)
-
     if noticeboard_channelid is not None:
         _set_by_path(config_data, "Noticeboard.ChannelId", noticeboard_channelid)
 
@@ -452,9 +418,6 @@ def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
 
     with open(config_file_path, "r") as config_file:
         config_data = json.load(config_file)
-
-    # migrate before editing
-    config_data = _migrate_flat_to_modules(config_data)
 
     # coerce based on schema if we know about this key
     try:
@@ -491,8 +454,6 @@ def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
             try:
                 with open(fp, "r") as f:
                     cfg = json.load(f)
-                cfg = _migrate_flat_to_modules(cfg)
-                # Set requested key
                 if "." in key:
                     _set_by_path(cfg, key, coerced_value)
                 else:
@@ -532,13 +493,54 @@ def check_guild_config_available(guild_id):
     return os.path.exists(config_file_path)
 
 
-def cache_read_latest(date):
+def cache_read_latest(weekSelect=None):
     cache_dir = os.path.join(os.path.dirname(__file__), "..", "cache")
-    cache_file_path = os.path.join(cache_dir, f"{date}.json")
-    if not os.path.exists(cache_file_path):
+    if not os.path.isdir(cache_dir):
         return None
-    with open(cache_file_path, "r") as cache_file:
-        return json.load(cache_file)
+
+    latest_file = None
+    latest_time = None
+
+    for file in os.listdir(cache_dir):
+        date_part = None
+        # Accept files like: cache_MM-HH_dd_mm_YYYY[ _week_<weekSelect>].json
+        if weekSelect is None:
+            if (
+                file.startswith("cache_")
+                and file.endswith(".json")
+                and "_week_" not in file
+            ):
+                date_part = file.split("_")[1:6]  # [MM-HH, dd, mm, yyyy, maybe tail]
+        else:
+            if file.startswith("cache_") and file.endswith(f"_week_{weekSelect}.json"):
+                date_part = file.split("_")[1:6]
+
+        if not date_part:
+            continue
+
+        try:
+            time_part = date_part[0].split("-")  # MM-HH
+            minute_str = time_part[0]
+            hour_str = time_part[1]
+            day_str = date_part[1]
+            month_str = date_part[2]
+            year_str = date_part[3]
+            file_datetime_str = (
+                f"{day_str}_{month_str}_{year_str} {hour_str}:{minute_str}"
+            )
+            file_dt = datetime.strptime(file_datetime_str, "%d_%m_%Y %H:%M")
+        except Exception:
+            continue
+
+        if latest_time is None or file_dt > latest_time:
+            latest_time = file_dt
+            latest_file = file
+
+    if not latest_file:
+        return None
+
+    with open(os.path.join(cache_dir, latest_file), "r", encoding="utf-8") as f:
+        return f.read()
 
 
 def check_admin_role(guild_id, user_roles):
@@ -550,7 +552,6 @@ def check_admin_role(guild_id, user_roles):
 
     with open(config_file_path, "r") as config_file:
         config_data = json.load(config_file)
-        config_data = _migrate_flat_to_modules(config_data)
         default_admin_role_id = _get_by_path(
             config_data, "General.DefaultAdmin", config_data.get("DefaultAdmin")
         )
@@ -564,7 +565,6 @@ def json_get(guild_id):
     with open(config_file_path, "r") as config_file:
         data = json.load(config_file)
 
-    migrated = _migrate_flat_to_modules(data)
     migrated, changed_schema = _ensure_schema_defaults(migrated)
     if migrated is not data or changed_schema:
         with open(config_file_path, "w") as config_file:

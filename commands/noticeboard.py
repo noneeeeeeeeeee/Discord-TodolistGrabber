@@ -1,18 +1,15 @@
 import discord
 from discord.ext import commands
 import os
-import json
 from modules.enviromentfilegenerator import check_and_load_env_file
 from discord.ui import Button, View
 from modules.setconfig import (
-    edit_noticeboard_config,
     check_guild_config_available,
     check_admin_role,
     json_get,
 )
 from modules.cache import (
     truncate_cache,
-    cache_read_latest,
 )  # Make sure you have this function implemented
 
 check_and_load_env_file()
@@ -77,31 +74,14 @@ class NoticeBoard(commands.Cog):
             embed.add_field(name="Daily Ping Time", value=ping_daily_time, inline=False)
 
             btnview = View(timeout=60)
-            update_now = Button(label="🔄 Update Now", style=discord.ButtonStyle.green)
             delete_cache = Button(label="🗑️ Delete Cache", style=discord.ButtonStyle.red)
 
             show_delete_cache = False
-            show_update_now = False
             try:
                 if OWNER_ID and str(ctx.author.id) == str(OWNER_ID):
                     show_delete_cache = True
-                    show_update_now = True
             except Exception:
                 show_delete_cache = False
-                show_update_now = False
-
-            async def update_callback(interaction):
-                if interaction.user != ctx.author:
-                    await interaction.response.send_message(
-                        "You are not authorized to use this button.", ephemeral=True
-                    )
-                    return
-                await interaction.response.send_message(
-                    "Updating noticeboard now...", ephemeral=True
-                )
-                cog = self.bot.get_cog("NoticeAutoUpdate")
-                if cog:
-                    await cog.run_update_noticeboard_once(guild_id)
 
             async def delete_cache_callback(interaction):
                 if interaction.user != ctx.author:
@@ -113,10 +93,6 @@ class NoticeBoard(commands.Cog):
                     "Deleting cache...", ephemeral=True
                 )
                 truncate_cache()
-
-            if show_update_now:
-                update_now.callback = update_callback
-                btnview.add_item(update_now)
 
             if show_delete_cache:
                 delete_cache.callback = delete_cache_callback
