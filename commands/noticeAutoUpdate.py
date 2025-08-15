@@ -37,10 +37,42 @@ class NoticeAutoUpdate(commands.Cog):
         self.ping_message_being_updated = {}
         self.daily_readings = None
         self.ping_message_lock = asyncio.Lock()
-        # run once every 30 minutes; we'll decide per-guild if it's time to update
+        # Track current heartbeat and configure loops
+        self.heartbeat_seconds = self.get_global_heartbeat()
+        # run loops; initial interval will be adjusted to heartbeat
+        self.update_noticeboard.change_interval(seconds=self.heartbeat_seconds)
+        self.send_ping_message_loop.change_interval(seconds=self.heartbeat_seconds)
         self.update_noticeboard.start()
         self.send_ping_message_loop.start()
         self.fetch_daily_readings_task.start()
+
+    def get_global_heartbeat(self) -> int:
+        """Returns the current global heartbeat (seconds), defaulting to 1800."""
+        try:
+            if MAIN_GUILD:
+                cfg = json_get(int(MAIN_GUILD))
+                hb = cfg.get("General", {}).get("GlobalHeartbeat", 1800)
+            else:
+                hb = 1800
+                if getattr(self.bot, "guilds", None):
+                    any_guild = next(iter(self.bot.guilds), None)
+                    if any_guild:
+                        cfg = json_get(any_guild.id)
+                        hb = cfg.get("General", {}).get("GlobalHeartbeat", 1800)
+            hb = int(hb)
+            if hb < 1800:
+                hb = 1800
+            return hb
+        except Exception:
+            return 1800
+
+    def ensure_heartbeat_interval(self):
+        """Adjust loop intervals if GlobalHeartbeat changed."""
+        hb = self.get_global_heartbeat()
+        if getattr(self, "heartbeat_seconds", None) != hb:
+            self.heartbeat_seconds = hb
+            self.update_noticeboard.change_interval(seconds=hb)
+            self.send_ping_message_loop.change_interval(seconds=hb)
 
     def has_assignments_tomorrow(self, task_data: dict) -> bool:
         today = datetime.now().date()
@@ -104,6 +136,10 @@ class NoticeAutoUpdate(commands.Cog):
         try:
             task_data = json.loads(task_data_str)
             api_call_time = task_data.get("api-call-time", "Unknown")
+            # Store last api call time
+            self.guild_update_info.setdefault(guild_id, {})[
+                "api_call_time"
+            ] = api_call_time
         except json.JSONDecodeError:
             print(
                 f"Error: Unable to decode cached data. Raw data: {task_data_str[:200]}..."
@@ -166,28 +202,43 @@ class NoticeAutoUpdate(commands.Cog):
     @tasks.loop(minutes=30)
     async def update_noticeboard(self):
         """
-        Runs every 30 minutes. For each guild, consult its configured UpdateInterval (min 1800s).
-        Only update the guild if the configured interval has elapsed since last update.
-        This staggers updates across guilds and honors per-guild minimum interval.
+        Runs on GlobalHeartbeat. For each guild, update only if its effective interval has elapsed.
         """
+        # Ensure loop interval tracks GlobalHeartbeat dynamically
+        self.ensure_heartbeat_interval()
+
         now = datetime.utcnow()
         for guild in self.bot.guilds:
             try:
                 config = json_get(guild.id)
-                nb_cfg = config.get("Noticeboard", {})
-                # Support FollowMain: if enabled and MAIN_GUILD is provided, use main guild's noticeboard settings
-                if nb_cfg.get("FollowMain") and MAIN_GUILD:
+                original_nb_cfg = config.get("Noticeboard", {})
+                nb_cfg = original_nb_cfg
+                # Support FollowMain
+                if original_nb_cfg.get("FollowMain") and MAIN_GUILD:
                     try:
                         main_cfg = json_get(int(MAIN_GUILD))
                         nb_cfg = main_cfg.get("Noticeboard", nb_cfg)
                     except Exception:
                         pass
 
-                interval_cfg = nb_cfg.get("UpdateInterval", None)
-                # enforce minimum of 1800 seconds
-                interval = max(
-                    interval_cfg if isinstance(interval_cfg, int) else 1800, 1800
-                )
+                # Compute effective interval: floor by GlobalHeartbeat
+                heartbeat = self.heartbeat_seconds or self.get_global_heartbeat()
+                raw_interval = nb_cfg.get("UpdateInterval", None)
+                if isinstance(raw_interval, int):
+                    interval = max(raw_interval, heartbeat)
+                else:
+                    interval = heartbeat
+
+                # Persist bump if this guild's own setting is below the heartbeat (and not following main)
+                if not original_nb_cfg.get("FollowMain"):
+                    own_raw = original_nb_cfg.get("UpdateInterval", None)
+                    if isinstance(own_raw, int) and own_raw < heartbeat:
+                        try:
+                            edit_json_file(
+                                guild.id, "Noticeboard.UpdateInterval", heartbeat
+                            )
+                        except Exception:
+                            pass
 
                 last_update = self.guild_update_info.get(guild.id, {}).get(
                     "last_update"
@@ -196,53 +247,19 @@ class NoticeAutoUpdate(commands.Cog):
                     last_update is None
                     or (now - last_update).total_seconds() >= interval
                 ):
-                    # perform update (this is rate-sensitive; we avoid doing every guild each loop)
                     await self._update_noticeboard_for_guild(guild)
-                    # small delay between guild updates to reduce rate-limit pressure
                     await asyncio.sleep(1)
             except Exception:
                 continue
 
-    @tasks.loop(hours=24)
-    async def fetch_daily_readings_task(self):
-        # Skip entirely if unavailable
-        if not _HAVE_DAILY_READINGS:
-            self.daily_readings = None
-            return
-        # Try fetch/summarize; on any failure, just hide the section
-        try:
-            readings = await fetch_usccb_daily_readings()
-            summary_json = await summarize_usccb_readings(readings)
-            self.daily_readings = summary_json
-        except Exception:
-            self.daily_readings = None
-
-    @fetch_daily_readings_task.before_loop
-    async def before_fetch_daily_readings_task(self):
-        await self.bot.wait_until_ready()
-
-    async def edit_with_retries(self, message, **kwargs):
-        """Attempts to edit a message with retries for handling rate limits."""
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                await message.edit(**kwargs)
-                break
-            except discord.HTTPException as e:
-                if e.status == 429:
-                    retry_after = getattr(e, "retry_after", None) or 60
-                    await asyncio.sleep(retry_after)
-                else:
-                    print(f"Failed to edit message due to an error: {e}")
-                    break
-
     @tasks.loop(minutes=10)
     async def send_ping_message_loop(self):
         """
-        Runs every 10 minutes and checks each guild whether ping should be sent.
-        If the guild's scheduled PingDailyTime has passed and PingDate is not today, send the ping.
-        Honors FollowMain override and PingDayBlacklist.
+        Runs on GlobalHeartbeat. Checks each guild whether ping should be sent.
         """
+        # Ensure loop interval tracks GlobalHeartbeat dynamically
+        self.ensure_heartbeat_interval()
+
         now = datetime.now()
         today = now.date()
         for guild in self.bot.guilds:
@@ -322,8 +339,17 @@ class NoticeAutoUpdate(commands.Cog):
                 config = json_get(guild_id)
                 nb_cfg = config.get("Noticeboard", {})
                 pingmessage_edit_id = nb_cfg.get("PingMessageEditID", None)
-                interval = nb_cfg.get("UpdateInterval", None) or 3600
+
+                # Use effective interval (floor by GlobalHeartbeat)
+                heartbeat = self.heartbeat_seconds or self.get_global_heartbeat()
+                raw_interval = nb_cfg.get("UpdateInterval", None)
+                interval = (
+                    heartbeat
+                    if not isinstance(raw_interval, int)
+                    else max(raw_interval, heartbeat)
+                )
                 next_update_time = now + timedelta(seconds=interval)
+
                 api_call_time = self.guild_update_info.get(guild_id, {}).get(
                     "api_call_time", "Unknown"
                 )
@@ -378,9 +404,7 @@ class NoticeAutoUpdate(commands.Cog):
             else "N/A"
         )
 
-        # Daily readings (optional; only include if enabled in this guild)
         daily_readings_info = ""
-        # Only include when we actually have data; swallow all errors
         if isinstance(self.daily_readings, dict):
             try:
                 title = self.daily_readings.get("title")

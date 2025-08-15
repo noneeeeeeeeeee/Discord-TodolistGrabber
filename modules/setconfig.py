@@ -27,6 +27,15 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "access": 0,
             "description": "Default member role ID",
         },
+        # New: Central-only heartbeat (seconds). Acts as a floor for per-guild intervals.
+        "GlobalHeartbeat": {
+            "type": "int",
+            "default": 1800,  # 30 minutes
+            "min": 1800,  # enforce minimum 30 minutes globally
+            "max": 86400,  # up to 24 hours
+            "access": 4,
+            "description": "Central-only: how often the bot checks for updates/pings (seconds). Acts as a floor for per-guild schedules.",
+        },
     },
     "Noticeboard": {
         "Enabled": {"type": "bool", "default": True, "access": 0},
@@ -453,6 +462,23 @@ def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
     except ValueError as e:
         raise
 
+    # Determine current/global heartbeat for dynamic floor
+    try:
+        current_hb = int(
+            _get_by_path(
+                config_data,
+                "General.GlobalHeartbeat",
+                SETTINGS_SCHEMA["General"]["GlobalHeartbeat"]["default"],
+            )
+        )
+    except Exception:
+        current_hb = SETTINGS_SCHEMA["General"]["GlobalHeartbeat"]["default"]
+
+    # Enforce dynamic floor on Noticeboard.UpdateInterval
+    if key == "Noticeboard.UpdateInterval" and isinstance(coerced_value, int):
+        if coerced_value < current_hb:
+            coerced_value = current_hb
+
     # Owner-based central propagation: if access is 3 or 4 and the actor is OWNER_ID
     meta = get_setting_meta(key)
     owner_env = os.getenv("OWNER_ID")
@@ -466,10 +492,23 @@ def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
                 with open(fp, "r") as f:
                     cfg = json.load(f)
                 cfg = _migrate_flat_to_modules(cfg)
+                # Set requested key
                 if "." in key:
                     _set_by_path(cfg, key, coerced_value)
                 else:
                     cfg[key] = coerced_value
+                # If GlobalHeartbeat changed, bump all guilds' UpdateInterval up to the new floor
+                if key == "General.GlobalHeartbeat":
+                    try:
+                        new_hb = int(coerced_value)
+                    except Exception:
+                        new_hb = SETTINGS_SCHEMA["General"]["GlobalHeartbeat"][
+                            "default"
+                        ]
+                    nb_val = _get_by_path(cfg, "Noticeboard.UpdateInterval", None)
+                    if not isinstance(nb_val, int) or nb_val < new_hb:
+                        _set_by_path(cfg, "Noticeboard.UpdateInterval", new_hb)
+                # Also ensure schema
                 cfg, _ = _ensure_schema_defaults(cfg)
                 with open(fp, "w") as f:
                     json.dump(cfg, f, indent=4)
@@ -477,7 +516,6 @@ def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
                 continue
         return
 
-    # Normal per-guild edit
     if "." in key:
         _set_by_path(config_data, key, coerced_value)
     else:
@@ -492,6 +530,15 @@ def check_guild_config_available(guild_id):
     config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")
     return os.path.exists(config_file_path)
+
+
+def cache_read_latest(date):
+    cache_dir = os.path.join(os.path.dirname(__file__), "..", "cache")
+    cache_file_path = os.path.join(cache_dir, f"{date}.json")
+    if not os.path.exists(cache_file_path):
+        return None
+    with open(cache_file_path, "r") as cache_file:
+        return json.load(cache_file)
 
 
 def check_admin_role(guild_id, user_roles):
@@ -517,21 +564,7 @@ def json_get(guild_id):
     with open(config_file_path, "r") as config_file:
         data = json.load(config_file)
 
-    # auto-migrate and persist if needed
     migrated = _migrate_flat_to_modules(data)
-    # apply schema defaults/migrations
-    migrated, changed_schema = _ensure_schema_defaults(migrated)
-    if migrated is not data or changed_schema:
-        with open(config_file_path, "w") as config_file:
-            json.dump(migrated, config_file, indent=4)
-    return migrated
-    config_file_path = os.path.join(config_dir, f"{guild_id}.json")
-    with open(config_file_path, "r") as config_file:
-        data = json.load(config_file)
-
-    # auto-migrate and persist if needed
-    migrated = _migrate_flat_to_modules(data)
-    # apply schema defaults/migrations
     migrated, changed_schema = _ensure_schema_defaults(migrated)
     if migrated is not data or changed_schema:
         with open(config_file_path, "w") as config_file:
