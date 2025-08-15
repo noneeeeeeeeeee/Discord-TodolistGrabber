@@ -3,6 +3,5 @@ python-dotenv
 requests
 google-generativeai
 PyNaCl
-yt-dlp
-isolate
 beautifulsoup4
+tzdata
