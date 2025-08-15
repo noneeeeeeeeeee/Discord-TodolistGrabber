@@ -35,6 +35,3 @@ def fetch_api_data(week=None, status=False):
         return json.dumps(response_json)
     else:
         return response.text
-
-
-print(fetch_api_data())

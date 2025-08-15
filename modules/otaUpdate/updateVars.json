@@ -1,6 +1,6 @@
 {
   "_comment": "For the Update get method, this has 2 ways either A its GET_FROM_SOURCE_CODE or B its GET_FROM_RELEASE_PACKAGE. A is straight forward, but for B it will get it from the FIRST package in releases.",
-  "_comment1": "There is also a option C where its GET_FROM_RELEASE_SOURCE, where this will get it from the source code of the release instead of the latest commit hash",
+  "_comment1": "There is also a option C where its GET_FROM_COMMIT, where this will get it from the latest commit hash",
   "REPOSITORY_URL": "https://github.com/noneeeeeeeeeee/Discord-TodolistGrabber",
   "WHITELISTED_FILES_FOLDERS": [
     "config",

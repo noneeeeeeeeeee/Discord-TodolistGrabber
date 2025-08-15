@@ -80,7 +80,8 @@ def smart_download_check():
             return None
 
         current_version = result.get("current_version")
-        latest_version = result.get("latest_version")
+        latest_version = result.get("stable_version") or result.get("latest_version")
+        prerelease_version = result.get("prerelease_version")
 
         # Check temp_update folder
         temp_package_path = TEMP_DIR
@@ -102,7 +103,12 @@ def smart_download_check():
             if os.path.exists(temp_package_path):
                 shutil.rmtree(temp_package_path, onerror=handle_remove_readonly)
                 print_progress("Smart Download Check", "Temp folder deleted.")
-            return "abort_update"
+            # If a prerelease exists, let the caller decide to opt-in later
+            return (
+                "abort_update_with_possible_prerelease"
+                if prerelease_version
+                else "abort_update"
+            )
 
         if temp_version and temp_version == latest_version:
             # Case 2: Temp package matches repository version
@@ -156,17 +162,33 @@ def fetch_with_retries(url, headers, max_retries=5):
     raise Exception("Max retries exceeded.")
 
 
-def fetch_update(repo_url, method, api_key=None):
+def fetch_update(repo_url, method, api_key=None, prefer_prerelease=False):
     """
     Handles fetching the update file with optional API key.
     """
     try:
         headers = {"Authorization": f"token {api_key}"} if api_key else {}
-        release_url = f"https://api.github.com/repos/{'/'.join(repo_url.rstrip('/').split('/')[-2:])}/releases/latest"
-        print(f"Fetching Update File From: {release_url}")
-
-        response = fetch_with_retries(release_url, headers)
-        release_data = response.json()
+        releases_url = f"https://api.github.com/repos/{'/'.join(repo_url.rstrip('/').split('/')[-2:])}/releases"
+        print(f"Fetching Release List From: {releases_url}")
+        response = fetch_with_retries(releases_url, headers)
+        releases = response.json()
+        if not isinstance(releases, list) or not releases:
+            raise ValueError("No releases found in repository.")
+        # Select target release
+        target = None
+        if prefer_prerelease:
+            target = next(
+                (r for r in releases if not r.get("draft") and r.get("prerelease")),
+                None,
+            )
+        if not target:
+            target = next(
+                (r for r in releases if not r.get("draft") and not r.get("prerelease")),
+                None,
+            )
+        if not target:
+            raise ValueError("No suitable release found (stable/prerelease).")
+        release_data = target
 
         if method == "GET_FROM_RELEASE_SOURCE":
             # Get the source code URL for the latest tag
@@ -441,7 +463,39 @@ def perform_ota_update():
             )
             result = "continue"
 
-        if result == "abort_update":
+        # Check for prerelease availability and optionally opt-in
+        prefer_prerelease = False
+        try:
+            cu = check_update()
+            current_version = cu.get("current_version")
+            pre_ver = cu.get("prerelease_version")
+            pre_avail = (
+                cu.get("prerelease_available", False)
+                and pre_ver
+                and pre_ver != current_version
+            )
+            stable_ver = cu.get("stable_version")
+            if pre_avail:
+                print()
+                print("A prerelease build is available:")
+                print(f"- Stable latest: {stable_ver or 'N/A'}")
+                print(f"- Prerelease: {pre_ver} (may be buggy or unstable)")
+                choice = (
+                    input("Do you want to install the prerelease? [y/N]: ")
+                    .strip()
+                    .lower()
+                )
+                prefer_prerelease = choice == "y"
+                # If we were about to abort due to being up-to-date on stable, but user opted into prerelease, continue
+                if (
+                    result in ("abort_update", "abort_update_with_possible_prerelease")
+                    and prefer_prerelease
+                ):
+                    result = "continue"
+        except Exception:
+            pass
+
+        if result in ("abort_update",):
             print("<<<---Bot is already up-to-date. Aborting installation.--->>>")
             time.sleep(10)
             sys.exit(0)
@@ -454,7 +508,40 @@ def perform_ota_update():
 
         # Fetch the update file
         if result == "continue" or not result:
-            fetch_update(repo_url, update_method, api_key)
+            # Skip download if zip for chosen tag already exists
+            try:
+                chosen_tag = None
+                if prefer_prerelease:
+                    chosen_tag = cu.get("prerelease_version")
+                else:
+                    chosen_tag = cu.get("stable_version") or cu.get("latest_version")
+                if chosen_tag:
+                    existing_zip = os.path.join(TEMP_DIR, f"{chosen_tag}.zip")
+                    if os.path.exists(existing_zip):
+                        print_progress(
+                            "Download", "Found existing package. Skipping download."
+                        )
+                    else:
+                        fetch_update(
+                            repo_url,
+                            update_method,
+                            api_key,
+                            prefer_prerelease=prefer_prerelease,
+                        )
+                else:
+                    fetch_update(
+                        repo_url,
+                        update_method,
+                        api_key,
+                        prefer_prerelease=prefer_prerelease,
+                    )
+            except Exception:
+                fetch_update(
+                    repo_url,
+                    update_method,
+                    api_key,
+                    prefer_prerelease=prefer_prerelease,
+                )
 
         # Cleanup
         time.sleep(2)

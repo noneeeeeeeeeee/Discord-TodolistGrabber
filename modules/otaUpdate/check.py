@@ -48,34 +48,53 @@ def check_update():
         # Set headers for API request if an API key is provided
         headers = {"Authorization": f"token {api_key}"} if api_key else {}
 
-        # Fetch the latest release version tag
-        response = requests.get(latest_release_api, headers=headers)
-        response.raise_for_status()
-        release_data = response.json()
-        latest_version = release_data.get("tag_name")
-        changelog = release_data.get("body")
+        # Fetch list of releases to get both stable and prerelease
+        releases_api = f"https://api.github.com/repos/{'/'.join(repo_url.rstrip('/').split('/')[-2:])}/releases"
+        resp = requests.get(releases_api, headers=headers)
+        resp.raise_for_status()
+        releases = resp.json() if isinstance(resp.json(), list) else []
 
-        if not latest_version:
+        latest_stable = next(
+            (r for r in releases if not r.get("draft") and not r.get("prerelease")),
+            None,
+        )
+        latest_pre = next(
+            (r for r in releases if not r.get("draft") and r.get("prerelease")), None
+        )
+
+        latest_version = latest_stable.get("tag_name") if latest_stable else None
+        changelog = latest_stable.get("body") if latest_stable else None
+
+        prerelease_version = latest_pre.get("tag_name") if latest_pre else None
+        prerelease_changelog = latest_pre.get("body") if latest_pre else None
+
+        if not latest_version and not prerelease_version:
             return {
                 "status": "error",
-                "message": "Could not fetch the latest version tag from the repository.",
+                "message": "Could not fetch any releases from the repository.",
             }
 
-        # Compare versions
-        if current_version == latest_version:
-            return {
-                "status": "up-to-date",
-                "current_version": current_version,
-                "latest_version": latest_version,
-                "changelog": changelog,
-            }
+        # Compare against stable by default
+        if latest_version and current_version == latest_version:
+            status = "up-to-date"
+        elif latest_version:
+            status = "update-available"
         else:
-            return {
-                "status": "update-available",
-                "current_version": current_version,
-                "latest_version": latest_version,
-                "changelog": changelog,
-            }
+            # No stable; prerelease only
+            status = "update-available"
+
+        return {
+            "status": status,
+            "current_version": current_version,
+            "latest_version": latest_version or prerelease_version,
+            "changelog": changelog if status != "error" else None,
+            # New fields for prerelease awareness
+            "prerelease_available": bool(prerelease_version),
+            "prerelease_version": prerelease_version,
+            "prerelease_changelog": prerelease_changelog,
+            "stable_version": latest_version,
+            "stable_changelog": changelog,
+        }
     except requests.exceptions.RequestException as e:
         return {"status": "error", "message": f"HTTP request failed: {e}"}
     except Exception as e:
