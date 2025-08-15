@@ -39,6 +39,35 @@ TEMP_ZIP_PATH = os.path.join(TEMP_DIR, "update.zip")
 WHITELISTED_FILES_KEY = "WHITELISTED_FILES_FOLDERS"
 
 
+# Version helpers to compare stable/prerelease correctly
+def _parse_version(ver: str):
+    if not ver:
+        return (0, 0, 0, 1, 0)
+    ver = ver.strip()
+    import re
+
+    m = re.match(r"^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([A-Za-z]+)?(\d+)?)?\s*$", ver)
+    if not m:
+        nums = [int(x) for x in re.findall(r"\d+", ver)]
+        major = nums[0] if len(nums) > 0 else 0
+        minor = nums[1] if len(nums) > 1 else 0
+        patch = nums[2] if len(nums) > 2 else 0
+        return (major, minor, patch, 1, 0)
+    major = int(m.group(1) or 0)
+    minor = int(m.group(2) or 0)
+    patch = int(m.group(3) or 0)
+    pre_label = (m.group(4) or "").lower()
+    pre_num = int(m.group(5) or 0)
+    is_prerelease = 1 if pre_label else 0
+    return (major, minor, patch, is_prerelease, pre_num)
+
+
+def _cmp_versions(a: str, b: str) -> int:
+    ta = _parse_version(a or "0")
+    tb = _parse_version(b or "0")
+    return (ta > tb) - (ta < tb)
+
+
 def log_error(stage, message, exception=None):
     """
     Logs errors with stage information to the logs directory.
@@ -83,6 +112,25 @@ def smart_download_check():
         latest_version = result.get("stable_version") or result.get("latest_version")
         prerelease_version = result.get("prerelease_version")
 
+        # Prevent downgrades: if current > latest stable and no newer prerelease exists, abort
+        try:
+            has_newer_pre = bool(
+                prerelease_version
+                and _cmp_versions(current_version, prerelease_version) < 0
+            )
+            if (
+                latest_version
+                and _cmp_versions(current_version, latest_version) > 0
+                and not has_newer_pre
+            ):
+                print_progress(
+                    "Smart Download Check",
+                    "Current version is newer than latest stable. Aborting installation.",
+                )
+                return "abort_update"
+        except Exception:
+            pass
+
         # Check temp_update folder
         temp_package_path = TEMP_DIR
         temp_version = None
@@ -95,7 +143,7 @@ def smart_download_check():
 
         # Logic based on different cases
         if current_version == latest_version:
-            # Case 1: Bot is up-to-date
+            # Case 1: Bot is up-to-date (stable). If a newer prerelease exists, let caller opt-in later.
             print_progress(
                 "Smart Download Check",
                 "Bot is already up-to-date. Aborting installation.",
@@ -103,10 +151,10 @@ def smart_download_check():
             if os.path.exists(temp_package_path):
                 shutil.rmtree(temp_package_path, onerror=handle_remove_readonly)
                 print_progress("Smart Download Check", "Temp folder deleted.")
-            # If a prerelease exists, let the caller decide to opt-in later
             return (
                 "abort_update_with_possible_prerelease"
                 if prerelease_version
+                and _cmp_versions(current_version, prerelease_version) < 0
                 else "abort_update"
             )
 
@@ -118,7 +166,11 @@ def smart_download_check():
             )
             return "skip_download"
 
-        if temp_version and temp_version < latest_version:
+        if (
+            temp_version
+            and latest_version
+            and _cmp_versions(temp_version, latest_version) < 0
+        ):
             # Case 3: Temp package is outdated
             print_progress(
                 "Smart Download Check", "Temp package is outdated. Cleaning..."
@@ -127,7 +179,7 @@ def smart_download_check():
             print_progress("Smart Download Check", "Temp folder cleaned.")
             return "continue"
 
-        if temp_version and temp_version > current_version:
+        if temp_version and _cmp_versions(temp_version, current_version) > 0:
             # Case 4: Temp package is invalid
             print_progress(
                 "Smart Download Check", "Temp package is invalid. Cleaning..."
@@ -453,6 +505,13 @@ def perform_ota_update():
         smart_download_enabled = update_vars.get("SMART_DOWNLOAD_ENABLED", False)
         api_key = update_vars.get("REPO_API_KEY", "")
 
+        # New: parse CLI preference override
+        prefer_override = None
+        if "--prefer-prerelease" in sys.argv:
+            prefer_override = True
+        elif "--prefer-stable" in sys.argv:
+            prefer_override = False
+
         # Prequisite checks 2
         if smart_download_enabled:
             result = smart_download_check()
@@ -475,23 +534,41 @@ def perform_ota_update():
                 and pre_ver != current_version
             )
             stable_ver = cu.get("stable_version")
+
             if pre_avail:
-                print()
-                print("A prerelease build is available:")
-                print(f"- Stable latest: {stable_ver or 'N/A'}")
-                print(f"- Prerelease: {pre_ver} (may be buggy or unstable)")
-                choice = (
-                    input("Do you want to install the prerelease? [y/N]: ")
-                    .strip()
-                    .lower()
-                )
-                prefer_prerelease = choice == "y"
-                # If we were about to abort due to being up-to-date on stable, but user opted into prerelease, continue
-                if (
-                    result in ("abort_update", "abort_update_with_possible_prerelease")
-                    and prefer_prerelease
-                ):
-                    result = "continue"
+                if prefer_override is not None:
+                    prefer_prerelease = bool(prefer_override)
+                    if (
+                        result
+                        in ("abort_update", "abort_update_with_possible_prerelease")
+                        and prefer_prerelease
+                    ):
+                        result = "continue"
+                    print_progress(
+                        "Preference",
+                        f"Using CLI preference: {'prerelease' if prefer_prerelease else 'stable'}",
+                    )
+                else:
+                    print()
+                    print("A prerelease build is available:")
+                    print(f"- Stable latest: {stable_ver or 'N/A'}")
+                    print(f"- Prerelease: {pre_ver} (may be buggy or unstable)")
+                    choice = (
+                        input("Do you want to install the prerelease? [y/N]: ")
+                        .strip()
+                        .lower()
+                    )
+                    prefer_prerelease = choice == "y"
+                    if (
+                        result
+                        in ("abort_update", "abort_update_with_possible_prerelease")
+                        and prefer_prerelease
+                    ):
+                        result = "continue"
+            else:
+                # If no prerelease or not newer, still respect explicit stable override silently
+                if prefer_override is False:
+                    print_progress("Preference", "Using CLI preference: stable")
         except Exception:
             pass
 
@@ -508,7 +585,6 @@ def perform_ota_update():
 
         # Fetch the update file
         if result == "continue" or not result:
-            # Skip download if zip for chosen tag already exists
             try:
                 chosen_tag = None
                 if prefer_prerelease:

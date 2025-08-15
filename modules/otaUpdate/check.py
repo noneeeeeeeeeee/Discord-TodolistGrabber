@@ -40,9 +40,9 @@ def check_update():
     # GitHub API endpoint for the latest release
     latest_release_api = f"https://api.github.com/repos/{'/'.join(repo_url.rstrip('/').split('/')[-2:])}/releases/latest"
 
-    # Load the current version from version.txt
+    # Load the current version from version.txt (keep prerelease suffix intact)
     with open(VERSION_FILE_PATH, "r") as f:
-        current_version = f.read().strip().split("-")[0]
+        current_version = f.read().strip()
 
     try:
         # Set headers for API request if an API key is provided
@@ -74,7 +74,7 @@ def check_update():
                 "message": "Could not fetch any releases from the repository.",
             }
 
-        # Compare against stable by default
+        # Compare against stable by default (status is advisory; consumers use detailed fields)
         if latest_version and current_version == latest_version:
             status = "up-to-date"
         elif latest_version:
