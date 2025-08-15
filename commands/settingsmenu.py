@@ -168,9 +168,10 @@ class SettingsView(View):
             self.setting_select.disabled = True
         else:
             for path, meta in visible_paths:
-                # Show "{Setting Name}" and description (fallback to name if missing)
+                # Show "{Setting Name}" and description (truncate to 100 chars)
                 opt_label = meta["key"]
-                opt_desc = meta.get("description") or opt_label
+                desc_raw = meta.get("description") or opt_label
+                opt_desc = desc_raw if len(desc_raw) <= 100 else (desc_raw[:97] + "...")
                 self.setting_select.add_option(
                     label=opt_label,
                     value=path,

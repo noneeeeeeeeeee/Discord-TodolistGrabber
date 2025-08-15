@@ -2,27 +2,15 @@ from discord.ext import commands, tasks
 import discord
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import asyncio
-import inspect
 from zoneinfo import ZoneInfo
 from modules.setconfig import json_get, edit_json_file
 from modules.cache import cache_data, cache_read_latest
 from modules.readversion import read_current_version
 from modules.enviromentfilegenerator import check_and_load_env_file
 
-# Make readings optional; if module/env not ready, disable silently
-try:
-    from modules.summarize_readings import (
-        fetch_usccb_daily_readings,
-        summarize_usccb_daily_readings,
-    )
-
-    _HAVE_DAILY_READINGS = True
-except Exception:
-    _HAVE_DAILY_READINGS = False
-    fetch_usccb_daily_readings = None
-    summarize_usccb_daily_readings = None
+# Daily readings disabled
 
 # Configure env early
 check_and_load_env_file()
@@ -38,15 +26,9 @@ class NoticeAutoUpdate(commands.Cog):
         self.sent_message_ids = {}
         self.guild_update_info = {}
         self.ping_message_being_updated = {}
-        self.daily_readings = None
         self.ping_message_lock = asyncio.Lock()
         self.ping_last_refreshed_ts: dict[int, str] = {}
         self.heartbeat_seconds = self.get_global_heartbeat()
-        if _HAVE_DAILY_READINGS:
-            try:
-                self.fetch_daily_readings_task.start()
-            except Exception:
-                pass
         # Debug: startup info
         self._dbg(
             f"Initialized. Heartbeat={self.heartbeat_seconds}s, TZ={LOCAL_TZ_NAME}"
@@ -127,45 +109,6 @@ class NoticeAutoUpdate(commands.Cog):
             if week_start <= task_date <= week_end and tasks:
                 return True
         return False
-
-    @tasks.loop(hours=6)
-    async def fetch_daily_readings_task(self):
-        """Fetch and summarize daily readings periodically (optional)."""
-        if not _HAVE_DAILY_READINGS:
-            return
-        try:
-            self._dbg("Fetching daily readings...")
-            # Fetch readings (sync or async)
-            data = None
-            if callable(fetch_usccb_daily_readings):
-                if inspect.iscoroutinefunction(fetch_usccb_daily_readings):
-                    data = await fetch_usccb_daily_readings()
-                else:
-                    data = fetch_usccb_daily_readings()
-            # Summarize (sync or async)
-            summary = None
-            if callable(summarize_usccb_daily_readings):
-                if inspect.iscoroutinefunction(summarize_usccb_daily_readings):
-                    summary = await summarize_usccb_daily_readings(data)
-                else:
-                    summary = summarize_usccb_daily_readings(data)
-            # Store for use in ping messages
-            if isinstance(summary, dict):
-                self.daily_readings = summary
-            self._dbg("Daily readings fetch complete.")
-        except Exception:
-            # Keep previous daily_readings on error
-            self._dbg(
-                "Daily readings fetch failed; keeping previous.",
-            )
-            pass
-
-    @fetch_daily_readings_task.before_loop
-    async def _before_fetch_daily_readings(self):
-        try:
-            await self.bot.wait_until_ready()
-        except Exception:
-            pass
 
     async def _update_noticeboard_for_guild(self, guild: discord.Guild):
         """Run a single noticeboard update for the provided guild."""
@@ -346,8 +289,6 @@ class NoticeAutoUpdate(commands.Cog):
 
     # Public: called by GlobalHeartbeat to process one heartbeat tick for updates
     async def process_noticeboard_tick(self):
-        self._dbg("[HB] process_noticeboard_tick invoked")
-        # Ensure heartbeat reflects current config
         self.ensure_heartbeat_interval()
         # Use local-aware timestamps consistently
         now = self.local_now()
@@ -389,9 +330,7 @@ class NoticeAutoUpdate(commands.Cog):
                     last_update is None
                     or (now - last_update).total_seconds() >= interval
                 ):
-                    self._dbg(
-                        f"[HB] Triggering noticeboard update guild={guild.id} interval={interval}s"
-                    )
+
                     await self._update_noticeboard_for_guild(guild)
                     await asyncio.sleep(1)
                 else:
@@ -404,7 +343,6 @@ class NoticeAutoUpdate(commands.Cog):
                 continue
 
     async def process_ping_tick(self):
-        self._dbg("[HB] process_ping_tick invoked")
         self.ensure_heartbeat_interval()
         now = self.local_now()
         today = now.date()
@@ -467,7 +405,6 @@ class NoticeAutoUpdate(commands.Cog):
             bl_raw = nb_cfg.get("PingDayBlacklist", None)
             blacklist = set(bl_raw or [])
             if today.strftime("%A") in blacklist:
-                self._dbg(f"[Ping] Skip: day blacklisted guild={guild_id}")
                 continue
 
             last_ping_ts = nb_cfg.get("LastPingTs", None)
@@ -478,7 +415,6 @@ class NoticeAutoUpdate(commands.Cog):
                         # Assume local tz for legacy naive timestamps
                         lp = lp.replace(tzinfo=self._local_tz())
                     if lp.astimezone(self._local_tz()).date() == today:
-                        self._dbg(f"[Ping] Skip: already pinged today guild={guild_id}")
                         continue
                 except Exception:
                     pass
@@ -495,7 +431,6 @@ class NoticeAutoUpdate(commands.Cog):
                 try:
                     task_data_str = cache_read_latest("all")
                     if not task_data_str:
-                        self._dbg(f"[Ping] Smart skip: no cache guild={guild_id}")
                         continue
                     task_data = json.loads(task_data_str)
                 except Exception as e:
@@ -685,21 +620,6 @@ class NoticeAutoUpdate(commands.Cog):
         except Exception:
             pass
 
-        daily_readings_info = ""
-        if isinstance(self.daily_readings, dict):
-            try:
-                title = self.daily_readings.get("title")
-                link = self.daily_readings.get("link")
-                quote = self.daily_readings.get("motivational_quote")
-                if quote:
-                    daily_readings_info += f"- Daily Motivational Quote: {quote}\n"
-                if title and link:
-                    daily_readings_info += (
-                        f"      - Read the Full Text here: [{title}](<{link}>)\n"
-                    )
-            except Exception:
-                pass
-
         ping_message_content = (
             f"# Daily Ping <@&{ping_role}>\n"
             f"- Today's date: {today.strftime('%a, %d %b %Y')}\n"
@@ -707,8 +627,6 @@ class NoticeAutoUpdate(commands.Cog):
             f"- Next Ping in: <t:{int(next_ping_time.timestamp())}:R>\n"
             f"{last_ping_line}"
         )
-        if daily_readings_info:
-            ping_message_content += daily_readings_info
         return ping_message_content
 
     def get_next_update_time(self, interval_seconds):
@@ -795,10 +713,6 @@ class NoticeAutoUpdate(commands.Cog):
 
         if not tasks_found:
             embed.description = "No Assignments this week! 🎉"
-        try:
-            ts = int((last_update_dt or self.local_now()).timestamp())
-            embed.set_footer(text=f"Bot Version: {version} • Updated: <t:{ts}:R>")
-        except Exception:
             embed.set_footer(text=f"Bot Version: {version}")
         return embed
 
@@ -862,10 +776,6 @@ class NoticeAutoUpdate(commands.Cog):
                 inline=False,
             )
 
-        try:
-            ts = int((last_update_dt or self.local_now()).timestamp())
-            embed.set_footer(text=f"Bot Version: {version} • Updated: <t:{ts}:R>")
-        except Exception:
             embed.set_footer(text=f"Bot Version: {version}")
         return embed
 
@@ -907,10 +817,6 @@ class NoticeAutoUpdate(commands.Cog):
             else:
                 embed.description = "Nice! There are no assignments due tomorrow!"
 
-        try:
-            ts = int((last_update_dt or self.local_now()).timestamp())
-            embed.set_footer(text=f"Bot Version: {version} • Updated: <t:{ts}:R>")
-        except Exception:
             embed.set_footer(text=f"Bot Version: {version}")
         return embed
 
@@ -944,7 +850,6 @@ class NoticeAutoUpdate(commands.Cog):
                 "due_tomorrow": due_tomorrow_message.id,
             }
 
-            # FIX: persist to Noticeboard.NoticeboardEditIDs (not legacy root key)
             edit_json_file(
                 guild_id, "Noticeboard.NoticeboardEditIDs", noticeboard_edit_ids
             )

@@ -29,9 +29,9 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "GlobalHeartbeat": {
             "type": "int",
-            "default": 1800,  # 30 minutes
-            "min": 1800,  # enforce minimum 30 minutes globally
-            "max": 86400,  # up to 24 hours
+            "default": 1800,
+            "min": 1800,
+            "max": 86400,
             "access": 4,
             "description": "Central-only: how often the bot checks for updates/pings (seconds). Acts as a floor for per-guild schedules.",
         },
@@ -96,7 +96,11 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
     },
     "Music": {
-        "Enabled": {"type": "bool", "default": False, "access": 0},
+        "Enabled": {
+            "type": "bool",
+            "default": False,
+            "access": 1,
+        },  # Force Disable for now, not ready.
         "DJRole": {"type": "role|null", "default": None, "access": 0},
         "DJRoleRequired": {"type": "bool", "default": True, "access": 0},
         "Volume": {
@@ -115,9 +119,9 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "MaxConcurrentInstances": {
             "type": "int",
-            "default": 5,
+            "default": 2,
             "min": 1,
-            "max": 50,
+            "max": 10,
             "access": 4,
             "description": "Central-only: maximum simultaneous music voice instances across all guilds.",
         },
@@ -352,8 +356,23 @@ def _ensure_schema_defaults(config_data: dict) -> Tuple[dict, bool]:
                 if coerced != cur[leaf]:
                     cur[leaf] = coerced
                     changed = True
-                # Range check
                 _within(meta, cur[leaf])
+                if path == "Noticeboard.UpdateInterval":
+                    try:
+                        hb = int(
+                            _get_by_path(
+                                config_data,
+                                "General.GlobalHeartbeat",
+                                SETTINGS_SCHEMA["General"]["GlobalHeartbeat"][
+                                    "default"
+                                ],
+                            )
+                        )
+                    except Exception:
+                        hb = SETTINGS_SCHEMA["General"]["GlobalHeartbeat"]["default"]
+                    if isinstance(cur[leaf], int) and cur[leaf] < hb:
+                        cur[leaf] = hb
+                        changed = True
             except Exception:
                 cur[leaf] = meta.get("default")
                 changed = True
@@ -379,36 +398,6 @@ def _get_by_path(obj: dict, path: str, default=None):
     return cur
 
 
-def edit_noticeboard_config(
-    guild_id,
-    noticeboard_channelid=None,
-    noticeboard_updateinterval=None,
-    PingDailyTime=None,
-):
-    config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
-    config_file_path = os.path.join(config_dir, f"{guild_id}.json")
-
-    if not os.path.exists(config_file_path):
-        raise FileNotFoundError(f"Config file for guild_id {guild_id} does not exist.")
-
-    with open(config_file_path, "r") as config_file:
-        config_data = json.load(config_file)
-
-    if noticeboard_channelid is not None:
-        _set_by_path(config_data, "Noticeboard.ChannelId", noticeboard_channelid)
-
-    if noticeboard_updateinterval is not None:
-        _set_by_path(
-            config_data, "Noticeboard.UpdateInterval", noticeboard_updateinterval
-        )
-
-    if PingDailyTime is not None:
-        _set_by_path(config_data, "Noticeboard.PingDailyTime", PingDailyTime)
-
-    with open(config_file_path, "w") as config_file:
-        json.dump(config_data, config_file, indent=4)
-
-
 def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
     config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")
@@ -419,13 +408,11 @@ def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
     with open(config_file_path, "r") as config_file:
         config_data = json.load(config_file)
 
-    # coerce based on schema if we know about this key
     try:
         coerced_value = coerce_value_for_path(key, value)
     except ValueError as e:
         raise
 
-    # Determine current/global heartbeat for dynamic floor
     try:
         current_hb = int(
             _get_by_path(
@@ -437,13 +424,12 @@ def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
     except Exception:
         current_hb = SETTINGS_SCHEMA["General"]["GlobalHeartbeat"]["default"]
 
-    # Enforce dynamic floor on Noticeboard.UpdateInterval
+    meta = get_setting_meta(key)
     if key == "Noticeboard.UpdateInterval" and isinstance(coerced_value, int):
         if coerced_value < current_hb:
             coerced_value = current_hb
 
     # Owner-based central propagation: if access is 3 or 4 and the actor is OWNER_ID
-    meta = get_setting_meta(key)
     owner_env = os.getenv("OWNER_ID")
     is_owner = owner_env is not None and str(actor_user_id) == str(owner_env)
     if meta and meta.get("access") in (3, 4) and is_owner:
@@ -458,7 +444,6 @@ def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
                     _set_by_path(cfg, key, coerced_value)
                 else:
                     cfg[key] = coerced_value
-                # If GlobalHeartbeat changed, bump all guilds' UpdateInterval up to the new floor
                 if key == "General.GlobalHeartbeat":
                     try:
                         new_hb = int(coerced_value)
@@ -467,9 +452,10 @@ def edit_json_file(guild_id, key, value, actor_user_id: int | None = None):
                             "default"
                         ]
                     nb_val = _get_by_path(cfg, "Noticeboard.UpdateInterval", None)
-                    if not isinstance(nb_val, int) or nb_val < new_hb:
+                    if isinstance(nb_val, int) and nb_val < new_hb:
                         _set_by_path(cfg, "Noticeboard.UpdateInterval", new_hb)
-                # Also ensure schema
+                    # normalize: if null, keep null; otherwise ensure >= new floor in defaults pass
+                # Also ensure schema (applies dynamic min normalization)
                 cfg, _ = _ensure_schema_defaults(cfg)
                 with open(fp, "w") as f:
                     json.dump(cfg, f, indent=4)
@@ -564,9 +550,8 @@ def json_get(guild_id):
     config_file_path = os.path.join(config_dir, f"{guild_id}.json")
     with open(config_file_path, "r") as config_file:
         data = json.load(config_file)
-
-    migrated, changed_schema = _ensure_schema_defaults(migrated)
-    if migrated is not data or changed_schema:
+    normalized, changed_schema = _ensure_schema_defaults(data)
+    if normalized is not data or changed_schema:
         with open(config_file_path, "w") as config_file:
-            json.dump(migrated, config_file, indent=4)
-    return migrated
+            json.dump(normalized, config_file, indent=4)
+    return normalized

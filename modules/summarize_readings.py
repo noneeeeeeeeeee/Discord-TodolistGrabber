@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Mapping, Any, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 
 def _ensure_tz(dt: datetime, tzinfo) -> datetime:
@@ -128,8 +129,10 @@ from bs4 import BeautifulSoup
 import google.generativeai as genai
 from datetime import datetime, timedelta
 
+
 _gemini_model = None
 _gemini_configured = False
+CACHE_DIR = Path(__file__).resolve().parents[1] / ".cache"
 
 
 def _get_gemini_model():
@@ -151,21 +154,124 @@ def _get_gemini_model():
     return _gemini_model
 
 
-def _clean_usccb_cache(cache_dir: Path, max_age_days: int = 3) -> None:
-    """
-    Remove cached USCCB files older than max_age_days.
-    """
+def _us_date_str(date_obj) -> str:
     try:
-        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
-        for p in cache_dir.glob("usccb_*.txt"):
-            try:
-                mtime = datetime.utcfromtimestamp(p.stat().st_mtime)
-                if mtime < cutoff:
-                    p.unlink(missing_ok=True)
-            except Exception:
-                continue
+        if hasattr(date_obj, "date"):
+            date_obj = date_obj.date()
+        # Example: "August 14, 2025"
+        return date_obj.strftime("%B %d, %Y")
+    except Exception:
+        return ""
+
+
+def _extract_text_for_date(raw_text: str, date_obj) -> str:
+    """
+    From a multi-day page dump, return only the section for the given date
+    by locating a heading like 'August 15, 2025' and slicing until the next date heading.
+    """
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return ""
+    lines = [ln.strip() for ln in raw_text.splitlines()]
+    date_pat = re.compile(r"^[A-Z][a-z]+ \d{1,2}, \d{4}$")
+    hdrs: list[tuple[int, str]] = [
+        (i, ln) for i, ln in enumerate(lines) if date_pat.match(ln)
+    ]
+    if not hdrs:
+        return raw_text
+    target = _us_date_str(date_obj)
+    start_idx = -1
+    for i, ln in hdrs:
+        if ln == target:
+            start_idx = i
+            break
+    if start_idx == -1:
+        return raw_text
+    end_idx = len(lines)
+    for i, _ in hdrs:
+        if i > start_idx:
+            end_idx = i
+            break
+    sliced = "\n".join(lines[start_idx:end_idx]).strip()
+    return sliced or raw_text
+
+
+def _looks_like_daily_readings(text: str) -> bool:
+    """
+    Heuristic: must contain at least one of 'Reading', 'Gospel', or 'Responsorial Psalm'
+    and be sufficiently long.
+    """
+    if not isinstance(text, str):
+        return False
+    t = text.lower()
+    markers = ["reading 1", "reading i", "gospel", "responsorial psalm"]
+    return any(m in t for m in markers) and len(text) > 200
+
+
+def _summary_seems_valid(summary: dict, expect_date=None) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    para = str(summary.get("summary_paragraph") or "").strip()
+    quote = str(summary.get("motivational_quote") or "")
+    if len(para) < 50:
+        return False
+    if "No motivational quote" in quote:
+        return False
+    # Optional sanity check on date field; do not strictly enforce
+    try:
+        if expect_date:
+            ds = str(summary.get("date") or "")
+            if ds:
+                _ = expect_date.strftime("%B")
     except Exception:
         pass
+    return True
+
+
+def purge_usccb_cache(max_age_days: int = 2) -> None:
+    """
+    Remove cached USCCB text and JSON summary files older than max_age_days.
+    """
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+        patterns = ["usccb_*.txt", "usccb_summary_*.json"]
+        for pat in patterns:
+            for p in CACHE_DIR.glob(pat):
+                try:
+                    mtime = datetime.utcfromtimestamp(p.stat().st_mtime)
+                    if mtime < cutoff:
+                        p.unlink(missing_ok=True)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+
+def _summary_cache_file(date_obj) -> Path:
+    if hasattr(date_obj, "date"):
+        date_obj = date_obj.date()
+    return CACHE_DIR / f"usccb_summary_{date_obj.isoformat()}.json"
+
+
+def load_usccb_summary_from_cache(date_obj=None) -> Optional[dict]:
+    """
+    Load the JSON summary for the given date (or today if None) from cache.
+    """
+    from datetime import date as _date
+
+    if date_obj is None:
+        date_obj = _date.today()
+    if hasattr(date_obj, "date"):
+        date_obj = date_obj.date()
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        fp = _summary_cache_file(date_obj)
+        if fp.exists():
+            with open(fp, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return None
+    return None
 
 
 async def fetch_usccb_daily_readings(date=None) -> Optional[str]:
@@ -184,17 +290,16 @@ async def fetch_usccb_daily_readings(date=None) -> Optional[str]:
     if hasattr(date, "date"):
         date = date.date()
 
-    # Build URL using DDMMYY format as requested
-    url_date = date.strftime("%d%m%y")
+    # Build URL using MMDDYY format as requested
+    url_date = date.strftime("%m%d%y")
     url = f"https://bible.usccb.org/bible/readings/{url_date}.cfm"
 
     # Prepare cache location (project root .cache)
-    cache_dir = Path(__file__).resolve().parents[1] / ".cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"usccb_{date.isoformat()}.txt"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = CACHE_DIR / f"usccb_{date.isoformat()}.txt"
 
     # Cleanup old cache files (older than 3 days)
-    _clean_usccb_cache(cache_dir, max_age_days=3)
+    purge_usccb_cache(max_age_days=2)
 
     # Return cached if present
     if cache_file.exists():
@@ -281,12 +386,24 @@ def _strip_code_fences(text: str) -> str:
     return t.strip()
 
 
-async def summarize_usccb_readings(readings) -> Optional[dict]:
+async def summarize_usccb_readings(readings, date=None) -> Optional[dict]:
     """
     Ask Gemini to summarize readings into JSON:
     { link, title, date, motivational_quote, summary_paragraph }
     Returns dict on success, or None on failure.
     """
+    # Resolve date for cache naming
+    from datetime import date as _date
+
+    if date is None:
+        date = _date.today()
+    if hasattr(date, "date"):
+        date = date.date()
+    # Try cached JSON summary first
+    cached = load_usccb_summary_from_cache(date)
+    if isinstance(cached, dict):
+        return cached
+
     model = _get_gemini_model()
     if model is None:
         return None
@@ -300,8 +417,68 @@ async def summarize_usccb_readings(readings) -> Optional[dict]:
         resp = model.generate_content(prompt)
         text = resp.text or ""
         text = _strip_code_fences(text)
-        print(f"Gemini response: {text}")
-        return json.loads(text)
+        data = json.loads(text)
+        # Save JSON summary cache for future reuse
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(_summary_cache_file(date), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return data
     except Exception:
-        print("failed")
         return None
+
+
+# Backward-compatible alias expected by callers
+async def summarize_usccb_daily_readings(readings, date=None) -> Optional[dict]:
+    return await summarize_usccb_readings(readings, date=date)
+
+
+async def get_usccb_daily_readings_summary(
+    tz_name: str | None = None,
+) -> Optional[dict]:
+    """
+    High-level orchestrator:
+    - Purge old caches (>= 2 days)
+    - Return today's JSON summary from cache if valid
+    - Else fetch today's page, slice to today's section, summarize with Gemini, cache JSON, and return
+    - Else fallback to yesterday's cached/derived summary
+    - Return None if nothing valid is available
+    This function guarantees at most one website fetch per day because it honors the JSON cache.
+    """
+    try:
+        purge_usccb_cache(2)
+    except Exception:
+        pass
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else None
+    except Exception:
+        tz = None
+    now = datetime.now(tz or datetime.now().astimezone().tzinfo)
+    today = now.date()
+    # 1) Try today's cached JSON summary
+    cached = load_usccb_summary_from_cache(today)
+    if _summary_seems_valid(cached or {}, expect_date=today):
+        return cached
+    # 2) Fetch today's readings and summarize if content looks valid
+    text = await fetch_usccb_daily_readings(today)
+    if isinstance(text, str) and text.strip():
+        sliced = _extract_text_for_date(text, today)
+        if _looks_like_daily_readings(sliced):
+            summary = await summarize_usccb_readings(sliced, date=today)
+            if _summary_seems_valid(summary or {}, expect_date=today):
+                return summary
+    # 3) Fallback to yesterday
+    yday = today - timedelta(days=1)
+    y_cached = load_usccb_summary_from_cache(yday)
+    if _summary_seems_valid(y_cached or {}, expect_date=yday):
+        return y_cached
+    y_text = await fetch_usccb_daily_readings(yday)
+    if isinstance(y_text, str) and y_text.strip():
+        y_sliced = _extract_text_for_date(y_text, yday)
+        if _looks_like_daily_readings(y_sliced):
+            y_summary = await summarize_usccb_readings(y_sliced, date=yday)
+            if _summary_seems_valid(y_summary or {}, expect_date=yday):
+                return y_summary
+    return None
