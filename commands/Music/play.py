@@ -53,6 +53,40 @@ class PlayCommands(commands.Cog):
                 added += 1
         await ctx.send(f"Added {added} recent track(s) to the queue.")
 
+    @commands.hybrid_command(
+        name="recommend",
+        description="Suggest related tracks based on what you're playing.",
+    )
+    async def recommend(self, ctx: commands.Context, count: Optional[int] = 3):
+        player = self._get_player()
+        if not player:
+            await ctx.send("Player backend not available.")
+            return
+
+        if count is None:
+            count = 3
+        try:
+            count = max(1, min(10, int(count)))
+        except (TypeError, ValueError):
+            count = 3
+
+        suggestions = await player.recommend(ctx.guild, max_rec=count)
+        if not suggestions:
+            await ctx.send("No recommendations available right now.")
+            return
+
+        lines = [
+            f"{idx+1}. [{rec['title']}]({rec['url']})"
+            for idx, rec in enumerate(suggestions)
+        ]
+        embed = discord.Embed(
+            title="Recommended Tracks",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text="Use /p <url> to queue a suggestion.")
+        await ctx.send(embed=embed)
+
 
 async def setup(bot):
     await bot.add_cog(PlayCommands(bot))

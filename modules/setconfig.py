@@ -9,10 +9,10 @@ from datetime import datetime
 # Central settings schema with identifiers, types, defaults, and per-setting access control
 # access values:
 # 0: Editable
-# 1: Not Editable (visible)
-# 2: Hidden (non editable in any server)
-# 3: Central Server only Editable (visible to all) (Bot Owner Can only Edit)
-# 4: Central Server only Editable and Hidden to Non-Central Servers (Bot Owner Can only Edit)
+# 1: Not Editable (visible). Usually for toggling modules on/off, for beta and unstable features access. No-one can edit, even bot owner.
+# 2: Hidden (non editable in any server even for bot owner). Usually for keeping track of last run timestamps etc.
+# 3: Bot Owner Can only Edit (visible to all)
+# 4: Bot Owner Can only Edit and Hidden to the Rest of the Users (only visible and editable to bot owner)
 SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
     "General": {
         "DefaultAdmin": {
@@ -74,7 +74,7 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "type": "bool",
             "default": True,
             "access": 0,
-            "description": "If true, follow MAIN_GUILD noticeboard config",
+            "description": "If true, follow MAIN_GUILD noticeboard module config",
         },
         "NoticeboardEditIDs": {"type": "list[int]", "default": [], "access": 2},
         "PingMessageEditID": {"type": "int|null", "default": None, "access": 2},
@@ -100,7 +100,7 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "type": "bool",
             "default": False,
             "access": 1,
-        },  # Force Disable for now, not ready.
+        },
         "DJRole": {"type": "role|null", "default": None, "access": 0},
         "DJRoleRequired": {"type": "bool", "default": True, "access": 0},
         "Volume": {
@@ -109,6 +109,12 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "min": 0.0,
             "max": 1.0,
             "access": 0,
+        },
+        "RememberLastVolume": {
+            "type": "bool",
+            "default": False,
+            "access": 0,
+            "description": "If true, the last used volume will persist across sessions.",
         },
         "QueueLimit": {
             "type": "int",
@@ -143,11 +149,71 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "min": 10,
             "max": 43200,
             "access": 3,
+            "description": "Maximum track duration in seconds. Set to 0 to disable.",
         },
         "RemoveNonSongsUsingSponsorBlock": {
             "type": "bool",
             "default": True,
             "access": 0,
+            "description": "If true, segments like intros, outros, and ads will be auto skipped using SponsorBlock.",
+        },
+        "SponsorBlockEnabled": {
+            "type": "bool",
+            "default": True,
+            "access": 0,
+            "description": "Enable Lavalink SponsorBlock plugin integration.",
+        },
+        "SponsorBlockCategories": {
+            "type": "list[str]",
+            "default": [
+                "sponsor",
+                "selfpromo",
+                "interaction",
+                "intro",
+                "outro",
+            ],
+            "access": 0,
+            "choices": [
+                "sponsor",
+                "selfpromo",
+                "interaction",
+                "intro",
+                "outro",
+                "preview",
+                "filler",
+                "music_offtopic",
+            ],
+            "description": "SponsorBlock categories to skip when enabled.",
+        },
+        "AutoPlay": {
+            "type": "bool",
+            "default": False,
+            "access": 0,
+            "description": "If enabled, related tracks are queued automatically when the queue ends.",
+        },
+        "AutoDisconnectSeconds": {
+            "type": "int",
+            "default": 300,
+            "min": 30,
+            "max": 7200,
+            "access": 0,
+            "description": "How long to stay connected with no playback before leaving voice.",
+        },
+        "VoteSkipPercent": {
+            "type": "int",
+            "default": 60,
+            "min": 0,
+            "max": 100,
+            "access": 0,
+            "description": "Percentage of non-bot listeners required to voteskip.",
+        },
+        "VoteSkipFloor": {
+            "type": "int",
+            "default": 2,
+            "min": 1,
+            "max": 10,
+            "access": 0,
+            "description": "Minimum number of voters required when voteskip is active.",
         },
         "PlaylistAddLimit": {
             "type": "int",
@@ -155,14 +221,20 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "min": 1,
             "max": 1000,
             "access": 3,
+            "description": "Maximum number of tracks that can be added from a playlist at once. It will add the first n tracks in the playlist.",
         },
     },
     "GoogleClassroom": {
-        "Enabled": {"type": "bool", "default": False, "access": 1},
+        "Enabled": {
+            "type": "bool",
+            "default": False,
+            "access": 1,
+            "description": "Enable Google Classroom module (Not ready, not even implemented.)",
+        },
         "DefaultChannelId": {
             "type": "channel|Default",
             "default": "Default",
-            "access": 0,
+            "access": 2,
         },
     },
 }

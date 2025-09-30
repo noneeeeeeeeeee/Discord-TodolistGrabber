@@ -3,6 +3,8 @@ from discord.ext import commands
 from collections import deque
 import random
 
+from typing import Optional
+
 
 class QueueCommands(commands.Cog):
     def __init__(self, bot):
@@ -14,15 +16,65 @@ class QueueCommands(commands.Cog):
         if not player:
             await ctx.send("Player backend not available.")
             return
-        q = list(player.queues.get(ctx.guild.id, []))
-        if not q:
-            await ctx.send("Queue is empty.")
+
+        current = player._current_entries.get(ctx.guild.id)
+        upcoming = list(player.queues.get(ctx.guild.id, []))
+
+        if not current and not upcoming:
+            await ctx.send("Nothing is playing or queued.")
             return
-        lines = [
-            f"{i+1}. {it.get('title')} — <@{it.get('requester')}>"
-            for i, it in enumerate(q[:25])
-        ]
-        await ctx.send(embed=discord.Embed(title="Queue", description="\n".join(lines)))
+
+        embed = discord.Embed(title="Music Queue", color=discord.Color.blurple())
+
+        if current:
+            embed.add_field(
+                name="Now Playing",
+                value=self._format_entry(current, None),
+                inline=False,
+            )
+
+        if upcoming:
+            lines = [
+                self._format_entry(entry, idx)
+                for idx, entry in enumerate(upcoming[:25], start=1)
+            ]
+            embed.add_field(
+                name=f"Up Next ({min(len(upcoming), 25)}/{len(upcoming)})",
+                value="\n".join(lines),
+                inline=False,
+            )
+            if len(upcoming) > 25:
+                embed.set_footer(text=f"…and {len(upcoming) - 25} more item(s) queued.")
+        else:
+            embed.add_field(
+                name="Up Next",
+                value="Queue empty",
+                inline=False,
+            )
+
+        repeat = player.repeat_mode.get(ctx.guild.id, "none").title()
+        embed.add_field(name="Repeat Mode", value=repeat, inline=True)
+
+        shuffle = "Enabled" if player.shuffle_flags.get(ctx.guild.id) else "Disabled"
+        embed.add_field(name="Shuffle", value=shuffle, inline=True)
+
+        await ctx.send(embed=embed)
+
+    def _format_entry(self, entry: dict, index: Optional[int]) -> str:
+        title = entry.get("title") or "Unknown"
+        uri = entry.get("uri")
+        if uri:
+            title = f"[{title}]({uri})"
+
+        requester = entry.get("requester")
+        if requester:
+            who = f"<@{requester}>"
+        else:
+            who = "AutoPlay"
+
+        marker = "AUTO" if entry.get("autoplay") else "REQ"
+        prefix = f"{index}. " if index is not None else ""
+        return f"{prefix}[{marker}] {title} — {who}"
 
     @commands.hybrid_command(
         name="shuffle",
