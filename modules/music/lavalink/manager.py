@@ -11,7 +11,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Optional, Tuple
+from typing import Any, ClassVar, Optional, Tuple
 
 import aiohttp
 
@@ -28,9 +28,11 @@ GITHUB_API = "https://api.github.com"
 LAVALINK_REPO = "lavalink-devs/Lavalink"
 YOUTUBE_PLUGIN_COORD = "dev.lavalink.youtube:youtube-plugin"
 SPONSORBLOCK_PLUGIN_COORD = "com.github.topi314.sponsorblock:sponsorblock-plugin"
+LAVASRC_PLUGIN_COORD = "com.github.topi314.lavasrc:lavasrc-plugin"
 DEFAULT_LAVALINK_VERSION = "4.1.1"
 DEFAULT_YOUTUBE_PLUGIN_VERSION = "1.13.5"
 DEFAULT_SPONSORBLOCK_PLUGIN_VERSION = "3.0.1"
+DEFAULT_LAVASRC_PLUGIN_VERSION = "4.8.1"
 LAVALINK_MAJOR = "4"
 
 HEADERS = {
@@ -121,7 +123,96 @@ class LavalinkManager:
             version, url = await self._resolve_lavalink_release(session)
             await self._download_if_needed(session, version, url)
 
-        await self._ensure_config(config)
+            youtube_version = await self._resolve_plugin_version(
+                session,
+                repo="lavalink-devs/youtube-source",
+                default=DEFAULT_YOUTUBE_PLUGIN_VERSION,
+                env_var="LAVALINK_YOUTUBE_PLUGIN_VERSION",
+            )
+            sponsor_version = await self._resolve_plugin_version(
+                session,
+                repo="topi314/SponsorBlock-Plugin",
+                default=DEFAULT_SPONSORBLOCK_PLUGIN_VERSION,
+                env_var="LAVALINK_SPONSORBLOCK_PLUGIN_VERSION",
+            )
+            lavasrc_version = await self._resolve_plugin_version(
+                session,
+                repo="topi314/LavaSrc",
+                default=DEFAULT_LAVASRC_PLUGIN_VERSION,
+                env_var="LAVASRC_PLUGIN_VERSION",
+            )
+
+        youtube_version = youtube_version or DEFAULT_YOUTUBE_PLUGIN_VERSION
+        sponsor_version = sponsor_version or DEFAULT_SPONSORBLOCK_PLUGIN_VERSION
+        lavasrc_version = lavasrc_version or DEFAULT_LAVASRC_PLUGIN_VERSION
+
+        self._purge_outdated_plugins(
+            {
+                "youtube": youtube_version,
+                "sponsorblock": sponsor_version,
+                "lavasrc": lavasrc_version,
+            }
+        )
+
+        await self._ensure_config(
+            config,
+            youtube_version,
+            sponsor_version,
+            lavasrc_version,
+        )
+
+    def _purge_outdated_plugins(self, expected_versions: dict[str, str]) -> None:
+        if not self.plugins_dir.exists():
+            return
+
+        patterns = {
+            "youtube": "youtube-plugin",
+            "sponsorblock": "sponsorblock-plugin",
+            "lavasrc": "lavasrc-plugin",
+        }
+
+        for key, prefix in patterns.items():
+            expected_version = expected_versions.get(key)
+            if not expected_version:
+                continue
+            expected_name = f"{prefix}-{expected_version}.jar"
+            for plugin_file in self.plugins_dir.glob(f"{prefix}-*.jar"):
+                if plugin_file.name != expected_name:
+                    try:
+                        plugin_file.unlink(missing_ok=True)  # type: ignore[call-arg]
+                    except TypeError:  # Python <3.8 compatibility fallback
+                        try:
+                            if plugin_file.exists():
+                                plugin_file.unlink()
+                        except Exception:
+                            continue
+
+    async def _resolve_plugin_version(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        repo: str,
+        default: str,
+        env_var: str,
+    ) -> str:
+        override = os.getenv(env_var)
+        if override:
+            return override
+
+        api_url = f"{GITHUB_API}/repos/{repo}/releases/latest"
+        try:
+            async with session.get(api_url) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"GitHub API returned {resp.status}")
+                payload = await resp.json()
+        except Exception:
+            return default
+
+        tag = str(payload.get("tag_name") or payload.get("name") or "").strip()
+        if not tag:
+            return default
+        normalized = tag.lstrip("vV") or tag
+        return normalized or default
 
     async def _resolve_lavalink_release(
         self, session: aiohttp.ClientSession
@@ -172,13 +263,64 @@ class LavalinkManager:
         tmp_path.replace(self.jar_path)
         self._write_version({"version": version, "download_url": url})
 
-    async def _ensure_config(self, config: LavalinkConfig) -> None:
-        youtube_version = os.getenv(
-            "LAVALINK_YOUTUBE_PLUGIN_VERSION", DEFAULT_YOUTUBE_PLUGIN_VERSION
+    async def _ensure_config(
+        self,
+        config: LavalinkConfig,
+        youtube_version: str,
+        sponsor_version: str,
+        lavasrc_version: str,
+    ) -> None:
+        spotify_client_id = os.getenv("LAVASRC_SPOTIFY_CLIENT_ID")
+        spotify_client_secret = os.getenv("LAVASRC_SPOTIFY_CLIENT_SECRET")
+        spotify_sp_dc = os.getenv("LAVASRC_SPOTIFY_SP_DC")
+        spotify_country = os.getenv("LAVASRC_SPOTIFY_COUNTRY", "US")
+        prefer_anonymous_raw = os.getenv("LAVASRC_SPOTIFY_PREFER_ANON")
+        prefer_anonymous = (
+            prefer_anonymous_raw.lower() in ("1", "true", "yes")
+            if isinstance(prefer_anonymous_raw, str)
+            else False
         )
-        sponsor_version = os.getenv(
-            "LAVALINK_SPONSORBLOCK_PLUGIN_VERSION", DEFAULT_SPONSORBLOCK_PLUGIN_VERSION
-        )
+
+        ytdlp_path = os.getenv("LAVASRC_YTDLP_PATH", "yt-dlp")
+
+        lavasrc_config: dict[str, Any] = {
+            "providers": [
+                'ytsearch:"%ISRC%"',
+                "ytsearch:%QUERY%",
+            ],
+            "sources": {
+                "spotify": True,
+                "applemusic": False,
+                "deezer": False,
+                "yandexmusic": False,
+                "flowerytts": False,
+                "youtube": False,
+                "vkmusic": False,
+                "tidal": False,
+                "qobuz": False,
+                "ytdlp": True,
+                "jiosaavn": False,
+            },
+        }
+
+        spotify_section: dict[str, Any] = {"countryCode": spotify_country}
+        if spotify_client_id:
+            spotify_section["clientId"] = spotify_client_id
+        if spotify_client_secret:
+            spotify_section["clientSecret"] = spotify_client_secret
+        if spotify_sp_dc:
+            spotify_section["spDc"] = spotify_sp_dc
+        if prefer_anonymous:
+            spotify_section["preferAnonymousToken"] = True
+
+        if spotify_section:
+            lavasrc_config["spotify"] = spotify_section
+
+        if ytdlp_path:
+            lavasrc_config["ytdlp"] = {
+                "path": ytdlp_path,
+                "searchLimit": 10,
+            }
 
         yaml_payload = {
             "server": {
@@ -195,6 +337,11 @@ class LavalinkManager:
                     },
                     {
                         "dependency": f"{SPONSORBLOCK_PLUGIN_COORD}:{sponsor_version}",
+                        "snapshot": False,
+                    },
+                    {
+                        "dependency": f"{LAVASRC_PLUGIN_COORD}:{lavasrc_version}",
+                        "repository": "https://maven.lavalink.dev/releases",
                         "snapshot": False,
                     },
                 ],
@@ -231,7 +378,10 @@ class LavalinkManager:
             },
             "logging": {
                 "file": {"path": "./logs/"},
-                "level": {"root": "INFO", "lavalink": "INFO"},
+                "level": {"root": "DEBUG", "lavalink": "DEBUG"},
+            },
+            "plugins": {
+                "lavasrc": lavasrc_config,
             },
         }
 
@@ -274,6 +424,7 @@ class LavalinkManager:
 
         try:
             self._process = subprocess.Popen(argv, **start_kwargs)
+            print(f"[Lavalink] Launched subprocess (PID={self._process.pid})")
             return True
         except FileNotFoundError:
             print(
@@ -319,6 +470,7 @@ class LavalinkManager:
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._is_port_open(host, port):
+                print(f"[Lavalink] Port {host}:{port} is now ready")
                 return True
             await asyncio.sleep(1.0)
         return False
@@ -392,6 +544,5 @@ async def shutdown_local_node() -> None:
 
 
 def is_local_node_managed() -> bool:
-    """Helper to check if the Lavalink process is managed by this manager."""
 
     return LavalinkManager.instance().is_managed_process()

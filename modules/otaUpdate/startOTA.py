@@ -421,12 +421,12 @@ def update_dependencies():
                 os.path.join(ROOT_DIR, "requirements.txt"),
             ]
         )
-        # Ensure wavelink is available (Lavalink client)
+        # Ensure Pomice is available (Lavalink client)
         try:
-            import wavelink  # noqa: F401
+            import pomice  # noqa: F401
         except Exception:
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "-U", "wavelink>=2.6.0"]
+                [sys.executable, "-m", "pip", "install", "-U", "pomice>=2.9.2"]
             )
         print_progress("Dependencies", "Dependencies updated successfully.")
     except subprocess.CalledProcessError as e:

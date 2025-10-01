@@ -5,5 +5,5 @@ google-generativeai
 PyNaCl
 beautifulsoup4
 tzdata
-wavelink>=3.2,<4.0
+pomice>=2.9.2,<3.0
 aiohttp

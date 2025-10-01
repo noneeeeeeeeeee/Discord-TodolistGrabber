@@ -1,6 +1,8 @@
 import discord
 from discord.ext import commands
 
+from modules.music.music_player import is_voice_playing
+
 
 class SkipCommands(commands.Cog):
     def __init__(self, bot):
@@ -22,17 +24,46 @@ class SkipCommands(commands.Cog):
         )
 
     @commands.hybrid_command(
-        name="skip", description="Skip the current track (DJ or voteskip)."
+        name="skip",
+        description="Skip current track or jump to queue position.",
+        aliases=["s"],
     )
-    async def skip(self, ctx: commands.Context):
+    async def skip(self, ctx: commands.Context, index: int = None):
         player = self.bot.get_cog("MusicPlayer")
         if not player:
             await ctx.send("Player backend missing.")
             return
 
+        # Handle skipto functionality if index provided
+        if index is not None:
+            if not self._is_dj(ctx):
+                await ctx.send(":x: DJ/Admin required to skip to specific position.")
+                return
+
+            q = player.queues.get(ctx.guild.id)
+            if not q:
+                await ctx.send(":x: Queue is empty.")
+                return
+
+            if index < 1 or index > len(q):
+                await ctx.send(f":x: Invalid index. Queue has {len(q)} tracks.")
+                return
+
+            # Skip to index by removing all tracks before it
+            for _ in range(index - 1):
+                q.popleft()
+
+            vc = ctx.guild.voice_client
+            if vc and is_voice_playing(vc):
+                vc.stop()
+
+            await ctx.send(f"Skipped to position {index}.")
+            return
+
+        # Regular skip (no index)
         if self._is_dj(ctx):
             vc = ctx.guild.voice_client
-            if vc and vc.is_playing():
+            if vc and is_voice_playing(vc):
                 vc.stop()
                 await ctx.send("Skipped by DJ.")
                 return
@@ -47,16 +78,31 @@ class SkipCommands(commands.Cog):
         # voteskip
         added, cur, needed = await player.handle_vote_skip(ctx.guild, ctx.author.id)
         if not added:
-            await ctx.send("You already voted to skip.")
+            await ctx.send("You already voted to skip this track.")
             return
+
+        remaining = max(0, needed - cur)
         if cur >= needed:
             vc = ctx.guild.voice_client
-            if vc and vc.is_playing():
+            if vc and is_voice_playing(vc):
                 vc.stop()
             player.voteskip[ctx.guild.id].clear()
-            await ctx.send("Vote threshold reached. Skipping track.")
+            await ctx.send(
+                embed=discord.Embed(
+                    title="Skip Vote",
+                    description="Threshold reached – skipping now!",
+                    color=discord.Color.green(),
+                )
+            )
         else:
-            await ctx.send(f"Voted to skip ({cur}/{needed}).")
+            status = f"{cur}/{needed} votes. {remaining} more required to skip."
+            await ctx.send(
+                embed=discord.Embed(
+                    title="Skip Vote",
+                    description=status,
+                    color=discord.Color.orange(),
+                )
+            )
 
 
 async def setup(bot):

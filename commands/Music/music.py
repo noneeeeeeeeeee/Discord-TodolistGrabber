@@ -122,10 +122,39 @@ class MusicSettingsView(discord.ui.View):
             inline=True,
         )
 
-        auto_disconnect = self.state.get("AutoDisconnectSeconds", 300)
+        recommend_mode = str(self.state.get("RecommendationMode", "list")).title()
+        try:
+            recommend_count = int(self.state.get("RecommendationMaxResults", 5) or 5)
+        except (TypeError, ValueError):
+            recommend_count = 5
+        try:
+            recommend_limit = int(self.state.get("RecommendationUpperLimit", 25) or 25)
+        except (TypeError, ValueError):
+            recommend_limit = 25
+        recommend_count = max(1, min(recommend_limit, recommend_count))
+        embed.add_field(
+            name="Recommendations",
+            value=(
+                f"Mode: {recommend_mode}\nDefault count: {recommend_count}\n"
+                f"Owner max: {recommend_limit}"
+            ),
+            inline=True,
+        )
+
+        try:
+            idle_seconds = int(self.state.get("AutoDisconnectIdleSeconds", 300) or 300)
+        except (TypeError, ValueError):
+            idle_seconds = 300
+        try:
+            empty_seconds = int(
+                self.state.get("AutoDisconnectEmptySeconds", 180) or 180
+            )
+        except (TypeError, ValueError):
+            empty_seconds = 180
+
         embed.add_field(
             name="Auto Disconnect",
-            value=f"{auto_disconnect}s of inactivity",
+            value=f"Idle: {idle_seconds}s • Empty: {empty_seconds}s",
             inline=True,
         )
 

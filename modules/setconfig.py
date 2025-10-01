@@ -191,13 +191,52 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "access": 0,
             "description": "If enabled, related tracks are queued automatically when the queue ends.",
         },
+        "RecommendationMode": {
+            "type": "str",
+            "default": "list",
+            "choices": ["list", "queue"],
+            "access": 0,
+            "description": "How /recommend behaves. 'list' shows suggestions, 'queue' adds them directly.",
+        },
+        "RecommendationMaxResults": {
+            "type": "int",
+            "default": 5,
+            "min": 1,
+            "max": 50,
+            "access": 0,
+            "description": "Default number of tracks returned or queued by /recommend (bounded by RecommendationUpperLimit).",
+        },
+        "RecommendationUpperLimit": {
+            "type": "int",
+            "default": 25,
+            "min": 1,
+            "max": 100,
+            "access": 4,
+            "description": "Bot owner only: maximum allowed value for /recommend counts.",
+        },
         "AutoDisconnectSeconds": {
             "type": "int",
             "default": 300,
             "min": 30,
             "max": 7200,
-            "access": 0,
-            "description": "How long to stay connected with no playback before leaving voice.",
+            "access": 4,
+            "description": "Deprecated legacy idle timeout. Use AutoDisconnectIdleSeconds / AutoDisconnectEmptySeconds.",
+        },
+        "AutoDisconnectIdleSeconds": {
+            "type": "int",
+            "default": 300,
+            "min": 30,
+            "max": 7200,
+            "access": 4,
+            "description": "Bot owner only: seconds before disconnect when idle (no playback and empty queue).",
+        },
+        "AutoDisconnectEmptySeconds": {
+            "type": "int",
+            "default": 180,
+            "min": 30,
+            "max": 7200,
+            "access": 4,
+            "description": "Bot owner only: seconds before disconnect when the voice channel becomes empty.",
         },
         "VoteSkipPercent": {
             "type": "int",
@@ -429,6 +468,30 @@ def _ensure_schema_defaults(config_data: dict) -> Tuple[dict, bool]:
                     cur[leaf] = coerced
                     changed = True
                 _within(meta, cur[leaf])
+                if path == "Music.RecommendationMaxResults":
+                    try:
+                        limit = int(
+                            _get_by_path(
+                                config_data,
+                                "Music.RecommendationUpperLimit",
+                                SETTINGS_SCHEMA["Music"]["RecommendationUpperLimit"][
+                                    "default"
+                                ],
+                            )
+                        )
+                    except Exception:
+                        limit = SETTINGS_SCHEMA["Music"]["RecommendationUpperLimit"][
+                            "default"
+                        ]
+                    try:
+                        normalized_val = max(1, min(limit, int(cur[leaf])))
+                    except Exception:
+                        normalized_val = SETTINGS_SCHEMA["Music"][
+                            "RecommendationMaxResults"
+                        ]["default"]
+                    if normalized_val != cur[leaf]:
+                        cur[leaf] = normalized_val
+                        changed = True
                 if path == "Noticeboard.UpdateInterval":
                     try:
                         hb = int(

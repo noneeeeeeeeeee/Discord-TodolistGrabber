@@ -121,9 +121,23 @@ class NoticeAutoUpdate(commands.Cog):
             print(f"Error getting config for guild {guild_id}: {e}")
             return
 
-        nb_cfg = config.get("Noticeboard", {})
-        noticeboard_channel_id = nb_cfg.get("ChannelId", "Default")
-        noticeboard_edit_ids = nb_cfg.get("NoticeboardEditIDs", [])
+        original_nb_cfg = config.get("Noticeboard", {})
+        nb_cfg = original_nb_cfg
+        if original_nb_cfg.get("FollowMain") and MAIN_GUILD:
+            try:
+                main_cfg = json_get(int(MAIN_GUILD))
+                nb_cfg = main_cfg.get("Noticeboard", nb_cfg)
+            except Exception:
+                pass
+
+        if not nb_cfg.get("Enabled", True):
+            self._dbg(f"[NB] Disabled for guild={guild_id}; skipping update")
+            return
+
+        noticeboard_channel_id = nb_cfg.get(
+            "ChannelId", original_nb_cfg.get("ChannelId", "Default")
+        )
+        noticeboard_edit_ids = original_nb_cfg.get("NoticeboardEditIDs", [])
 
         if noticeboard_channel_id in ("Default", None, "null"):
             self._dbg(
@@ -304,6 +318,12 @@ class NoticeAutoUpdate(commands.Cog):
                     except Exception:
                         pass
 
+                if not nb_cfg.get("Enabled", True):
+                    self._dbg(
+                        f"[HB] Noticeboard disabled for guild={guild.id}; skipping tick"
+                    )
+                    continue
+
                 interval = self._effective_interval(nb_cfg)
 
                 if not original_nb_cfg.get("FollowMain"):
@@ -357,6 +377,8 @@ class NoticeAutoUpdate(commands.Cog):
                         nb_cfg = main_cfg.get("Noticeboard", nb_cfg)
                     except Exception:
                         pass
+                if not nb_cfg.get("Enabled", True):
+                    continue
             except Exception as e:
                 self._dbg(f"[HB] Ping tick: config error guild={guild_id}: {e}")
                 continue

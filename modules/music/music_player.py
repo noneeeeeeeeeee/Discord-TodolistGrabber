@@ -3,7 +3,10 @@ import asyncio
 import time
 import math
 import logging
-from typing import Dict, Any, Optional, List
+import json
+import random
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
 from collections import defaultdict, deque
 
 import aiohttp
@@ -11,7 +14,8 @@ import discord
 from discord.ext import commands, tasks
 from modules.setconfig import json_get
 
-import wavelink
+import pomice
+from pomice import events as pomice_events
 from modules.music.lavalink.manager import (
     ensure_local_node,
     shutdown_local_node,
@@ -19,6 +23,52 @@ from modules.music.lavalink.manager import (
     DEFAULT_YOUTUBE_PLUGIN_VERSION,
     DEFAULT_SPONSORBLOCK_PLUGIN_VERSION,
 )
+
+# -- Pomice compatibility shims -------------------------------------------------
+try:  # pragma: no cover - defensive
+    _base_event = getattr(pomice_events, "PomiceEvent", None)
+    if _base_event is not None:
+        if not hasattr(pomice_events, "SegmentsLoaded"):
+
+            class SegmentsLoaded(_base_event):
+                """Compatibility event for Lavalink SponsorBlock segments."""
+
+                name = "segments_loaded"
+                __slots__ = ("player", "data", "segments")
+
+                def __init__(self, data, player):
+                    self.player = player
+                    self.data = data
+                    self.segments = (
+                        data.get("segments") if isinstance(data, dict) else None
+                    )
+                    self.handler_args = (self.player, self.segments)
+
+            pomice_events.SegmentsLoaded = SegmentsLoaded
+
+        if not hasattr(pomice_events, "SegmentSkipped"):
+
+            class SegmentSkipped(_base_event):
+                """Compatibility event for Lavalink SponsorBlock segment skip."""
+
+                name = "segment_skipped"
+                __slots__ = ("player", "data", "segment", "category")
+
+                def __init__(self, data, player):
+                    self.player = player
+                    self.data = data
+                    payload = data.get("segment") if isinstance(data, dict) else None
+                    if isinstance(payload, dict):
+                        self.segment = payload
+                        self.category = payload.get("category")
+                    else:
+                        self.segment = payload
+                        self.category = None
+                    self.handler_args = (self.player, self.segment, self.category)
+
+            pomice_events.SegmentSkipped = SegmentSkipped
+except Exception:
+    pass
 
 LOG = logging.getLogger(__name__)
 
@@ -50,9 +100,33 @@ NON_SONG_SEGMENTS = {"intro", "outro", "preview", "filler", "music_offtopic"}
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
 
 
+def _voice_flag(vc: Any, attr: str) -> bool:
+    if vc is None:
+        return False
+    value = getattr(vc, attr, None)
+    if callable(value):
+        try:
+            value = value()
+        except TypeError:
+            pass
+    return bool(value)
+
+
+def is_voice_connected(vc: Any) -> bool:
+    return _voice_flag(vc, "is_connected")
+
+
+def is_voice_playing(vc: Any) -> bool:
+    return _voice_flag(vc, "is_playing")
+
+
+def is_voice_paused(vc: Any) -> bool:
+    return _voice_flag(vc, "is_paused")
+
+
 class MusicPlayer(commands.Cog):
     """
-    Lavalink-based music backend (wavelink):
+    Lavalink-based music backend (Pomice):
     - Node connect/reconnect + optional auto-start local node if unavailable
     - Per-guild player queue, repeat modes (none/current/queue)
     - Vote-skip helpers
@@ -70,11 +144,57 @@ class MusicPlayer(commands.Cog):
         self.queues: Dict[int, deque] = defaultdict(deque)
         self.shuffle_flags: Dict[int, bool] = defaultdict(bool)
         self._current_entries: Dict[int, Dict[str, Any]] = {}
+        self._playing_flags: Dict[int, bool] = defaultdict(bool)
         self._local_node_managed = False
         self._sponsorblock_lock = asyncio.Lock()
         self._node_ready = asyncio.Event()
         self._node_help_printed = False
+        self._enqueue_errors: Dict[int, str] = {}
+        self._bootstrap_error: Optional[str] = None
+        LOG.setLevel(logging.DEBUG)
+        root_logger = logging.getLogger()
+        if not root_logger.handlers:
+            logging.basicConfig(level=logging.DEBUG)
+        elif root_logger.level > logging.DEBUG:
+            root_logger.setLevel(logging.DEBUG)
+        for logger_name in ("pomice", "pomice.node", "pomice.player"):
+            try:
+                logging.getLogger(logger_name).setLevel(logging.DEBUG)
+            except Exception:
+                continue
+        self._disconnect_messages = self._load_disconnect_messages()
         self._bootstrap_node.start()
+
+    @staticmethod
+    def _clamp_seconds(value: Any, default: int) -> int:
+        try:
+            seconds = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(30, min(7200, seconds))
+
+    def _resolve_disconnect_timeout(self, guild_id: int, kind: str) -> int:
+        cfg = self._get_music_config(guild_id)
+        if kind == "idle":
+            keys = ["AutoDisconnectIdleSeconds", "AutoDisconnectSeconds"]
+            fallback = 300
+        else:
+            keys = ["AutoDisconnectEmptySeconds", "AutoDisconnectSeconds"]
+            fallback = 180
+
+        for key in keys:
+            if key in cfg and cfg[key] is not None:
+                return self._clamp_seconds(cfg[key], fallback)
+        return fallback
+
+    def _get_recommendation_limit(self, guild_id: int) -> int:
+        cfg = self._get_music_config(guild_id)
+        limit = cfg.get("RecommendationUpperLimit", 25)
+        try:
+            limit_int = int(limit)
+        except (TypeError, ValueError):
+            limit_int = 25
+        return max(1, min(100, limit_int))
 
     def cog_unload(self):
         self._bootstrap_node.cancel()
@@ -82,6 +202,278 @@ class MusicPlayer(commands.Cog):
             t.cancel()
         if self._local_node_managed:
             asyncio.create_task(shutdown_local_node())
+
+    def _set_enqueue_error(self, guild_id: int, message: str) -> None:
+        if guild_id:
+            self._enqueue_errors[guild_id] = message
+
+    def get_last_enqueue_error(self, guild_id: int) -> Optional[str]:
+        return self._enqueue_errors.get(guild_id)
+
+    def is_playback_active(self, guild_id: int) -> bool:
+        return bool(self._playing_flags.get(guild_id))
+
+    def _load_disconnect_messages(self) -> Dict[str, List[str]]:
+        messages: Dict[str, List[str]] = {}
+        try:
+            path = (
+                Path(__file__).resolve().parent.parent
+                / "sentenceslist"
+                / "disconnectMessages.json"
+            )
+            if not path.exists():
+                return messages
+            with path.open("r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except Exception:
+            LOG.debug("Failed to load disconnect messages", exc_info=True)
+            return messages
+
+        if not isinstance(data, dict):
+            return messages
+
+        for key, value in data.items():
+            bucket: List[str] = []
+            if isinstance(value, list):
+                for entry in value:
+                    if isinstance(entry, dict):
+                        msgs = entry.get("messages")
+                        if isinstance(msgs, list):
+                            bucket.extend([m for m in msgs if isinstance(m, str)])
+                    elif isinstance(entry, list):
+                        bucket.extend([m for m in entry if isinstance(m, str)])
+                    elif isinstance(entry, str):
+                        bucket.append(entry)
+            elif isinstance(value, dict):
+                msgs = value.get("messages")
+                if isinstance(msgs, list):
+                    bucket.extend([m for m in msgs if isinstance(m, str)])
+
+            if bucket:
+                messages[key] = bucket
+
+        return messages
+
+    def _pick_disconnect_message(self, category: str) -> Optional[str]:
+        choices = (
+            self._disconnect_messages.get(category)
+            if hasattr(self, "_disconnect_messages")
+            else None
+        )
+        if not choices:
+            return None
+        return random.choice(choices)
+
+    def get_disconnect_message(self, category: str) -> Optional[str]:
+        if not getattr(self, "_disconnect_messages", None):
+            self._disconnect_messages = self._load_disconnect_messages()
+        return self._pick_disconnect_message(category)
+
+    def _get_announcement_channel(
+        self, guild: discord.Guild
+    ) -> Optional[discord.abc.Messageable]:
+        member = getattr(guild, "me", None)
+        if member is None and getattr(self.bot, "user", None):
+            member = guild.get_member(self.bot.user.id)  # type: ignore[arg-type]
+
+        for channel in getattr(guild, "text_channels", []):
+            try:
+                perms = channel.permissions_for(member or guild.default_role)
+            except Exception:
+                continue
+            if getattr(perms, "send_messages", False):
+                return channel
+        return None
+
+    async def send_disconnect_message(
+        self,
+        guild: discord.Guild,
+        category: str,
+        channel: Optional[discord.abc.Messageable] = None,
+    ) -> bool:
+        message = self.get_disconnect_message(category)
+        if not message:
+            return False
+        target = channel or self._get_announcement_channel(guild)
+        if not target:
+            return False
+        try:
+            await target.send(message)
+            return True
+        except Exception:
+            LOG.debug(
+                "Failed to send disconnect message in guild %s", guild.id, exc_info=True
+            )
+        return False
+
+    async def _handle_track_exception(
+        self,
+        player: pomice.Player,
+        track: Optional[pomice.Track],
+        exc_payload: Any,
+    ) -> None:
+        guild = player.guild
+        gid = guild.id
+        title = getattr(track, "title", "Unknown track")
+        self._playing_flags[gid] = False
+        detail, hint, raw = self._summarize_track_exception(exc_payload)
+
+        entry = self._current_entries.get(gid) or {}
+        entry.setdefault("title", title)
+
+        fallback_source = await self._attempt_track_fallback(player, track, entry)
+
+        message_parts = [f":warning: I couldn't play **{title}**."]
+        if detail:
+            message_parts.append(detail)
+        if hint:
+            message_parts.append(hint)
+        if fallback_source:
+            message_parts.append(f"Trying {fallback_source}...")
+
+        notify_text = " ".join(message_parts)
+
+        self._set_enqueue_error(gid, hint or detail or "Playback failed.")
+
+        channel = self._get_announcement_channel(guild)
+        if channel:
+            try:
+                await channel.send(notify_text)
+            except Exception:
+                LOG.debug(
+                    "Failed to send track exception message in guild %s",
+                    gid,
+                    exc_info=True,
+                )
+
+        LOG.warning(
+            "Track exception in guild %s: %s", gid, raw or detail or exc_payload
+        )
+
+        await self._advance_or_idle(player)
+
+    def _summarize_track_exception(
+        self, exc_payload: Any
+    ) -> tuple[str, Optional[str], str]:
+        raw = ""
+        detail = ""
+        hint: Optional[str] = None
+
+        if isinstance(exc_payload, dict):
+            detail = str(
+                exc_payload.get("message") or exc_payload.get("error") or ""
+            ).strip()
+            cause = str(exc_payload.get("cause") or "").strip()
+            raw = f"{detail} {cause}".strip()
+        elif exc_payload is not None:
+            raw = str(exc_payload).strip()
+            detail = raw
+
+        combined = raw or detail
+
+        if combined and "ScriptExtractionException" in combined:
+            hint = "YouTube changed its playback signature. Updating the Lavalink YouTube plugin should resolve this."
+            if not detail:
+                detail = "YouTube signature extractor failed."
+
+        short_detail = detail
+        if short_detail and len(short_detail) > 200:
+            short_detail = short_detail[:197] + "..."
+
+        return short_detail or "Playback failed.", hint, combined or short_detail
+
+    async def _attempt_track_fallback(
+        self,
+        player: pomice.Player,
+        track: Optional[pomice.Track],
+        entry: Dict[str, Any],
+    ) -> Optional[str]:
+        guild_id = player.guild.id
+        retries = entry.get("_retry_attempts", 0)
+        if retries >= 1:
+            return None
+
+        query_seed = (
+            entry.get("title")
+            or getattr(track, "title", None)
+            or getattr(track, "uri", None)
+        )
+        if not query_seed:
+            return None
+
+        entry["_retry_attempts"] = retries + 1
+
+        title = entry.get("title") or getattr(track, "title", None) or query_seed
+        author = entry.get("author") or getattr(track, "author", None)
+        query_text = title or query_seed
+        if author and author not in query_text:
+            query_text = f"{query_text} {author}"
+
+        search_targets: List[Tuple[str, str]] = []
+
+        if query_seed.startswith("ytsearch:"):
+            search_targets.append(("YouTube", query_seed))
+        else:
+            search_targets.append(("YouTube", f"ytsearch:{query_text}"))
+
+        search_targets.append(("Spotify", f"spsearch:{query_text}"))
+
+        for provider, query in search_targets:
+            try:
+                results = await player.get_tracks(query=query)
+            except Exception as exc:
+                LOG.debug(
+                    "Fallback search (%s) failed in guild %s: %s",
+                    provider,
+                    guild_id,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+
+            candidates: List[pomice.Track] = []
+            if isinstance(results, pomice.Playlist):
+                candidates = list(results.tracks)
+            elif isinstance(results, list):
+                candidates = list(results)
+            elif results:
+                candidates = [results]  # type: ignore[list-item]
+
+            if not candidates:
+                continue
+
+            candidate = candidates[0]
+            try:
+                if hasattr(player.queue, "put_at_front"):
+                    result = player.queue.put_at_front(candidate)
+                else:
+                    result = player.queue.put(candidate)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                LOG.debug(
+                    "Failed to enqueue %s fallback track in guild %s: %s",
+                    provider,
+                    guild_id,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+
+            meta = entry.copy()
+            meta["title"] = getattr(candidate, "title", meta.get("title", "Unknown"))
+            meta["author"] = getattr(candidate, "author", meta.get("author"))
+            meta["uri"] = getattr(candidate, "uri", meta.get("uri"))
+            meta["track"] = candidate
+            meta["fallback"] = True
+            meta["fallback_source"] = provider
+            self.queues[guild_id].appendleft(meta)
+            self._current_entries[guild_id] = meta
+            self._playing_flags[guild_id] = False
+            LOG.info("Queued fallback track via %s in guild %s", provider, guild_id)
+            return provider
+
+        return None
 
     # ---- limits ----
     def get_global_instance_limit(self) -> int:
@@ -99,7 +491,7 @@ class MusicPlayer(commands.Cog):
         n = 0
         for g in self.bot.guilds:
             vc = getattr(g, "voice_client", None)
-            if isinstance(vc, wavelink.Player) and vc.is_connected():
+            if isinstance(vc, pomice.Player) and is_voice_connected(vc):
                 n += 1
         return n
 
@@ -107,6 +499,20 @@ class MusicPlayer(commands.Cog):
     @tasks.loop(count=1)
     async def _bootstrap_node(self):
         await self.bot.wait_until_ready()
+        if not hasattr(pomice, "NodePool"):
+            version = getattr(pomice, "__version__", "unknown")
+            msg = (
+                "Installed Pomice package is missing NodePool. "
+                "Please install pomice>=2.9 (current version: %s)."
+            ) % version
+            LOG.error(msg)
+            self._bootstrap_error = msg
+            self._node_ready.clear()
+            if not self._node_help_printed:
+                self._print_lavalink_setup_help()
+                self._node_help_printed = True
+            return
+
         if LAVALINK_AUTO_START and LAVALINK_HOST in LOCAL_HOSTS:
             try:
                 ensured = await ensure_local_node(
@@ -124,6 +530,7 @@ class MusicPlayer(commands.Cog):
                     )
             except Exception as exc:  # pragma: no cover - defensive logging
                 LOG.exception("Auto-starting Lavalink failed: %s", exc)
+                self._bootstrap_error = str(exc)
         elif LAVALINK_AUTO_START:
             LOG.info(
                 "LAVALINK_AUTO_START enabled but host %s is not local; skipping auto provisioning.",
@@ -133,8 +540,13 @@ class MusicPlayer(commands.Cog):
         ok = await self._try_connect_node()
         if ok:
             self._node_ready.set()
+            self._bootstrap_error = None
         else:
             LOG.error("Lavalink node unavailable. Music features will be limited.")
+            if self._bootstrap_error is None:
+                self._bootstrap_error = (
+                    "Unable to reach Lavalink at configured host/port."
+                )
             # Print setup instructions once
             if not self._node_help_printed:
                 self._print_lavalink_setup_help()
@@ -147,17 +559,26 @@ class MusicPlayer(commands.Cog):
     async def _try_connect_node(
         self, retry_delay: float = 1.0, attempts: int = 3
     ) -> bool:
+        node_pool_cls = getattr(pomice, "NodePool", None)
+        if node_pool_cls is None:
+            self._bootstrap_error = "Pomice NodePool is unavailable."
+            return False
+
+        identifier = LAVALINK_REGION or f"default-{LAVALINK_HOST}:{LAVALINK_PORT}"
+
         for i in range(attempts):
             try:
-                if wavelink.NodePool.nodes:
+                if getattr(node_pool_cls, "_nodes", {}):
                     return True
-                await wavelink.NodePool.create_node(
+                await node_pool_cls.create_node(
                     bot=self.bot,
                     host=LAVALINK_HOST,
                     port=LAVALINK_PORT,
                     password=LAVALINK_PASSWORD,
-                    https=LAVALINK_SECURE,
-                    region=LAVALINK_REGION or None,
+                    identifier=str(identifier),
+                    secure=LAVALINK_SECURE,
+                    loop=getattr(self.bot, "loop", None),
+                    logger=LOG,
                 )
                 LOG.info(
                     "Connected to Lavalink %s:%s (secure=%s)",
@@ -170,41 +591,117 @@ class MusicPlayer(commands.Cog):
                 LOG.warning(
                     "Lavalink connect failed (attempt %d/%d): %s", i + 1, attempts, e
                 )
+                self._bootstrap_error = str(e)
                 await asyncio.sleep(retry_delay)
         return False
 
     @commands.Cog.listener()
-    async def on_wavelink_node_ready(self, node: wavelink.Node):
-        LOG.info("Wavelink node '%s' ready.", node.identifier)
+    async def on_pomice_websocket_open(self, event: pomice.WebSocketOpenEvent):
+        LOG.info("Pomice node websocket open: %s", getattr(event, "target", "unknown"))
         self._node_ready.set()
 
     @commands.Cog.listener()
-    async def on_wavelink_node_closed(self, payload: wavelink.NodeClosedPayload):
-        LOG.warning("Wavelink node closed: %s", payload)
+    async def on_pomice_websocket_closed(
+        self, event: pomice.WebSocketClosedEvent
+    ) -> None:
+        reason = getattr(getattr(event, "payload", None), "reason", None)
+        LOG.warning("Pomice node websocket closed: %s", reason or event)
+        self._node_ready.clear()
 
     @commands.Cog.listener()
-    async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload):
-        player: wavelink.Player = payload.player
-        track: wavelink.Playable = payload.track
+    async def on_pomice_track_start(self, *args, **kwargs):
+        event = args[0] if args else kwargs.get("event")
+        player: Optional[pomice.Player] = None
+        track: Optional[pomice.Track] = None
+
+        if isinstance(event, pomice.TrackStartEvent):
+            player = getattr(event, "player", None)
+            track = getattr(event, "track", None)
+        else:
+            player = kwargs.get("player")
+            track = kwargs.get("track")
+            if len(args) >= 1 and player is None:
+                player = args[0]
+            if len(args) >= 2 and track is None:
+                track = args[1]
+
+        if not isinstance(player, pomice.Player):
+            return
+
+        if track is None and isinstance(event, pomice.TrackStartEvent):
+            track = getattr(event, "track", None)
+        if track is None:
+            track = getattr(player, "_last_track", None)
+        if not track:
+            return
+
         setattr(player, "_last_track", track)
+        self._playing_flags[player.guild.id] = True
         await self._announce_now_playing(player, track)
 
     @commands.Cog.listener()
-    async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
-        player: wavelink.Player = payload.player
+    async def on_pomice_chapters_loaded(self, *args, **kwargs):
+        """Suppress Pomice chapter events if not supported."""
+        pass
+
+    @commands.Cog.listener()
+    async def on_pomice_chapter_started(self, *args, **kwargs):
+        """Suppress Pomice chapter events if not supported."""
+        pass
+
+    @commands.Cog.listener()
+    async def on_pomice_segments_loaded(self, *args, **kwargs):
+        """Suppress SponsorBlock segment events not supported by Pomice."""
+        pass
+
+    @commands.Cog.listener()
+    async def on_pomice_segment_skipped(self, *args, **kwargs):
+        """Suppress SponsorBlock segment events not supported by Pomice."""
+        pass
+
+    @commands.Cog.listener()
+    async def on_pomice_track_end(self, *args, **kwargs):
+        event = args[0] if args else kwargs.get("event")
+        player: Optional[pomice.Player] = None
+        track: Optional[pomice.Track] = None
+
+        if isinstance(event, pomice.TrackEndEvent):
+            player = getattr(event, "player", None)
+            track = getattr(event, "track", None)
+        else:
+            player = kwargs.get("player")
+            track = kwargs.get("track")
+            if len(args) >= 1 and player is None:
+                player = args[0]
+            if len(args) >= 2 and track is None:
+                track = args[1]
+
+        if not isinstance(player, pomice.Player):
+            return
+
         gid = player.guild.id
+        self._playing_flags[gid] = False
         mode = self.repeat_mode.get(gid, "none")
-        last = getattr(player, "_last_track", None)
+        last = track or getattr(player, "_last_track", None)
         entry = self._current_entries.get(gid)
         if entry:
             self._record_recent(entry)
         if mode == "current" and last:
             self.voteskip[gid].clear()
-            await player.play(last)
+            self._playing_flags[gid] = True
+            try:
+                await player.play(last)
+            except Exception:
+                LOG.debug(
+                    "Failed to replay last track for repeat-current in guild %s",
+                    gid,
+                    exc_info=True,
+                )
+                await self._advance_or_idle(player)
             return
         if mode == "queue" and last:
             try:
-                player.queue.put_nowait(last)
+                player.queue.put(last)
                 meta = self._current_entries.get(gid)
                 if meta:
                     clone = {
@@ -218,31 +715,121 @@ class MusicPlayer(commands.Cog):
                 pass
         await self._advance_or_idle(player)
 
+    @commands.Cog.listener()
+    async def on_pomice_track_exception(self, *args, **kwargs):
+        event = args[0] if args else kwargs.get("event")
+        player: Optional[pomice.Player] = None
+        track: Optional[pomice.Track] = None
+        exc_payload: Any = None
+
+        if isinstance(event, pomice.TrackExceptionEvent):
+            player = getattr(event, "player", None)
+            track = getattr(event, "track", None)
+            exc_payload = getattr(event, "exception", None)
+        else:
+            player = kwargs.get("player")
+            track = kwargs.get("track")
+            exc_payload = kwargs.get("exception")
+            if len(args) >= 1 and player is None:
+                player = args[0]
+            if len(args) >= 2 and track is None:
+                track = args[1]
+            if len(args) >= 3 and exc_payload is None:
+                exc_payload = args[2]
+
+        if not isinstance(player, pomice.Player):
+            return
+
+        await self._handle_track_exception(player, track, exc_payload)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if member.bot and getattr(member, "id", None) == getattr(
+            self.bot.user, "id", None
+        ):
+            return
+
+        guild = getattr(member, "guild", None)
+        if guild is None:
+            return
+
+        player = getattr(guild, "voice_client", None)
+        if not isinstance(player, pomice.Player):
+            return
+
+        channel = getattr(player, "channel", None)
+        if channel is None:
+            return
+
+        if channel not in {before.channel, after.channel}:
+            return
+
+        listeners = [m for m in channel.members if not getattr(m, "bot", False)]
+
+        if not listeners:
+            empty_timeout = self._resolve_disconnect_timeout(guild.id, "empty")
+            await self._schedule_idle_disconnect(
+                player, timeout=empty_timeout, reason="empty"
+            )
+            return
+
+        await self._cancel_idle(guild.id)
+
+        queue_obj = getattr(player, "queue", None)
+        queue_empty = (
+            getattr(queue_obj, "is_empty", True) if queue_obj is not None else True
+        )
+
+        if queue_empty and not is_voice_playing(player) and not is_voice_paused(player):
+            idle_timeout = self._resolve_disconnect_timeout(guild.id, "idle")
+            await self._schedule_idle_disconnect(
+                player, timeout=idle_timeout, reason="idle"
+            )
+
     async def _ensure_player_connected(
         self, guild: discord.Guild, requester_id: int
-    ) -> Optional[wavelink.Player]:
+    ) -> Optional[pomice.Player]:
         await self._node_ready.wait()
 
         now = time.time()
         cool = self.connection_cooldowns.get(guild.id, 0)
         if cool > now:
+            self._set_enqueue_error(
+                guild.id,
+                "Connection temporarily rate-limited. Please wait a moment and try again.",
+            )
             return None
 
         # enforce global instance limit
+        existing_vc = getattr(guild, "voice_client", None)
         if (
-            not guild.voice_client or not guild.voice_client.is_connected()
+            not existing_vc or not is_voice_connected(existing_vc)
         ) and self.current_active_instances() >= self.get_global_instance_limit():
+            self._set_enqueue_error(
+                guild.id,
+                "Maximum number of active music players reached."
+                " Try again after another guild stops playback.",
+            )
             return None
 
         member = guild.get_member(requester_id)
         channel = getattr(getattr(member, "voice", None), "channel", None)
         if channel is None:
+            self._set_enqueue_error(
+                guild.id,
+                "You need to join a voice channel before using music commands.",
+            )
             return None
 
         try:
-            player: wavelink.Player = await channel.connect(cls=wavelink.Player)
+            player: pomice.Player = await channel.connect(cls=pomice.Player)
             if not hasattr(player, "queue"):
-                player.queue = wavelink.Queue()
+                player.queue = pomice.Queue()
             cfg = self._get_music_config(guild.id)
             volume = float(cfg.get("Volume", 0.5) or 0.5)
             try:
@@ -250,33 +837,41 @@ class MusicPlayer(commands.Cog):
             except Exception:
                 pass
             await self._apply_sponsorblock_settings(guild.id)
+            self._playing_flags[guild.id] = False
             return player
         except Exception as e:
             LOG.warning("Player connect failed in guild %s: %s", guild.id, e)
             self.connection_cooldowns[guild.id] = now + 60
+            self._set_enqueue_error(
+                guild.id,
+                f"Failed to connect to voice channel: {e}",
+            )
             return None
 
-    async def _play_next(self, player: wavelink.Player):
+    async def _play_next(self, player: pomice.Player):
         if player.queue.is_empty:
             await self._schedule_idle_disconnect(player)
             return
         try:
-            track: wavelink.Playable = player.queue.get()
+            track: pomice.Track = player.queue.get()
             meta = self.queues[player.guild.id]
             entry = meta.popleft() if meta else {}
             entry.setdefault("title", getattr(track, "title", "Unknown"))
+            entry.setdefault("author", getattr(track, "author", None))
             entry.setdefault("requester", None)
             entry["uri"] = getattr(track, "uri", None)
             entry["track"] = track
             self._current_entries[player.guild.id] = entry
             self.voteskip[player.guild.id].clear()
+            self._playing_flags[player.guild.id] = True
             await player.play(track)
             await self._cancel_idle(player.guild.id)
         except Exception as e:
             LOG.warning("Failed to start track: %s", e)
+            self._playing_flags[player.guild.id] = False
             await self._advance_or_idle(player)
 
-    async def _advance_or_idle(self, player: wavelink.Player):
+    async def _advance_or_idle(self, player: pomice.Player):
         if not player.queue.is_empty:
             await self._play_next(player)
         else:
@@ -284,7 +879,7 @@ class MusicPlayer(commands.Cog):
             if not autoplayed:
                 await self._schedule_idle_disconnect(player)
 
-    async def _maybe_autoplay(self, player: wavelink.Player) -> bool:
+    async def _maybe_autoplay(self, player: pomice.Player) -> bool:
         cfg = self._get_music_config(player.guild.id)
         if not cfg.get("AutoPlay", False):
             return False
@@ -305,46 +900,153 @@ class MusicPlayer(commands.Cog):
             LOG.debug("AutoPlay queued %s in guild %s", item["title"], player.guild.id)
         return ok
 
-    async def _announce_now_playing(
-        self, player: wavelink.Player, track: wavelink.Playable
-    ):
+    async def _announce_now_playing(self, player: pomice.Player, track: pomice.Track):
         guild = player.guild
-        txt = None
-        for ch in guild.text_channels:
-            if ch.permissions_for(guild.me).send_messages:
-                txt = ch
-                break
+        txt = self._get_announcement_channel(guild)
         if not txt:
             return
         try:
-            embed = discord.Embed(
-                title="Now Playing",
-                description=f"{getattr(track, 'title', 'Unknown')} — [{getattr(track, 'author', 'Unknown')}]",
-                color=discord.Color.blurple(),
-            )
+            title = getattr(track, "title", "Unknown")
+            author = getattr(track, "author", "Unknown")
+            uri = getattr(track, "uri", None)
+
+            # Get requester info from current entry
+            current_entry = self._current_entries.get(guild.id, {})
+            requester_id = current_entry.get("requester")
+
+            # Create clickable title if URI exists
+            if uri:
+                embed_title = f"🎵 {title}"
+                embed = discord.Embed(
+                    title=embed_title,
+                    url=uri,
+                    color=discord.Color.blurple(),
+                )
+            else:
+                embed = discord.Embed(
+                    title=f"🎵 {title}",
+                    color=discord.Color.blurple(),
+                )
+
+            # Add thumbnail from artwork
+            artwork_url = getattr(track, "artwork_url", None)
+            if artwork_url:
+                embed.set_thumbnail(url=artwork_url)
+            elif uri and "youtube.com/watch?v=" in uri:
+                video_id = uri.split("v=")[1].split("&")[0]
+                embed.set_thumbnail(
+                    url=f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+                )
+            elif uri and "youtu.be/" in uri:
+                video_id = uri.split("youtu.be/")[1].split("?")[0]
+                embed.set_thumbnail(
+                    url=f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+                )
+
+            # Create visual seekbar with duration
             dur = getattr(track, "length", None)
             if dur:
-                embed.add_field(name="Duration", value=f"{int(dur/1000)}s", inline=True)
-            url = getattr(track, "uri", None)
-            if url:
-                embed.add_field(name="URL", value=f"[Link]({url})", inline=True)
+                total_seconds = int(dur / 1000)
+                minutes, seconds = divmod(total_seconds, 60)
+                duration_str = f"{minutes:02d}:{seconds:02d}"
+
+                # Visual seekbar (at start of track)
+                seekbar_length = 15
+                filled = 0  # Start at beginning
+                empty = seekbar_length - filled
+                seekbar = "🔘" + "▬" * empty
+
+                embed.add_field(
+                    name="Duration",
+                    value=f"00:00 {seekbar} {duration_str}",
+                    inline=False,
+                )
+
+            # Add requester footer
+            if requester_id:
+                try:
+                    requester = guild.get_member(requester_id)
+                    if requester:
+                        embed.set_footer(
+                            text=f"Requested by {requester.display_name}",
+                            icon_url=requester.display_avatar.url,
+                        )
+                    else:
+                        embed.set_footer(text=f"Requested by User#{requester_id}")
+                except Exception:
+                    embed.set_footer(text=f"Requested by <@{requester_id}>")
+
             await txt.send(embed=embed)
         except Exception:
             pass
 
-    async def _schedule_idle_disconnect(self, player: wavelink.Player):
+    async def _schedule_idle_disconnect(
+        self,
+        player: pomice.Player,
+        *,
+        timeout: Optional[int] = None,
+        reason: str = "idle",
+    ) -> None:
         gid = player.guild.id
         await self._cancel_idle(gid)
 
-        timeout = self._get_idle_timeout(gid)
+        channel = getattr(player, "channel", None)
+        members = getattr(channel, "members", []) if channel else []
+        listeners = [m for m in members if not getattr(m, "bot", False)]
 
-        async def _idle():
+        idle_timeout = self._resolve_disconnect_timeout(gid, "idle")
+        empty_timeout = self._resolve_disconnect_timeout(gid, "empty")
+
+        if timeout is None:
+            if not listeners:
+                timeout = empty_timeout
+                reason = "empty"
+            else:
+                timeout = idle_timeout
+                reason = "idle"
+
+        async def _idle() -> None:
             try:
                 await asyncio.sleep(timeout)
-                if player.queue.is_empty and not player.playing:
+                if not is_voice_connected(player):
+                    return
+                channel_now = getattr(player, "channel", None)
+                members_now = getattr(channel_now, "members", []) if channel_now else []
+                listeners_now = [m for m in members_now if not getattr(m, "bot", False)]
+
+                queue_obj = getattr(player, "queue", None)
+                queue_empty = (
+                    getattr(queue_obj, "is_empty", True)
+                    if queue_obj is not None
+                    else True
+                )
+
+                if reason == "empty":
+                    if listeners_now:
+                        return
+                else:
+                    if listeners_now and (
+                        is_voice_playing(player) or is_voice_paused(player)
+                    ):
+                        return
+                    if not queue_empty:
+                        return
+                    if is_voice_playing(player) or is_voice_paused(player):
+                        return
+
+                self._playing_flags[gid] = False
+                guild = player.guild
+                try:
                     await player.disconnect()
+                finally:
+                    category = (
+                        "disconnected_due_to_empty_channel"
+                        if reason == "empty"
+                        else "disconnected_by_inactivity"
+                    )
+                    await self.send_disconnect_message(guild, category)
             except Exception:
-                pass
+                LOG.debug("Idle disconnect failed for guild %s", gid, exc_info=True)
 
         self._idle_tasks[gid] = asyncio.create_task(_idle())
 
@@ -359,14 +1061,6 @@ class MusicPlayer(commands.Cog):
         except Exception:
             return {}
 
-    def _get_idle_timeout(self, guild_id: int) -> int:
-        cfg = self._get_music_config(guild_id)
-        try:
-            seconds = int(cfg.get("AutoDisconnectSeconds", 300) or 300)
-        except Exception:
-            seconds = 300
-        return max(30, min(7200, seconds))
-
     async def _apply_sponsorblock_settings(self, guild_id: int) -> None:
         cfg = self._get_music_config(guild_id)
         enabled = cfg.get("SponsorBlockEnabled", True)
@@ -378,9 +1072,13 @@ class MusicPlayer(commands.Cog):
 
         method = "PUT" if enabled and categories else "DELETE"
 
+        node_pool_cls = getattr(pomice, "NodePool", None)
+        if node_pool_cls is None:
+            return
+
         node = None
         try:
-            node = wavelink.NodePool.get_node()
+            node = node_pool_cls.get_node()
         except Exception:
             return
 
@@ -445,7 +1143,6 @@ class MusicPlayer(commands.Cog):
         dq.appendleft(payload)
 
     def _print_lavalink_setup_help(self):
-        # Console guidance for manual setup
         jar_dir = os.path.join(os.path.dirname(__file__), "lavalink")
         app_yml_path = os.path.join(jar_dir, "application.yml")
         print("\n========== Lavalink Setup Assistance ==========")
@@ -496,22 +1193,37 @@ lavalink:
         *,
         from_autoplay: bool = False,
     ) -> bool:
-        # Return fast if node isn’t ready instead of waiting indefinitely
         if not self._node_ready.is_set():
-            # try a short wait and then fail fast
             try:
                 await asyncio.wait_for(self._node_ready.wait(), timeout=1.0)
             except asyncio.TimeoutError:
+                self._set_enqueue_error(
+                    guild.id,
+                    self._bootstrap_error
+                    or "Lavalink node is not connected yet. Check that Lavalink is running and reachable.",
+                )
                 return False
+        if not self._node_ready.is_set():
+            self._set_enqueue_error(
+                guild.id,
+                self._bootstrap_error
+                or "Lavalink node is not connected yet. Check that Lavalink is running and reachable.",
+            )
+            return False
 
         player = (
             guild.voice_client
-            if isinstance(guild.voice_client, wavelink.Player)
+            if isinstance(guild.voice_client, pomice.Player)
             else None
         )
-        if not player or not player.is_connected():
+        if not player or not is_voice_connected(player):
             player = await self._ensure_player_connected(guild, item.get("requester"))
             if not player:
+                if guild.id not in self._enqueue_errors:
+                    self._set_enqueue_error(
+                        guild.id,
+                        "Unable to join voice channel. Please verify permissions and try again.",
+                    )
                 return False
 
         cfg = self._get_music_config(guild.id)
@@ -521,68 +1233,167 @@ lavalink:
         track_max_duration = int(cfg.get("TrackMaxDuration", 600) or 600)
 
         query = item.get("source") or item.get("title")
-        tracks: List[wavelink.Playable] = []
+        is_url = isinstance(query, str) and (
+            query.startswith("http://") or query.startswith("https://")
+        )
+        tracks: List[pomice.Track] = []
+
+        def _normalize_results(
+            results_obj: Any, prefer_single: bool
+        ) -> List[pomice.Track]:
+            if isinstance(results_obj, pomice.Playlist):
+                return list(results_obj.tracks)[:playlist_limit]
+            if isinstance(results_obj, list):
+                return list(results_obj[:1]) if prefer_single else list(results_obj)
+            if results_obj:
+                return [results_obj]
+            return []
+
         try:
-            if isinstance(query, str) and (
-                query.startswith("http://") or query.startswith("https://")
-            ):
-                fetched = await wavelink.Pool.fetch_tracks(query)
-                if isinstance(fetched, wavelink.Playlist):
-                    tracks = list(fetched.tracks)[:playlist_limit]
-                else:
-                    tracks = list(fetched) if fetched else []
-            else:
-                res = await wavelink.YouTubeTrack.search(
-                    query or "", return_first=False
-                )
-                tracks = res[:1] if res else []
+            results = await player.get_tracks(query=str(query or ""))
+            tracks = _normalize_results(results, prefer_single=not is_url)
         except Exception as e:
             LOG.warning("Track fetch failed: %s", e)
+            self._set_enqueue_error(
+                guild.id,
+                f"Failed to fetch tracks for '{query}': {e}",
+            )
             return False
 
+        if not tracks and not is_url:
+            search_term = str(item.get("title") or "").strip()
+            if isinstance(query, str) and ":" in query:
+                _, _, tail = query.partition(":")
+                search_term = search_term or tail
+            fallback_queries = []
+            if search_term:
+                fallback_queries.extend(
+                    [
+                        f"ytsearch:{search_term}",
+                        f"ytmsearch:{search_term}",
+                        f"scsearch:{search_term}",
+                    ]
+                )
+            else:
+                fallback_queries.append("ytsearch:" + str(query))
+
+            seen_terms = {str(query or "").lower()}
+            for fq in fallback_queries:
+                if not fq or fq.lower() in seen_terms:
+                    continue
+                seen_terms.add(fq.lower())
+                try:
+                    results = await player.get_tracks(query=fq)
+                    candidate_tracks = _normalize_results(results, prefer_single=True)
+                except Exception as exc:
+                    LOG.debug("Fallback track lookup failed for %s: %s", fq, exc)
+                    continue
+                if candidate_tracks:
+                    tracks = candidate_tracks
+                    break
+
         if not tracks:
+            self._set_enqueue_error(
+                guild.id,
+                "No playable tracks were found for that query.",
+            )
             return False
 
         total_in_queue = player.queue.count
         queued = 0
+        filtered_by_duration = 0
+        LOG.debug(
+            "Guild %s enqueue: track_max_duration=%s, queue_limit=%s, tracks=%d",
+            guild.id,
+            track_max_duration,
+            queue_limit if queue_limit_enabled else "disabled",
+            len(tracks),
+        )
         for tr in tracks:
             if (
                 not from_autoplay
                 and queue_limit_enabled
                 and total_in_queue + queued >= queue_limit
             ):
+                self._set_enqueue_error(
+                    guild.id,
+                    "Queue limit reached for this guild. Clear some tracks and try again.",
+                )
                 break
-            if (
-                track_max_duration > 0
-                and getattr(tr, "length", 0) > track_max_duration * 1000
-            ):
+            track_length_ms = getattr(tr, "length", 0)
+            if track_max_duration > 0 and track_length_ms > track_max_duration * 1000:
+                filtered_by_duration += 1
+                LOG.debug(
+                    "Filtered track '%s' (length=%dms > limit=%dms)",
+                    getattr(tr, "title", "Unknown"),
+                    track_length_ms,
+                    track_max_duration * 1000,
+                )
                 continue
             try:
-                player.queue.put_nowait(tr)
+                player.queue.put(tr)
                 entry = {
                     "title": getattr(tr, "title", "Unknown"),
                     "requester": item.get("requester"),
                     "uri": getattr(tr, "uri", None),
                     "autoplay": from_autoplay,
+                    "track": tr,
                 }
                 self.queues[guild.id].append(entry)
-                setattr(tr, "requester_id", item.get("requester"))
-                setattr(tr, "is_autoplay", from_autoplay)
                 queued += 1
-            except Exception:
+            except Exception as exc:
+                LOG.warning(
+                    "Failed to queue track '%s': %s",
+                    getattr(tr, "title", "Unknown"),
+                    exc,
+                )
                 break
 
-        if not player.playing and not player.paused:
+        playback_active = (
+            self._playing_flags.get(guild.id, False)
+            or is_voice_playing(player)
+            or is_voice_paused(player)
+        )
+
+        if not playback_active:
+            self._playing_flags[guild.id] = True
             await self._play_next(player)
 
-        return queued > 0
+        if queued == 0:
+            if guild.id not in self._enqueue_errors:
+                if filtered_by_duration > 0:
+                    minutes = track_max_duration // 60
+                    seconds = track_max_duration % 60
+                    time_str = (
+                        f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+                    )
+                    self._set_enqueue_error(
+                        guild.id,
+                        f"No tracks could be queued. {filtered_by_duration} track(s) exceeded the configured duration limit of {time_str}.",
+                    )
+                else:
+                    self._set_enqueue_error(
+                        guild.id,
+                        "No tracks could be queued. Check logs for details.",
+                    )
+            return False
+
+        self._enqueue_errors.pop(guild.id, None)
+        return True
 
     async def recommend(
         self, guild: discord.Guild, max_rec: int = 3
     ) -> List[Dict[str, Any]]:
+        try:
+            max_rec_int = int(max_rec)
+        except (TypeError, ValueError):
+            max_rec_int = 3
+        limit = self._get_recommendation_limit(guild.id)
+        max_rec = max(1, min(limit, max_rec_int))
+
         player = (
             guild.voice_client
-            if isinstance(guild.voice_client, wavelink.Player)
+            if isinstance(guild.voice_client, pomice.Player)
             else None
         )
         if not player:
@@ -615,10 +1426,19 @@ lavalink:
                 continue
             seen_queries.add(query)
             try:
-                results = await wavelink.YouTubeTrack.search(query, return_first=False)
+                results = await player.get_tracks(query=str(query))
             except Exception:
                 continue
-            for cand in results:
+
+            candidates: List[pomice.Track] = []
+            if isinstance(results, pomice.Playlist):
+                candidates = list(results.tracks)
+            elif isinstance(results, list):
+                candidates = list(results)
+            elif results:
+                candidates = [results]
+
+            for cand in candidates:
                 url = getattr(cand, "uri", None)
                 title = getattr(cand, "title", None)
                 if not url:

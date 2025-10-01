@@ -27,6 +27,27 @@ class MyBot(commands.Bot):
             print(f"Failed to load MusicPlayer cog: {e}")
         await self.tree.sync()
 
+    async def on_socket_raw_receive(self, message):
+        """Re-dispatch raw gateway payloads for libraries expecting socket_response."""
+        await super().on_socket_raw_receive(message)
+
+        if isinstance(message, bytes):
+            try:
+                message = message.decode("utf-8")
+            except UnicodeDecodeError:
+                return
+
+        if not isinstance(message, str):
+            return
+
+        try:
+            payload = json.loads(message)
+        except (TypeError, ValueError):
+            return
+
+        if isinstance(payload, dict):
+            self.dispatch("socket_response", payload)
+
 
 async def load_commands():
     """Load all cogs from the commands directory."""
@@ -38,7 +59,6 @@ async def load_commands():
     for root, dirs, files in os.walk(commands_dir):
         for filename in files:
             if filename.endswith(".py"):
-                # Construct the module name based on the folder structure
                 module_path = os.path.relpath(
                     os.path.join(root, filename), start=commands_dir
                 )

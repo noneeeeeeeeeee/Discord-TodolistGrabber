@@ -100,6 +100,7 @@ class SettingsView(View):
         self.selected_section = None
         self.selected_path = None
         self.is_owner = _is_owner(ctx.author.id)
+        self.visible_paths = []
 
         self.section_select = Select(placeholder="Choose module/section")
         for section in self.flat.keys():
@@ -158,6 +159,7 @@ class SettingsView(View):
         for path, meta in self.flat[self.selected_section].items():
             if _can_view(meta, self.is_owner):
                 visible_paths.append((path, meta))
+        self.visible_paths = visible_paths
 
         if not visible_paths:
             self.setting_select.add_option(
@@ -319,6 +321,26 @@ class SettingsView(View):
                 embed.add_field(
                     name="Music Settings",
                     value="Configure DJ role, volume, queue limits and playlist behaviour here. Central-only settings (owner) propagate to all guilds.",
+                    inline=False,
+                )
+            if not self.selected_path:
+                summary_lines = []
+                for path, meta in self.visible_paths[:10]:
+                    value = _format_value(_safe_get(self.cfg, path))
+                    summary_lines.append(
+                        f"`{meta['key']}` → `{value}` ({_access_label(meta.get('access', 0))})"
+                    )
+                if len(self.visible_paths) > 10:
+                    summary_lines.append(
+                        f"…and {len(self.visible_paths) - 10} more setting(s)."
+                    )
+                embed.add_field(
+                    name="Available Settings",
+                    value=(
+                        "\n".join(summary_lines)
+                        if summary_lines
+                        else "No settings visible."
+                    ),
                     inline=False,
                 )
         if self.selected_path:
