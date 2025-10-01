@@ -13,3 +13,4 @@ lavalink_server/*
 *.yml
 modules/music/lavalink/logs
 modules/music/lavalink/plugins
+modules/music/lavalink/.lavalink-version.json
