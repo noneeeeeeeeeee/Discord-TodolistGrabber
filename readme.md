@@ -11,5 +11,3 @@ Modern Discord bot for homework tracking and utility modules with an advanced mu
 2. Run the bot once so it can generate `.env` and default config files.
 3. Populate `.env` with your Discord token and (optionally) Lavalink host credentials. If you keep the defaults, the bot can auto-provision Lavalink locally.
 4. Invite the bot to your server and start it.
-
-> The bot automatically prunes configuration files for guilds it has left after 7 days (configurable via `CONFIG_RETENTION_DAYS`). Run `!setup` again if you re-invite it after that window.

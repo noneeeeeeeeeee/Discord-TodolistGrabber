@@ -80,6 +80,10 @@ class QueueCommands(commands.Cog):
         shuffle = "Enabled" if player.shuffle_flags.get(ctx.guild.id) else "Disabled"
         embed.add_field(name="🔀 Shuffle", value=shuffle, inline=True)
 
+        autoplay_enabled = player.is_session_autoplay_enabled(ctx.guild.id)
+        autoplay_status = "Enabled" if autoplay_enabled else "Disabled (session)"
+        embed.add_field(name="🤖 AutoPlay", value=autoplay_status, inline=True)
+
         await ctx.send(embed=embed)
 
     @discord.app_commands.command(name="q", description="Show current queue.")

@@ -55,10 +55,19 @@ class Help(commands.Cog):
             ),
             "Music": (
                 [
-                    ("/play", "Play a track", "/play <url or search>"),
-                    ("/queue", "Show current queue", "/queue"),
-                    ("/skip", "Skip current track", "/skip"),
-                    ("/volume", "Set player volume (0.0 - 1.0)", "/volume <0.5>"),
+                    ("/p", "Play or search for a track/playlist", "/p <url or search>"),
+                    ("/queue", "Show the current queue", "/queue"),
+                    ("/skip", "Vote to skip the current track", "/skip"),
+                    (
+                        "/autoplay",
+                        "Toggle AutoPlay for the active voice session",
+                        "/autoplay state:Enable",
+                    ),
+                    (
+                        "/volume",
+                        "Set the default playback volume (0-200%)",
+                        "/volume 100",
+                    ),
                 ]
                 if music_enabled
                 else []

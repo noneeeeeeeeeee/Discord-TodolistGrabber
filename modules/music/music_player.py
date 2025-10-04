@@ -5,6 +5,7 @@ import math
 import logging
 import json
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from collections import defaultdict, deque
@@ -99,6 +100,28 @@ NON_SONG_SEGMENTS = {"intro", "outro", "preview", "filler", "music_offtopic"}
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
 
+DEFAULT_AUTOPLAY_MAX_RESULTS = 25
+DEFAULT_VOTESKIP_PERCENT = 60
+
+
+@dataclass(slots=True)
+class EnsureConnectionResult:
+    player: Optional["pomice.Player"]
+    joined_channel: Optional[str] = None
+    joined: bool = False
+    error: Optional[str] = None
+
+
+@dataclass(slots=True)
+class EnqueueResult:
+    success: bool
+    track_title: Optional[str] = None
+    queue_position: Optional[int] = None
+    joined_channel: Optional[str] = None
+    started_playback: bool = False
+    queued_count: int = 0
+    error: Optional[str] = None
+
 
 def _voice_flag(vc: Any, attr: str) -> bool:
     if vc is None:
@@ -151,6 +174,8 @@ class MusicPlayer(commands.Cog):
         self._node_help_printed = False
         self._enqueue_errors: Dict[int, str] = {}
         self._bootstrap_error: Optional[str] = None
+        self._now_playing_messages: Dict[int, discord.Message] = {}
+        self._session_autoplay_disabled = defaultdict(bool)
         LOG.setLevel(logging.DEBUG)
         root_logger = logging.getLogger()
         if not root_logger.handlers:
@@ -165,6 +190,18 @@ class MusicPlayer(commands.Cog):
         self._disconnect_messages = self._load_disconnect_messages()
         self._bootstrap_node.start()
 
+    def is_session_autoplay_enabled(self, guild_id: int) -> bool:
+        return not self._session_autoplay_disabled.get(guild_id, False)
+
+    def set_session_autoplay(self, guild_id: int, enabled: bool) -> None:
+        if enabled:
+            self._session_autoplay_disabled.pop(guild_id, None)
+        else:
+            self._session_autoplay_disabled[guild_id] = True
+
+    def reset_session_state(self, guild_id: int) -> None:
+        self._session_autoplay_disabled.pop(guild_id, None)
+
     @staticmethod
     def _clamp_seconds(value: Any, default: int) -> int:
         try:
@@ -176,25 +213,15 @@ class MusicPlayer(commands.Cog):
     def _resolve_disconnect_timeout(self, guild_id: int, kind: str) -> int:
         cfg = self._get_music_config(guild_id)
         if kind == "idle":
-            keys = ["AutoDisconnectIdleSeconds", "AutoDisconnectSeconds"]
+            key = "AutoDisconnectIdleSeconds"
             fallback = 300
         else:
-            keys = ["AutoDisconnectEmptySeconds", "AutoDisconnectSeconds"]
+            key = "AutoDisconnectEmptySeconds"
             fallback = 180
 
-        for key in keys:
-            if key in cfg and cfg[key] is not None:
-                return self._clamp_seconds(cfg[key], fallback)
+        if key in cfg and cfg[key] is not None:
+            return self._clamp_seconds(cfg[key], fallback)
         return fallback
-
-    def _get_recommendation_limit(self, guild_id: int) -> int:
-        cfg = self._get_music_config(guild_id)
-        limit = cfg.get("RecommendationUpperLimit", 25)
-        try:
-            limit_int = int(limit)
-        except (TypeError, ValueError):
-            limit_int = 25
-        return max(1, min(100, limit_int))
 
     def cog_unload(self):
         self._bootstrap_node.cancel()
@@ -317,6 +344,7 @@ class MusicPlayer(commands.Cog):
         title = getattr(track, "title", "Unknown track")
         self._playing_flags[gid] = False
         detail, hint, raw = self._summarize_track_exception(exc_payload)
+        await self._delete_now_playing_message(gid)
 
         entry = self._current_entries.get(gid) or {}
         entry.setdefault("title", title)
@@ -372,7 +400,7 @@ class MusicPlayer(commands.Cog):
         combined = raw or detail
 
         if combined and "ScriptExtractionException" in combined:
-            hint = "YouTube changed its playback signature. Updating the Lavalink YouTube plugin should resolve this."
+            hint = "YouTube changed its playback signature. Updating the Lavalink YouTube plugin or configuring a remote cipher/poToken usually fixes it."
             if not detail:
                 detail = "YouTube signature extractor failed."
 
@@ -403,6 +431,11 @@ class MusicPlayer(commands.Cog):
 
         entry["_retry_attempts"] = retries + 1
 
+        original_identifier = entry.get("identifier") or (
+            getattr(track, "identifier", None) if track else None
+        )
+        original_uri = entry.get("uri") or getattr(track, "uri", None)
+
         title = entry.get("title") or getattr(track, "title", None) or query_seed
         author = entry.get("author") or getattr(track, "author", None)
         query_text = title or query_seed
@@ -415,8 +448,9 @@ class MusicPlayer(commands.Cog):
             search_targets.append(("YouTube", query_seed))
         else:
             search_targets.append(("YouTube", f"ytsearch:{query_text}"))
-
-        search_targets.append(("Spotify", f"spsearch:{query_text}"))
+        if title and not query_seed.startswith("ytsearch:"):
+            search_targets.append(("YouTube", f"ytsearch:{title}"))
+        search_targets.append(("YouTube Music", f"ytmsearch:{query_text}"))
 
         for provider, query in search_targets:
             try:
@@ -442,36 +476,50 @@ class MusicPlayer(commands.Cog):
             if not candidates:
                 continue
 
-            candidate = candidates[0]
-            try:
-                if hasattr(player.queue, "put_at_front"):
-                    result = player.queue.put_at_front(candidate)
-                else:
-                    result = player.queue.put(candidate)
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception as exc:
-                LOG.debug(
-                    "Failed to enqueue %s fallback track in guild %s: %s",
-                    provider,
-                    guild_id,
-                    exc,
-                    exc_info=True,
-                )
-                continue
+            for candidate in candidates:
+                candidate_id = getattr(candidate, "identifier", None)
+                candidate_uri = getattr(candidate, "uri", None)
+                if (
+                    candidate_id
+                    and original_identifier
+                    and candidate_id == original_identifier
+                ):
+                    continue
+                if candidate_uri and original_uri and candidate_uri == original_uri:
+                    continue
 
-            meta = entry.copy()
-            meta["title"] = getattr(candidate, "title", meta.get("title", "Unknown"))
-            meta["author"] = getattr(candidate, "author", meta.get("author"))
-            meta["uri"] = getattr(candidate, "uri", meta.get("uri"))
-            meta["track"] = candidate
-            meta["fallback"] = True
-            meta["fallback_source"] = provider
-            self.queues[guild_id].appendleft(meta)
-            self._current_entries[guild_id] = meta
-            self._playing_flags[guild_id] = False
-            LOG.info("Queued fallback track via %s in guild %s", provider, guild_id)
-            return provider
+                try:
+                    if hasattr(player.queue, "put_at_front"):
+                        result = player.queue.put_at_front(candidate)
+                    else:
+                        result = player.queue.put(candidate)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as exc:
+                    LOG.debug(
+                        "Failed to enqueue %s fallback track in guild %s: %s",
+                        provider,
+                        guild_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    continue
+
+                meta = entry.copy()
+                meta["title"] = getattr(
+                    candidate, "title", meta.get("title", "Unknown")
+                )
+                meta["author"] = getattr(candidate, "author", meta.get("author"))
+                meta["uri"] = candidate_uri or meta.get("uri")
+                meta["identifier"] = candidate_id or meta.get("identifier")
+                meta["track"] = candidate
+                meta["fallback"] = True
+                meta["fallback_source"] = provider
+                self.queues[guild_id].appendleft(meta)
+                self._current_entries[guild_id] = meta
+                self._playing_flags[guild_id] = False
+                LOG.info("Queued fallback track via %s in guild %s", provider, guild_id)
+                return provider
 
         return None
 
@@ -681,6 +729,7 @@ class MusicPlayer(commands.Cog):
 
         gid = player.guild.id
         self._playing_flags[gid] = False
+        await self._delete_now_playing_message(gid)
         mode = self.repeat_mode.get(gid, "none")
         last = track or getattr(player, "_last_track", None)
         entry = self._current_entries.get(gid)
@@ -791,43 +840,50 @@ class MusicPlayer(commands.Cog):
                 player, timeout=idle_timeout, reason="idle"
             )
 
-    async def _ensure_player_connected(
+    async def ensure_player_connected(
         self, guild: discord.Guild, requester_id: int
-    ) -> Optional[pomice.Player]:
+    ) -> EnsureConnectionResult:
         await self._node_ready.wait()
+
+        result = EnsureConnectionResult(player=None)
 
         now = time.time()
         cool = self.connection_cooldowns.get(guild.id, 0)
         if cool > now:
-            self._set_enqueue_error(
-                guild.id,
-                "Connection temporarily rate-limited. Please wait a moment and try again.",
-            )
-            return None
+            message = "Connection temporarily rate-limited. Please wait a moment and try again."
+            self._set_enqueue_error(guild.id, message)
+            result.error = message
+            return result
 
-        # enforce global instance limit
         existing_vc = getattr(guild, "voice_client", None)
         if (
             not existing_vc or not is_voice_connected(existing_vc)
         ) and self.current_active_instances() >= self.get_global_instance_limit():
-            self._set_enqueue_error(
-                guild.id,
+            message = (
                 "Maximum number of active music players reached."
-                " Try again after another guild stops playback.",
+                " Try again after another guild stops playback."
             )
-            return None
+            self._set_enqueue_error(guild.id, message)
+            result.error = message
+            return result
 
         member = guild.get_member(requester_id)
         channel = getattr(getattr(member, "voice", None), "channel", None)
         if channel is None:
-            self._set_enqueue_error(
-                guild.id,
-                "You need to join a voice channel before using music commands.",
-            )
-            return None
+            message = "You need to join a voice channel before using music commands."
+            self._set_enqueue_error(guild.id, message)
+            result.error = message
+            return result
+
+        player = existing_vc if isinstance(existing_vc, pomice.Player) else None
+        if player and is_voice_connected(player):
+            result.player = player
+            result.joined_channel = getattr(player.channel, "name", None)
+            result.joined = False
+            return result
 
         try:
-            player: pomice.Player = await channel.connect(cls=pomice.Player)
+            player = await channel.connect(cls=pomice.Player)
             if not hasattr(player, "queue"):
                 player.queue = pomice.Queue()
             cfg = self._get_music_config(guild.id)
@@ -838,15 +894,18 @@ class MusicPlayer(commands.Cog):
                 pass
             await self._apply_sponsorblock_settings(guild.id)
             self._playing_flags[guild.id] = False
-            return player
+            self.reset_session_state(guild.id)
+            result.player = player
+            result.joined_channel = getattr(channel, "name", None)
+            result.joined = True
+            return result
         except Exception as e:
             LOG.warning("Player connect failed in guild %s: %s", guild.id, e)
             self.connection_cooldowns[guild.id] = now + 60
-            self._set_enqueue_error(
-                guild.id,
-                f"Failed to connect to voice channel: {e}",
-            )
-            return None
+            message = f"Failed to connect to voice channel: {e}"
+            self._set_enqueue_error(guild.id, message)
+            result.error = message
+            return result
 
     async def _play_next(self, player: pomice.Player):
         if player.queue.is_empty:
@@ -860,6 +919,7 @@ class MusicPlayer(commands.Cog):
             entry.setdefault("author", getattr(track, "author", None))
             entry.setdefault("requester", None)
             entry["uri"] = getattr(track, "uri", None)
+            entry["identifier"] = getattr(track, "identifier", None)
             entry["track"] = track
             self._current_entries[player.guild.id] = entry
             self.voteskip[player.guild.id].clear()
@@ -880,8 +940,7 @@ class MusicPlayer(commands.Cog):
                 await self._schedule_idle_disconnect(player)
 
     async def _maybe_autoplay(self, player: pomice.Player) -> bool:
-        cfg = self._get_music_config(player.guild.id)
-        if not cfg.get("AutoPlay", False):
+        if not self.is_session_autoplay_enabled(player.guild.id):
             return False
 
         recs = await self.recommend(player.guild, max_rec=1)
@@ -895,10 +954,37 @@ class MusicPlayer(commands.Cog):
             "requester": getattr(self.bot.user, "id", 0),
         }
 
-        ok = await self.enqueue(player.guild, item, from_autoplay=True)
-        if ok:
+        result = await self.enqueue(player.guild, item, from_autoplay=True)
+        if result.success:
             LOG.debug("AutoPlay queued %s in guild %s", item["title"], player.guild.id)
-        return ok
+            channel = self._get_announcement_channel(player.guild)
+            if channel:
+                try:
+                    await channel.send(
+                        ":sparkle: Autoplaying recommended tracks based on your session listening history. Use `/autoplay disable` to stop autoplay."
+                    )
+                except Exception:
+                    LOG.debug(
+                        "Failed to send autoplay notice in guild %s",
+                        player.guild.id,
+                        exc_info=True,
+                    )
+        return result.success
+
+    async def _delete_now_playing_message(self, guild_id: int) -> None:
+        message = self._now_playing_messages.pop(guild_id, None)
+        if not message:
+            return
+        try:
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+        except Exception:
+            LOG.debug(
+                "Failed to delete now playing message in guild %s",
+                guild_id,
+                exc_info=True,
+            )
 
     async def _announce_now_playing(self, player: pomice.Player, track: pomice.Track):
         guild = player.guild
@@ -906,6 +992,7 @@ class MusicPlayer(commands.Cog):
         if not txt:
             return
         try:
+            await self._delete_now_playing_message(guild.id)
             title = getattr(track, "title", "Unknown")
             author = getattr(track, "author", "Unknown")
             uri = getattr(track, "uri", None)
@@ -913,6 +1000,9 @@ class MusicPlayer(commands.Cog):
             # Get requester info from current entry
             current_entry = self._current_entries.get(guild.id, {})
             requester_id = current_entry.get("requester")
+
+            voice_channel = getattr(player, "channel", None)
+            channel_name = getattr(voice_channel, "name", "Unknown channel")
 
             # Create clickable title if URI exists
             if uri:
@@ -951,16 +1041,16 @@ class MusicPlayer(commands.Cog):
                 duration_str = f"{minutes:02d}:{seconds:02d}"
 
                 # Visual seekbar (at start of track)
-                seekbar_length = 15
-                filled = 0  # Start at beginning
-                empty = seekbar_length - filled
-                seekbar = "🔘" + "▬" * empty
+                seekbar_length = 16
+                seekbar = "▰" + "▱" * (seekbar_length - 1)
 
                 embed.add_field(
                     name="Duration",
-                    value=f"00:00 {seekbar} {duration_str}",
+                    value=f"`00:00` {seekbar} `{duration_str}`",
                     inline=False,
                 )
+            else:
+                duration_str = "Live"
 
             # Add requester footer
             if requester_id:
@@ -976,7 +1066,15 @@ class MusicPlayer(commands.Cog):
                 except Exception:
                     embed.set_footer(text=f"Requested by <@{requester_id}>")
 
-            await txt.send(embed=embed)
+            embed.add_field(
+                name="Voice Channel",
+                value=channel_name,
+                inline=False,
+            )
+
+            content = f":musical_note: Now Playing: `{title}`"
+            message = await txt.send(content=content, embed=embed)
+            self._now_playing_messages[guild.id] = message
         except Exception:
             pass
 
@@ -1039,6 +1137,7 @@ class MusicPlayer(commands.Cog):
                 try:
                     await player.disconnect()
                 finally:
+                    self.reset_session_state(gid)
                     category = (
                         "disconnected_due_to_empty_channel"
                         if reason == "empty"
@@ -1192,7 +1291,8 @@ lavalink:
         item: Dict[str, Any],
         *,
         from_autoplay: bool = False,
-    ) -> bool:
+        player: Optional["pomice.Player"] = None,
+    ) -> EnqueueResult:
         if not self._node_ready.is_set():
             try:
                 await asyncio.wait_for(self._node_ready.wait(), timeout=1.0)
@@ -1202,29 +1302,31 @@ lavalink:
                     self._bootstrap_error
                     or "Lavalink node is not connected yet. Check that Lavalink is running and reachable.",
                 )
-                return False
+                return EnqueueResult(
+                    success=False,
+                    error=self._bootstrap_error
+                    or "Lavalink node is not connected yet. Check that Lavalink is running and reachable.",
+                )
         if not self._node_ready.is_set():
-            self._set_enqueue_error(
-                guild.id,
+            error_msg = (
                 self._bootstrap_error
-                or "Lavalink node is not connected yet. Check that Lavalink is running and reachable.",
+                or "Lavalink node is not connected yet. Check that Lavalink is running and reachable."
             )
-            return False
+            self._set_enqueue_error(guild.id, error_msg)
+            return EnqueueResult(success=False, error=error_msg)
 
-        player = (
-            guild.voice_client
-            if isinstance(guild.voice_client, pomice.Player)
-            else None
-        )
-        if not player or not is_voice_connected(player):
-            player = await self._ensure_player_connected(guild, item.get("requester"))
-            if not player:
-                if guild.id not in self._enqueue_errors:
-                    self._set_enqueue_error(
-                        guild.id,
-                        "Unable to join voice channel. Please verify permissions and try again.",
-                    )
-                return False
+        joined_channel: Optional[str] = None
+        if player is None or not is_voice_connected(player):
+            conn = await self.ensure_player_connected(guild, item.get("requester"))
+            if not conn.player:
+                error_msg = conn.error or self._enqueue_errors.get(guild.id)
+                if not error_msg:
+                    error_msg = "Unable to join voice channel. Please verify permissions and try again."
+                    self._set_enqueue_error(guild.id, error_msg)
+                return EnqueueResult(success=False, error=error_msg)
+            player = conn.player
+            if conn.joined:
+                joined_channel = conn.joined_channel
 
         cfg = self._get_music_config(guild.id)
         queue_limit_enabled = cfg.get("QueueLimitEnabled", True)
@@ -1258,7 +1360,8 @@ lavalink:
                 guild.id,
                 f"Failed to fetch tracks for '{query}': {e}",
             )
-            return False
+            error_msg = self._enqueue_errors.get(guild.id)
+            return EnqueueResult(success=False, error=error_msg)
 
         if not tracks and not is_url:
             search_term = str(item.get("title") or "").strip()
@@ -1297,10 +1400,13 @@ lavalink:
                 guild.id,
                 "No playable tracks were found for that query.",
             )
-            return False
+            error_msg = self._enqueue_errors.get(guild.id)
+            return EnqueueResult(success=False, error=error_msg)
 
         total_in_queue = player.queue.count
         queued = 0
+        first_track_title: Optional[str] = None
+        first_queue_position: Optional[int] = None
         filtered_by_duration = 0
         LOG.debug(
             "Guild %s enqueue: track_max_duration=%s, queue_limit=%s, tracks=%d",
@@ -1341,6 +1447,9 @@ lavalink:
                 }
                 self.queues[guild.id].append(entry)
                 queued += 1
+                if first_track_title is None:
+                    first_track_title = entry["title"]
+                    first_queue_position = total_in_queue + queued
             except Exception as exc:
                 LOG.warning(
                     "Failed to queue track '%s': %s",
@@ -1376,10 +1485,19 @@ lavalink:
                         guild.id,
                         "No tracks could be queued. Check logs for details.",
                     )
-            return False
+            error_msg = self._enqueue_errors.get(guild.id)
+            return EnqueueResult(success=False, error=error_msg)
 
         self._enqueue_errors.pop(guild.id, None)
-        return True
+        started_playback = not playback_active
+        return EnqueueResult(
+            success=True,
+            track_title=first_track_title,
+            queue_position=first_queue_position,
+            joined_channel=joined_channel,
+            started_playback=started_playback,
+            queued_count=queued,
+        )
 
     async def recommend(
         self, guild: discord.Guild, max_rec: int = 3
@@ -1388,8 +1506,7 @@ lavalink:
             max_rec_int = int(max_rec)
         except (TypeError, ValueError):
             max_rec_int = 3
-        limit = self._get_recommendation_limit(guild.id)
-        max_rec = max(1, min(limit, max_rec_int))
+        max_rec = max(1, min(DEFAULT_AUTOPLAY_MAX_RESULTS, max_rec_int))
 
         player = (
             guild.voice_client
@@ -1454,20 +1571,17 @@ lavalink:
 
     # votes
     def votes_needed(self, guild: discord.Guild) -> int:
-        cfg = self._get_music_config(guild.id)
-        percent = int(cfg.get("VoteSkipPercent", 60) or 0)
-        floor = int(cfg.get("VoteSkipFloor", 2) or 1)
         try:
             members = [m for m in guild.voice_client.channel.members if not m.bot]
         except Exception:
-            return max(1, floor)
+            return 1
 
         listeners = len(members)
         if listeners <= 1:
             return 1
 
-        needed = math.ceil(listeners * (percent / 100.0)) if percent > 0 else 0
-        return max(1, floor, needed)
+        needed = math.ceil(listeners * (DEFAULT_VOTESKIP_PERCENT / 100.0))
+        return max(1, needed)
 
     async def handle_vote_skip(
         self, guild: discord.Guild, user_id: int

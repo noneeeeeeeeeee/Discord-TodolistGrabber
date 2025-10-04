@@ -28,17 +28,22 @@ GITHUB_API = "https://api.github.com"
 LAVALINK_REPO = "lavalink-devs/Lavalink"
 YOUTUBE_PLUGIN_COORD = "dev.lavalink.youtube:youtube-plugin"
 SPONSORBLOCK_PLUGIN_COORD = "com.github.topi314.sponsorblock:sponsorblock-plugin"
-LAVASRC_PLUGIN_COORD = "com.github.topi314.lavasrc:lavasrc-plugin"
 DEFAULT_LAVALINK_VERSION = "4.1.1"
 DEFAULT_YOUTUBE_PLUGIN_VERSION = "1.13.5"
 DEFAULT_SPONSORBLOCK_PLUGIN_VERSION = "3.0.1"
-DEFAULT_LAVASRC_PLUGIN_VERSION = "4.8.1"
 LAVALINK_MAJOR = "4"
 
 HEADERS = {
     "Accept": "application/vnd.github+json",
     "User-Agent": "Discord-TodolistGrabber/1.0",
 }
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(slots=True)
@@ -135,22 +140,14 @@ class LavalinkManager:
                 default=DEFAULT_SPONSORBLOCK_PLUGIN_VERSION,
                 env_var="LAVALINK_SPONSORBLOCK_PLUGIN_VERSION",
             )
-            lavasrc_version = await self._resolve_plugin_version(
-                session,
-                repo="topi314/LavaSrc",
-                default=DEFAULT_LAVASRC_PLUGIN_VERSION,
-                env_var="LAVASRC_PLUGIN_VERSION",
-            )
 
         youtube_version = youtube_version or DEFAULT_YOUTUBE_PLUGIN_VERSION
         sponsor_version = sponsor_version or DEFAULT_SPONSORBLOCK_PLUGIN_VERSION
-        lavasrc_version = lavasrc_version or DEFAULT_LAVASRC_PLUGIN_VERSION
 
         self._purge_outdated_plugins(
             {
                 "youtube": youtube_version,
                 "sponsorblock": sponsor_version,
-                "lavasrc": lavasrc_version,
             }
         )
 
@@ -158,7 +155,6 @@ class LavalinkManager:
             config,
             youtube_version,
             sponsor_version,
-            lavasrc_version,
         )
 
     def _purge_outdated_plugins(self, expected_versions: dict[str, str]) -> None:
@@ -168,7 +164,6 @@ class LavalinkManager:
         patterns = {
             "youtube": "youtube-plugin",
             "sponsorblock": "sponsorblock-plugin",
-            "lavasrc": "lavasrc-plugin",
         }
 
         for key, prefix in patterns.items():
@@ -268,59 +263,8 @@ class LavalinkManager:
         config: LavalinkConfig,
         youtube_version: str,
         sponsor_version: str,
-        lavasrc_version: str,
     ) -> None:
-        spotify_client_id = os.getenv("LAVASRC_SPOTIFY_CLIENT_ID")
-        spotify_client_secret = os.getenv("LAVASRC_SPOTIFY_CLIENT_SECRET")
-        spotify_sp_dc = os.getenv("LAVASRC_SPOTIFY_SP_DC")
-        spotify_country = os.getenv("LAVASRC_SPOTIFY_COUNTRY", "US")
-        prefer_anonymous_raw = os.getenv("LAVASRC_SPOTIFY_PREFER_ANON")
-        prefer_anonymous = (
-            prefer_anonymous_raw.lower() in ("1", "true", "yes")
-            if isinstance(prefer_anonymous_raw, str)
-            else False
-        )
-
-        ytdlp_path = os.getenv("LAVASRC_YTDLP_PATH", "yt-dlp")
-
-        lavasrc_config: dict[str, Any] = {
-            "providers": [
-                'ytsearch:"%ISRC%"',
-                "ytsearch:%QUERY%",
-            ],
-            "sources": {
-                "spotify": True,
-                "applemusic": False,
-                "deezer": False,
-                "yandexmusic": False,
-                "flowerytts": False,
-                "youtube": False,
-                "vkmusic": False,
-                "tidal": False,
-                "qobuz": False,
-                "ytdlp": True,
-                "jiosaavn": False,
-            },
-        }
-
-        spotify_section: dict[str, Any] = {"countryCode": spotify_country}
-        if spotify_client_id:
-            spotify_section["clientId"] = spotify_client_id
-        if spotify_client_secret:
-            spotify_section["clientSecret"] = spotify_client_secret
-        if spotify_sp_dc:
-            spotify_section["spDc"] = spotify_sp_dc
-        if prefer_anonymous:
-            spotify_section["preferAnonymousToken"] = True
-
-        if spotify_section:
-            lavasrc_config["spotify"] = spotify_section
-
-        if ytdlp_path:
-            lavasrc_config["ytdlp"] = {
-                "path": ytdlp_path,
-                "searchLimit": 10,
-            }
+        youtube_plugin_settings = self._build_youtube_plugin_config()
 
         yaml_payload = {
             "server": {
@@ -337,11 +281,6 @@ class LavalinkManager:
                     },
                     {
                         "dependency": f"{SPONSORBLOCK_PLUGIN_COORD}:{sponsor_version}",
-                        "snapshot": False,
-                    },
-                    {
-                        "dependency": f"{LAVASRC_PLUGIN_COORD}:{lavasrc_version}",
-                        "repository": "https://maven.lavalink.dev/releases",
                         "snapshot": False,
                     },
                 ],
@@ -376,12 +315,12 @@ class LavalinkManager:
                     "useSeekGhosting": True,
                 },
             },
+            "plugins": {
+                "youtube": youtube_plugin_settings,
+            },
             "logging": {
                 "file": {"path": "./logs/"},
                 "level": {"root": "DEBUG", "lavalink": "DEBUG"},
-            },
-            "plugins": {
-                "lavasrc": lavasrc_config,
             },
         }
 
@@ -393,6 +332,80 @@ class LavalinkManager:
         )
         if existing.strip() != content.strip():
             self.config_path.write_text(content, encoding="utf-8")
+
+    def _build_youtube_plugin_config(self) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "enabled": _env_bool("YOUTUBE_PLUGIN_ENABLED", True),
+            "allowSearch": _env_bool("YOUTUBE_PLUGIN_ALLOW_SEARCH", True),
+            "allowDirectVideoIds": _env_bool(
+                "YOUTUBE_PLUGIN_ALLOW_DIRECT_VIDEO_IDS", True
+            ),
+            "allowDirectPlaylistIds": _env_bool(
+                "YOUTUBE_PLUGIN_ALLOW_DIRECT_PLAYLIST_IDS", True
+            ),
+        }
+
+        clients_raw = os.getenv("YOUTUBE_PLUGIN_CLIENTS")
+        if clients_raw:
+            clients = [
+                client.strip().upper()
+                for client in clients_raw.split(",")
+                if client.strip()
+            ]
+            if clients:
+                config["clients"] = clients
+        else:
+            config["clients"] = [
+                "MUSIC",
+                "ANDROID_VR",
+                "IOS",
+                "WEB",
+                "WEBEMBEDDED",
+            ]
+
+        remote_cipher_url = os.getenv("YOUTUBE_PLUGIN_REMOTE_CIPHER_URL")
+        remote_cipher_password = os.getenv("YOUTUBE_PLUGIN_REMOTE_CIPHER_PASSWORD")
+        if remote_cipher_url:
+            remote_block: dict[str, Any] = {"url": remote_cipher_url}
+            if remote_cipher_password:
+                remote_block["password"] = remote_cipher_password
+            config["remoteCipher"] = remote_block
+
+        po_token = os.getenv("YOUTUBE_PLUGIN_POTOKEN")
+        visitor_data = os.getenv("YOUTUBE_PLUGIN_VISITOR_DATA")
+        if po_token or visitor_data:
+            pot_section: dict[str, Any] = {}
+            if po_token:
+                pot_section["token"] = po_token
+            if visitor_data:
+                pot_section["visitorData"] = visitor_data
+            if pot_section:
+                config["pot"] = pot_section
+
+        oauth_enabled = _env_bool("YOUTUBE_PLUGIN_OAUTH_ENABLED", False)
+        oauth_refresh = os.getenv("YOUTUBE_PLUGIN_OAUTH_REFRESH_TOKEN")
+        oauth_skip_init = _env_bool("YOUTUBE_PLUGIN_OAUTH_SKIP_INITIALIZATION", False)
+        if oauth_enabled or oauth_refresh or oauth_skip_init:
+            oauth_section: dict[str, Any] = {
+                "enabled": oauth_enabled or bool(oauth_refresh)
+            }
+            if oauth_refresh:
+                oauth_section["refreshToken"] = oauth_refresh
+            if oauth_skip_init:
+                oauth_section["skipInitialization"] = True
+            config["oauth"] = oauth_section
+
+        client_options_raw = os.getenv("YOUTUBE_PLUGIN_CLIENT_OPTIONS_JSON")
+        if client_options_raw:
+            try:
+                parsed = json.loads(client_options_raw)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(parsed, dict):
+                    config["clientOptions"] = parsed
+
+        return config
 
     async def _start_process(self) -> bool:
         java_binary = os.getenv("LAVALINK_JAVA_PATH") or "java"
@@ -424,15 +437,18 @@ class LavalinkManager:
 
         try:
             self._process = subprocess.Popen(argv, **start_kwargs)
-            print(f"[Lavalink] Launched subprocess (PID={self._process.pid})")
+            print(f"[Music] Starting Lavalink process at PID={self._process.pid}")
             return True
         except FileNotFoundError:
             print(
-                "[Lavalink] Unable to invoke Java. Please ensure Java 17+ is installed and on PATH, "
+                "[Music] Error starting Lavalink: Unable to invoke Java. Please ensure Java 17+ is installed and on PATH, "
                 "or set LAVALINK_JAVA_PATH to the JVM executable."
             )
         except Exception as exc:  # pragma: no cover - defensive
-            print(f"[Lavalink] Failed to launch Lavalink: {exc}")
+            print(f"[Music] Error starting Lavalink: {exc}")
+            import traceback
+
+            traceback.print_exc()
         return False
 
     async def _terminate_process(self) -> None:
@@ -470,7 +486,7 @@ class LavalinkManager:
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._is_port_open(host, port):
-                print(f"[Lavalink] Port {host}:{port} is now ready")
+                print(f"[Music] Successfully started Lavalink")
                 return True
             await asyncio.sleep(1.0)
         return False
