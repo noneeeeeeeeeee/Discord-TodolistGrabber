@@ -93,26 +93,48 @@ class Update(commands.Cog):
             if hasattr(self, "message") and self.message:
                 await self.message.edit(view=self)
 
-    # New: multi-option view
-    class ChooseUpdateView(discord.ui.View):
+    # New: multi-option view with flexible options
+    class ChooseActionView(discord.ui.View):
         def __init__(
-            self, author_id: int, enable_stable: bool, enable_prerelease: bool
+            self,
+            author_id: int,
+            enable_stable: bool = True,
+            enable_prerelease: bool = True,
+            enable_reinstall: bool = False,
+            enable_switch: bool = False,
+            switch_label: str = "Switch Channel",
         ):
-            super().__init__(timeout=45.0)
+            super().__init__(timeout=60.0)
             self.author_id = author_id
             self.choice = None
-            # Enable/disable after the auto-created buttons exist
+            self.enable_stable = enable_stable
+            self.enable_prerelease = enable_prerelease
+            self.enable_reinstall = enable_reinstall
+            self.enable_switch = enable_switch
+            self.switch_label = switch_label
+
+            # Dynamically update button states
+            self._update_buttons()
+
+        def _update_buttons(self):
+            """Update button visibility and enabled state."""
             for child in self.children:
                 if isinstance(child, discord.ui.Button):
                     if child.custom_id == "choose_stable":
-                        child.disabled = not enable_stable
+                        child.disabled = not self.enable_stable
                     elif child.custom_id == "choose_prerelease":
-                        child.disabled = not enable_prerelease
+                        child.disabled = not self.enable_prerelease
+                    elif child.custom_id == "choose_reinstall":
+                        child.disabled = not self.enable_reinstall
+                    elif child.custom_id == "choose_switch":
+                        child.disabled = not self.enable_switch
+                        child.label = self.switch_label
 
         @discord.ui.button(
-            label="Update to Stable (recommended)",
+            label="Update to Stable",
             style=discord.ButtonStyle.green,
             custom_id="choose_stable",
+            row=0,
         )
         async def choose_stable(
             self, interaction: discord.Interaction, button: discord.ui.Button
@@ -129,9 +151,10 @@ class Update(commands.Cog):
             self.stop()
 
         @discord.ui.button(
-            label="Update to Prerelease (may be unstable)",
+            label="Update to Prerelease",
             style=discord.ButtonStyle.blurple,
             custom_id="choose_prerelease",
+            row=0,
         )
         async def choose_prerelease(
             self, interaction: discord.Interaction, button: discord.ui.Button
@@ -147,7 +170,47 @@ class Update(commands.Cog):
             )
             self.stop()
 
-        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
+        @discord.ui.button(
+            label="Reinstall Current",
+            style=discord.ButtonStyle.grey,
+            custom_id="choose_reinstall",
+            row=1,
+        )
+        async def choose_reinstall(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            if interaction.user.id != self.author_id:
+                await interaction.response.send_message(
+                    ":x: You are not authorized to choose this option.", ephemeral=True
+                )
+                return
+            self.choice = "reinstall"
+            await interaction.response.send_message(
+                ":white_check_mark: Reinstalling current version."
+            )
+            self.stop()
+
+        @discord.ui.button(
+            label="Switch Channel",
+            style=discord.ButtonStyle.primary,
+            custom_id="choose_switch",
+            row=1,
+        )
+        async def choose_switch(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            if interaction.user.id != self.author_id:
+                await interaction.response.send_message(
+                    ":x: You are not authorized to choose this option.", ephemeral=True
+                )
+                return
+            self.choice = "switch"
+            await interaction.response.send_message(
+                ":white_check_mark: Switching channel."
+            )
+            self.stop()
+
+        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red, row=2)
         async def cancel(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
@@ -165,8 +228,20 @@ class Update(commands.Cog):
             if hasattr(self, "message") and self.message:
                 await self.message.edit(view=self)
 
+    def _truncate_changelog(self, changelog: str, max_length: int = 3500) -> str:
+        """Truncate changelog to fit within Discord embed limits."""
+        if not changelog or len(changelog) <= max_length:
+            return changelog
+        return (
+            changelog[:max_length]
+            + "\n\n... (changelog truncated, see full release notes on GitHub)"
+        )
+
     @commands.hybrid_command(name="checkupdates", description="Check for updates.")
-    async def check_updates(self, ctx: commands.Context):
+    @discord.app_commands.describe(
+        channel="Update channel to check: 'stable' (default) or 'prerelease'"
+    )
+    async def check_updates(self, ctx: commands.Context, channel: str = "stable"):
         # OWNER gate
         try:
             owner_env = os.getenv("OWNER_ID")
@@ -194,6 +269,20 @@ class Update(commands.Cog):
                 pass
             return
 
+        # Normalize channel parameter
+        channel = channel.lower().strip()
+        if channel not in ["stable", "prerelease", "pre"]:
+            await ctx.send(
+                ":x: Invalid channel. Use 'stable' or 'prerelease'.", delete_after=10
+            )
+            return
+
+        # Normalize 'pre' to 'prerelease'
+        if channel == "pre":
+            channel = "prerelease"
+
+        check_prerelease = channel == "prerelease"
+
         try:
             # Check for updates
             result = check.check_update()
@@ -207,7 +296,20 @@ class Update(commands.Cog):
             def cmp(a, b):
                 return Update._cmp_versions(a or "0", b or "0")
 
-            # Determine valid upgrade candidates (strictly higher than current)
+            # Determine what type of version we're currently on
+            current_parsed = Update._parse_version(current_version)
+            is_on_prerelease = current_parsed[3] == 1  # prerelease flag
+            is_on_stable = not is_on_prerelease
+
+            # Check if current matches stable or prerelease
+            on_latest_stable = (
+                stable_version and cmp(current_version, stable_version) == 0
+            )
+            on_latest_prerelease = (
+                prerelease_version and cmp(current_version, prerelease_version) == 0
+            )
+
+            # Determine valid upgrade candidates
             stable_candidate = bool(
                 stable_version and cmp(current_version, stable_version) < 0
             )
@@ -215,153 +317,286 @@ class Update(commands.Cog):
                 prerelease_version and cmp(current_version, prerelease_version) < 0
             )
 
-            # Up-to-date checks with prerelease-aware logic
-            up_to_date = False
-            reason = ""
-            if prerelease_version and cmp(current_version, prerelease_version) == 0:
-                up_to_date = True
-                reason = "You are on the latest prerelease."
-            elif stable_candidate or prerelease_candidate:
-                up_to_date = False
-            else:
-                up_to_date = True
-                reason = "You are on the latest stable."
-
-            if up_to_date:
-                embed = discord.Embed(
-                    title="No Updates Available",
-                    description=f"{reason}\nCurrent version: {current_version}",
-                    color=discord.Color.dark_gray(),
-                )
-                if stable_version:
-                    embed.add_field(
-                        name="Latest Stable", value=stable_version, inline=True
+            # Logic based on channel parameter
+            if check_prerelease:
+                # User wants to check prerelease channel
+                if on_latest_prerelease:
+                    # Already on latest prerelease
+                    embed = discord.Embed(
+                        title="✅ Up to Date (Prerelease)",
+                        description=f"You are on the latest prerelease version.\n\n**Current:** {current_version}",
+                        color=discord.Color.blue(),
                     )
-                if prerelease_version:
+                    if stable_version:
+                        embed.add_field(
+                            name="Latest Stable", value=stable_version, inline=True
+                        )
+                    if prerelease_version:
+                        embed.add_field(
+                            name="Latest Prerelease",
+                            value=prerelease_version,
+                            inline=True,
+                        )
+
+                    # Offer options to reinstall or switch to stable
+                    view = self.ChooseActionView(
+                        ctx.author.id,
+                        enable_stable=False,
+                        enable_prerelease=False,
+                        enable_reinstall=True,
+                        enable_switch=stable_version is not None,
+                        switch_label="Switch to Stable",
+                    )
+                    view.message = await ctx.send(embed=embed, view=view)
+                    await view.wait()
+
+                    if view.choice == "reinstall":
+                        self._start_ota("--prefer-prerelease")
+                        await ctx.send(
+                            ":warning: Reinstalling current prerelease version..."
+                        )
+                    elif view.choice == "switch":
+                        self._start_ota("--prefer-stable")
+                        await ctx.send(":warning: Switching to stable channel...")
+                    return
+
+                elif prerelease_candidate:
+                    # New prerelease available
+                    prerelease_changelog_truncated = self._truncate_changelog(
+                        prerelease_changelog or "No changelog provided.", 3800
+                    )
+                    desc = f"# Changelog v{prerelease_version}\n{prerelease_changelog_truncated}\n\n:warning: This is a prerelease and may be unstable."
+                    embed = discord.Embed(
+                        title="🆕 Prerelease Update Available",
+                        description=desc,
+                        color=discord.Color.orange(),
+                    )
+                    embed.add_field(name="Current", value=current_version, inline=True)
                     embed.add_field(
                         name="Latest Prerelease", value=prerelease_version, inline=True
                     )
-                await ctx.send(embed=embed)
-                return
+                    if stable_version:
+                        embed.add_field(
+                            name="Latest Stable", value=stable_version, inline=True
+                        )
 
-            # If both candidates exist, let user choose
-            if stable_candidate and prerelease_candidate:
-                desc_parts = []
-                desc_parts.append(
-                    f"Stable target: v{stable_version}\n{stable_changelog or 'No changelog provided.'}"
-                )
-                desc_parts.append(
-                    f"\nPrerelease target: v{prerelease_version}\n{prerelease_changelog or 'No changelog provided.'}\n:warning: Prereleases may be unstable."
-                )
-                embed = discord.Embed(
-                    title="Multiple updates available",
-                    description="\n".join(desc_parts),
-                    color=discord.Color.gold(),
-                )
-                embed.add_field(
-                    name="Current Version", value=current_version, inline=False
-                )
-                view = self.ChooseUpdateView(
-                    ctx.author.id, enable_stable=True, enable_prerelease=True
-                )
-                view.message = await ctx.send(embed=embed, view=view)
-                await view.wait()
+                    view = self.ChooseActionView(
+                        ctx.author.id,
+                        enable_stable=False,
+                        enable_prerelease=True,
+                        enable_reinstall=True,
+                        enable_switch=stable_version and not on_latest_stable,
+                        switch_label="Switch to Stable" if stable_version else "Switch",
+                    )
+                    view.message = await ctx.send(embed=embed, view=view)
+                    await view.wait()
 
-                if view.choice == "stable":
-                    subprocess.Popen(
-                        [
-                            "python",
-                            "modules/otaUpdate/startOTA.py",
-                            "worker",
-                            "--prefer-stable",
-                        ],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                    await ctx.send(
-                        ":warning: The bot will now shortly shutdown for OTA update to Stable. If it doesn't turn back on in a few minutes, please check the ota_logs."
-                    )
-                elif view.choice == "prerelease":
-                    subprocess.Popen(
-                        [
-                            "python",
-                            "modules/otaUpdate/startOTA.py",
-                            "worker",
-                            "--prefer-prerelease",
-                        ],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                    await ctx.send(
-                        ":warning: The bot will now shortly shutdown for OTA update to Prerelease. If it doesn't turn back on in a few minutes, please check the ota_logs."
-                    )
+                    if view.choice == "prerelease":
+                        self._start_ota("--prefer-prerelease")
+                        await ctx.send(":warning: Updating to latest prerelease...")
+                    elif view.choice == "reinstall":
+                        self._start_ota("--prefer-prerelease")
+                        await ctx.send(":warning: Reinstalling current version...")
+                    elif view.choice == "switch":
+                        self._start_ota("--prefer-stable")
+                        await ctx.send(":warning: Switching to stable channel...")
+                    elif view.choice is None:
+                        await ctx.send("Update cancelled.")
+                    return
                 else:
-                    await ctx.send("OTA update cancelled.")
-                return
+                    # No prerelease updates
+                    embed = discord.Embed(
+                        title="ℹ️ No Prerelease Updates",
+                        description=f"No newer prerelease versions available.\n\n**Current:** {current_version}",
+                        color=discord.Color.greyple(),
+                    )
+                    if stable_version:
+                        embed.add_field(
+                            name="Latest Stable", value=stable_version, inline=True
+                        )
+                    if prerelease_version:
+                        embed.add_field(
+                            name="Latest Prerelease",
+                            value=prerelease_version,
+                            inline=True,
+                        )
 
-            # Otherwise, single target flow (confirm + pass appropriate flag)
-            is_prerelease_target = prerelease_candidate and not stable_candidate
-            target_version = (
-                prerelease_version if is_prerelease_target else stable_version
-            )
-            target_changelog = (
-                prerelease_changelog if is_prerelease_target else stable_changelog
-            ) or "No changelog provided."
-            title = (
-                "Prerelease Available" if is_prerelease_target else "Update Available!"
-            )
-            warn = (
-                "\n:warning: This is a prerelease and may be unstable."
-                if is_prerelease_target
-                else ""
-            )
-            desc = f"# Changelog v{target_version}\n{target_changelog}{warn}"
-            embed = discord.Embed(
-                title=title,
-                description=desc,
-                color=(
-                    discord.Color.orange()
-                    if is_prerelease_target
-                    else discord.Color.green()
-                ),
-            )
-            embed.add_field(name="Current Version", value=current_version, inline=True)
-            if stable_version:
-                embed.add_field(name="Latest Stable", value=stable_version, inline=True)
-            if prerelease_version:
-                embed.add_field(
-                    name="Latest Prerelease", value=prerelease_version, inline=True
-                )
+                    view = self.ChooseActionView(
+                        ctx.author.id,
+                        enable_stable=False,
+                        enable_prerelease=False,
+                        enable_reinstall=True,
+                        enable_switch=stable_version is not None,
+                        switch_label="Switch to Stable",
+                    )
+                    view.message = await ctx.send(embed=embed, view=view)
+                    await view.wait()
 
-            view = self.ConfirmUpdateView(ctx.author.id)
-            view.message = await ctx.send(embed=embed, view=view)
-            await view.wait()
+                    if view.choice == "reinstall":
+                        self._start_ota(
+                            "--prefer-prerelease"
+                            if is_on_prerelease
+                            else "--prefer-stable"
+                        )
+                        await ctx.send(":warning: Reinstalling current version...")
+                    elif view.choice == "switch":
+                        self._start_ota("--prefer-stable")
+                        await ctx.send(":warning: Switching to stable channel...")
+                    return
 
-            if view.value:
-                args = [
-                    "python",
-                    "modules/otaUpdate/startOTA.py",
-                    "worker",
-                    (
-                        "--prefer-prerelease"
-                        if is_prerelease_target
-                        else "--prefer-stable"
-                    ),
-                ]
-                subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                await ctx.send(
-                    ":warning: The bot will now shortly shutdown for OTA update. If it doesn't turn back on in a few minutes, please check the ota_logs."
-                )
             else:
-                await ctx.send("OTA update cancelled.")
+                # User wants to check stable channel (default)
+                if on_latest_stable:
+                    # Already on latest stable
+                    embed = discord.Embed(
+                        title="✅ Up to Date (Stable)",
+                        description=f"You are on the latest stable version.\n\n**Current:** {current_version}",
+                        color=discord.Color.green(),
+                    )
+                    if stable_version:
+                        embed.add_field(
+                            name="Latest Stable", value=stable_version, inline=True
+                        )
+                    if prerelease_version:
+                        embed.add_field(
+                            name="Latest Prerelease",
+                            value=prerelease_version,
+                            inline=True,
+                        )
+
+                    # Offer options to reinstall or switch to prerelease
+                    view = self.ChooseActionView(
+                        ctx.author.id,
+                        enable_stable=False,
+                        enable_prerelease=False,
+                        enable_reinstall=True,
+                        enable_switch=prerelease_version is not None,
+                        switch_label="Switch to Prerelease",
+                    )
+                    view.message = await ctx.send(embed=embed, view=view)
+                    await view.wait()
+
+                    if view.choice == "reinstall":
+                        self._start_ota("--prefer-stable")
+                        await ctx.send(
+                            ":warning: Reinstalling current stable version..."
+                        )
+                    elif view.choice == "switch":
+                        self._start_ota("--prefer-prerelease")
+                        await ctx.send(":warning: Switching to prerelease channel...")
+                    return
+
+                elif stable_candidate:
+                    # New stable version available
+                    stable_changelog_truncated = self._truncate_changelog(
+                        stable_changelog or "No changelog provided.", 3800
+                    )
+                    desc = (
+                        f"# Changelog v{stable_version}\n{stable_changelog_truncated}"
+                    )
+                    embed = discord.Embed(
+                        title="🎉 Stable Update Available",
+                        description=desc,
+                        color=discord.Color.green(),
+                    )
+                    embed.add_field(name="Current", value=current_version, inline=True)
+                    embed.add_field(
+                        name="Latest Stable", value=stable_version, inline=True
+                    )
+                    if prerelease_version:
+                        embed.add_field(
+                            name="Latest Prerelease",
+                            value=prerelease_version,
+                            inline=True,
+                        )
+
+                    view = self.ChooseActionView(
+                        ctx.author.id,
+                        enable_stable=True,
+                        enable_prerelease=False,
+                        enable_reinstall=True,
+                        enable_switch=prerelease_version and not on_latest_prerelease,
+                        switch_label=(
+                            "Switch to Prerelease" if prerelease_version else "Switch"
+                        ),
+                    )
+                    view.message = await ctx.send(embed=embed, view=view)
+                    await view.wait()
+
+                    if view.choice == "stable":
+                        self._start_ota("--prefer-stable")
+                        await ctx.send(":warning: Updating to latest stable version...")
+                    elif view.choice == "reinstall":
+                        self._start_ota(
+                            "--prefer-stable" if is_on_stable else "--prefer-prerelease"
+                        )
+                        await ctx.send(":warning: Reinstalling current version...")
+                    elif view.choice == "switch":
+                        self._start_ota("--prefer-prerelease")
+                        await ctx.send(":warning: Switching to prerelease channel...")
+                    elif view.choice is None:
+                        await ctx.send("Update cancelled.")
+                    return
+                else:
+                    # No stable updates
+                    embed = discord.Embed(
+                        title="ℹ️ No Stable Updates",
+                        description=f"No newer stable versions available.\n\n**Current:** {current_version}",
+                        color=discord.Color.greyple(),
+                    )
+                    if stable_version:
+                        embed.add_field(
+                            name="Latest Stable", value=stable_version, inline=True
+                        )
+                    if prerelease_version:
+                        embed.add_field(
+                            name="Latest Prerelease",
+                            value=prerelease_version,
+                            inline=True,
+                        )
+
+                    view = self.ChooseActionView(
+                        ctx.author.id,
+                        enable_stable=False,
+                        enable_prerelease=False,
+                        enable_reinstall=True,
+                        enable_switch=prerelease_version is not None,
+                        switch_label="Switch to Prerelease",
+                    )
+                    view.message = await ctx.send(embed=embed, view=view)
+                    await view.wait()
+
+                    if view.choice == "reinstall":
+                        self._start_ota(
+                            "--prefer-stable" if is_on_stable else "--prefer-prerelease"
+                        )
+                        await ctx.send(":warning: Reinstalling current version...")
+                    elif view.choice == "switch":
+                        self._start_ota("--prefer-prerelease")
+                        await ctx.send(":warning: Switching to prerelease channel...")
+                    return
+
         except Exception as e:
             embed = discord.Embed(
-                title="Error Checking Updates",
+                title="❌ Error Checking Updates",
                 description=f"Error: {e}",
                 color=discord.Color.red(),
             )
             await ctx.send(embed=embed)
-            print(f"Error: {e}")
+            print(f"Error in checkupdates: {e}")
+
+    def _start_ota(self, flag: str):
+        """Helper to start OTA update process."""
+        subprocess.Popen(
+            [
+                "python",
+                "modules/otaUpdate/startOTA.py",
+                "worker",
+                flag,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
 
 async def setup(bot):
