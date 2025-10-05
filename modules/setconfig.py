@@ -99,7 +99,8 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
         "Enabled": {
             "type": "bool",
             "default": False,
-            "access": 1,
+            "access": 3,
+            "description": "Note: This module is in beta, it may be unstable.",
         },
         "DJRole": {"type": "role|null", "default": None, "access": 0},
         "DJMode": {
