@@ -325,6 +325,16 @@ class PlayCommands(commands.Cog):
         """Play a direct URL without search results."""
         is_dj = await player._check_dj(ctx.author, ctx.guild)
 
+        # Check if URL might be a playlist
+        is_playlist_url = any(
+            [
+                "list=" in source,
+                "/playlist" in source,
+                "/album" in source,
+                "/sets/" in source,  # SoundCloud sets
+            ]
+        )
+
         item = {"title": source, "requester": ctx.author.id, "source": source}
 
         connection = await player.ensure_player_connected(ctx.guild, ctx.author.id)
@@ -354,7 +364,15 @@ class PlayCommands(commands.Cog):
                 joined_name = "Voice Channel"
             await ctx.send(f":arrow_right: Joined `{joined_name}`")
 
-        search_message = await ctx.send(f":mag_right: Loading `{escaped_query}`...")
+        if is_playlist_url:
+            search_message = await ctx.send(
+                f":mag_right: Loading playlist from `{escaped_query}`..."
+            )
+        else:
+            search_message = await ctx.send(f":mag_right: Loading `{escaped_query}`...")
+
+        # Track queue size before and after
+        queue_before = len(player.queues.get(ctx.guild.id, []))
 
         enqueue_result = await player.enqueue(
             ctx.guild, item, player=connection.player, is_dj=is_dj
@@ -368,16 +386,45 @@ class PlayCommands(commands.Cog):
             await search_message.edit(content=f":x: {reason}")
             return
 
-        added_title = (enqueue_result.track_title or source).replace("`", "\\`")
+        # Check if multiple tracks were added (playlist)
+        queue_after = len(player.queues.get(ctx.guild.id, []))
+        tracks_added = queue_after - queue_before
+
+        # If playing started, count that as +1 track
         if enqueue_result.started_playback:
-            await search_message.edit(content=f"▶️ Now playing: **{added_title}**")
-        else:
-            position = enqueue_result.queue_position or connection.player.queue.count
-            await search_message.edit(
-                content=(
-                    f":clock130: Queued `{added_title}`\n" f"-# Position: {position}"
+            tracks_added += 1
+
+        added_title = (enqueue_result.track_title or source).replace("`", "\\`")
+
+        # Playlist detected: show summary instead of listing all tracks
+        if is_playlist_url and tracks_added > 1:
+            if enqueue_result.started_playback:
+                await search_message.edit(
+                    content=f"📋 **Playlist loaded!**\n"
+                    f"▶️ Now playing: **{added_title}**\n"
+                    f"✅ Added **{tracks_added - 1}** more tracks to queue\n"
+                    f"-# Use `/queue` to see all queued tracks"
                 )
-            )
+            else:
+                await search_message.edit(
+                    content=f"📋 **Playlist loaded!**\n"
+                    f"✅ Added **{tracks_added}** tracks to queue\n"
+                    f"-# Use `/queue` to see all queued tracks"
+                )
+        else:
+            # Single track
+            if enqueue_result.started_playback:
+                await search_message.edit(content=f"▶️ Now playing: **{added_title}**")
+            else:
+                position = (
+                    enqueue_result.queue_position or connection.player.queue.count
+                )
+                await search_message.edit(
+                    content=(
+                        f":clock130: Queued `{added_title}`\n"
+                        f"-# Position: {position}"
+                    )
+                )
 
     async def _play_first_result(
         self, ctx: commands.Context, query: str, escaped_query: str, player

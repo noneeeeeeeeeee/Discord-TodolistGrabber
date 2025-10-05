@@ -15,7 +15,7 @@ class QueueCommands(commands.Cog):
     @commands.hybrid_command(
         name="queue", description="Show current queue.", aliases=["q"]
     )
-    async def queue(self, ctx: commands.Context):
+    async def queue(self, ctx: commands.Context, page: int = 1):
         player = self.bot.get_cog("MusicPlayer")
         if not player:
             await ctx.send("Player backend not available.")
@@ -56,17 +56,36 @@ class QueueCommands(commands.Cog):
             )
 
         if upcoming:
-            lines = [
-                self._format_entry(entry, idx)
-                for idx, entry in enumerate(upcoming[:25], start=1)
-            ]
+            # Pagination to handle Discord's 1024 character limit
+            items_per_page = 10
+            total_pages = max(1, (len(upcoming) + items_per_page - 1) // items_per_page)
+            page = max(1, min(page, total_pages))  # Clamp page number
+
+            start_idx = (page - 1) * items_per_page
+            end_idx = min(start_idx + items_per_page, len(upcoming))
+
+            # Build queue text with character limit safety
+            lines = []
+            char_count = 0
+            for idx in range(start_idx, end_idx):
+                entry = upcoming[idx]
+                line = self._format_entry(entry, idx + 1)
+                # Safety check: if adding this line would exceed 1000 chars, stop
+                if char_count + len(line) + 1 > 1000:
+                    break
+                lines.append(line)
+                char_count += len(line) + 1  # +1 for newline
+
+            queue_text = "\n".join(lines) if lines else "*Page is empty*"
+
             embed.add_field(
-                name=f"⏭️ Up Next ({min(len(upcoming), 25)}/{len(upcoming)})",
-                value="\n".join(lines),
+                name=f"⏭️ Up Next (Page {page}/{total_pages}) • {len(upcoming)} total",
+                value=queue_text,
                 inline=False,
             )
-            if len(upcoming) > 25:
-                embed.set_footer(text=f"…and {len(upcoming) - 25} more item(s) queued.")
+
+            if total_pages > 1:
+                embed.set_footer(text=f"Use /queue {page + 1} to see the next page")
         else:
             embed.add_field(
                 name="⏭️ Up Next",
@@ -97,6 +116,11 @@ class QueueCommands(commands.Cog):
     ) -> str:
         title = entry.get("title") or "Unknown"
         uri = entry.get("uri")
+
+        # Truncate title if too long
+        max_title_length = 80
+        if len(title) > max_title_length:
+            title = title[: max_title_length - 3] + "..."
 
         # Format duration if available
         track_obj = entry.get("track")
