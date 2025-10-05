@@ -453,8 +453,12 @@ class QueueManagementView(View):
             self.player.queues[guild_id] = new_queue
             message = f"🗑️ **{username}** removed {removed} duplicate song(s) from queue"
             await interaction.response.send_message(message)
-            if self.ctx.channel:
-                await self.ctx.channel.send(message)
+            # Send to channel if available (not FakeContext)
+            if hasattr(self.ctx, "channel") and self.ctx.channel:
+                try:
+                    await self.ctx.channel.send(message)
+                except:
+                    pass
 
         elif action == "reverse":
             from collections import deque
@@ -462,8 +466,11 @@ class QueueManagementView(View):
             self.player.queues[guild_id] = deque(list(queue)[::-1])
             message = f"🔄 **{username}** reversed the queue"
             await interaction.response.send_message(message)
-            if self.ctx.channel:
-                await self.ctx.channel.send(message)
+            if hasattr(self.ctx, "channel") and self.ctx.channel:
+                try:
+                    await self.ctx.channel.send(message)
+                except:
+                    pass
 
         elif action == "remove_absent":
             from collections import deque
@@ -483,8 +490,11 @@ class QueueManagementView(View):
             self.player.queues[guild_id] = new_queue
             message = f"👤 **{username}** removed {removed} song(s) from absent users"
             await interaction.response.send_message(message)
-            if self.ctx.channel:
-                await self.ctx.channel.send(message)
+            if hasattr(self.ctx, "channel") and self.ctx.channel:
+                try:
+                    await self.ctx.channel.send(message)
+                except:
+                    pass
 
         elif action == "sort_title":
             from collections import deque
@@ -493,8 +503,11 @@ class QueueManagementView(View):
             self.player.queues[guild_id] = deque(sorted_queue)
             message = f"🔤 **{username}** sorted queue by title"
             await interaction.response.send_message(message)
-            if self.ctx.channel:
-                await self.ctx.channel.send(message)
+            if hasattr(self.ctx, "channel") and self.ctx.channel:
+                try:
+                    await self.ctx.channel.send(message)
+                except:
+                    pass
 
         elif action == "sort_requester":
             from collections import deque
@@ -503,8 +516,11 @@ class QueueManagementView(View):
             self.player.queues[guild_id] = deque(sorted_queue)
             message = f"👥 **{username}** sorted queue by requester"
             await interaction.response.send_message(message)
-            if self.ctx.channel:
-                await self.ctx.channel.send(message)
+            if hasattr(self.ctx, "channel") and self.ctx.channel:
+                try:
+                    await self.ctx.channel.send(message)
+                except:
+                    pass
 
 
 class PlayerControlView(View):

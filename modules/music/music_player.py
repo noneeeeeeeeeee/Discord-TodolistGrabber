@@ -1211,13 +1211,14 @@ class MusicPlayer(commands.Cog):
 
                 # Create a fake context for the view
                 class FakeContext:
-                    def __init__(self, bot, guild, author_id):
+                    def __init__(self, bot, guild, author_id, channel):
                         self.bot = bot
                         self.guild = guild
                         self.author = type("obj", (object,), {"id": author_id})
+                        self.channel = channel  # Add channel attribute
 
                 fake_ctx = FakeContext(
-                    self.bot, guild, requester_id or self.bot.user.id
+                    self.bot, guild, requester_id or self.bot.user.id, txt
                 )
                 view = PlayerControlView(
                     fake_ctx, self, persistent=True, is_announcement=True
