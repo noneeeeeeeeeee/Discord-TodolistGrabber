@@ -215,6 +215,12 @@ class ControlCommands(commands.Cog):
         # Set volume (Pomice uses 0-1000 range, we cap at 200 for safety)
         try:
             await vc.set_volume(value)
+
+            # Save volume to config if RememberLastVolume is enabled
+            from modules.music.player_actions import _save_volume_to_config
+
+            await _save_volume_to_config(player, ctx.guild.id, value)
+
             # Announce publicly - include vote count if vote passed
             if permission.get("needs_vote") and vote_result.get("passed"):
                 await ctx.send(
@@ -240,6 +246,12 @@ class ControlCommands(commands.Cog):
     )
     async def repeat(self, ctx: commands.Context, mode: str = None):
         """Set repeat mode with voting system."""
+        from modules.music.player_actions import (
+            handle_repeat_action,
+            validate_user_in_voice,
+            validate_same_voice_channel,
+        )
+
         player = self._get_player()
         if not player:
             await ctx.send(":x: Player backend not available.")
@@ -248,7 +260,7 @@ class ControlCommands(commands.Cog):
         # If no mode specified, show current mode
         if mode is None:
             current = player.repeat_mode.get(ctx.guild.id, "off")
-            mode_text = {"off": "disabled", "track": "track", "queue": "queue"}[current]
+            mode_text = {"off": "Off", "track": "Track", "queue": "Queue"}[current]
             await ctx.send(f"🔁 Current repeat mode: **{mode_text}**")
             return
 
@@ -262,40 +274,20 @@ class ControlCommands(commands.Cog):
             await ctx.send(":x: Not connected to voice channel.")
             return
 
-        # Check if user is in voice channel
-        if not ctx.author.voice or ctx.author.voice.channel.id != vc.channel.id:
-            await ctx.send(":x: You must be in the voice channel!")
+        # Validation checks
+        error = validate_user_in_voice(ctx.author)
+        if error:
+            await ctx.send(error)
             return
 
-        # Check DJ permissions
-        is_dj = await player._check_dj(ctx.author, ctx.guild)
+        error = validate_same_voice_channel(ctx.author, vc)
+        if error:
+            await ctx.send(error)
+            return
 
-        if is_dj:
-            # DJ bypass
-            player.repeat_mode[ctx.guild.id] = mode
-            mode_text = {"off": "disabled", "track": "track", "queue": "queue"}[mode]
-            await ctx.send(f"🔁 Repeat mode: **{mode_text}**")
-        else:
-            # Voting required
-            vote_result = await player.handle_vote_action(
-                ctx.guild.id, ctx.author.id, f"repeat_{mode}", vc.channel
-            )
-
-            if vote_result["passed"]:
-                player.repeat_mode[ctx.guild.id] = mode
-                mode_text = {"off": "disabled", "track": "track", "queue": "queue"}[
-                    mode
-                ]
-                await ctx.send(
-                    f"🔁 Vote passed! Repeat mode: **{mode_text}** "
-                    f"({vote_result['votes']}/{vote_result['needed']} votes)"
-                )
-            else:
-                mode_text = {"off": "disable", "track": "track", "queue": "queue"}[mode]
-                await ctx.send(
-                    f"🗳️ Vote registered. Need {vote_result['needed']} votes to set repeat to {mode_text}. "
-                    f"({vote_result['votes']}/{vote_result['needed']})"
-                )
+        # Handle repeat action using unified function
+        result = await handle_repeat_action(player, ctx.guild, ctx.author, mode)
+        await ctx.send(result["message"])
 
     @commands.hybrid_command(
         name="autoplay",

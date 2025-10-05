@@ -115,6 +115,12 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "access": 0,
             "description": "If true, the last used volume will persist across sessions.",
         },
+        "RememberLastVolumeBetweenSessions": {
+            "type": "float",
+            "default": 1.0,
+            "access": 2,
+            "description": "Stores the last used volume (0.0-2.0 range). Only used if RememberLastVolume is true.",
+        },
         "QueueLimit": {
             "type": "int",
             "default": 10,

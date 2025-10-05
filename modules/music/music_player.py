@@ -1016,7 +1016,15 @@ class MusicPlayer(commands.Cog):
             if not hasattr(player, "queue"):
                 player.queue = pomice.Queue()
             cfg = self._get_music_config(guild.id)
-            volume = float(cfg.get("Volume", 0.5) or 0.5)
+
+            remember_volume = cfg.get("RememberLastVolume", False)
+            if remember_volume:
+                # Use saved volume from RememberLastVolumeBetweenSessions (0.0-2.0 range)
+                volume = float(cfg.get("RememberLastVolumeBetweenSessions", 1.0) or 1.0)
+            else:
+                # Default to 100 (1.0 in 0-2.0 range) when not persisting
+                volume = 1.0
+
             try:
                 await player.set_volume(int(max(0.0, min(2.0, volume)) * 100))
             except Exception:
@@ -1211,7 +1219,9 @@ class MusicPlayer(commands.Cog):
                 fake_ctx = FakeContext(
                     self.bot, guild, requester_id or self.bot.user.id
                 )
-                view = PlayerControlView(fake_ctx, self, persistent=True)
+                view = PlayerControlView(
+                    fake_ctx, self, persistent=True, is_announcement=True
+                )
                 message = await txt.send(embed=embed, view=view)
                 view.message = message
                 self._now_playing_messages[guild.id] = message

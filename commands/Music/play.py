@@ -280,7 +280,7 @@ class PlayCommands(commands.Cog):
         # Check if user explicitly wants search dropdown
         show_dropdown = False
         if q.lower().startswith("search "):
-            q = q[7:].strip()  # Remove "search " prefix
+            q = q[7:].strip()
             show_dropdown = True
 
         escaped_query = q.replace("`", "\\`")
@@ -312,7 +312,6 @@ class PlayCommands(commands.Cog):
             )
             return
 
-        # Reuse the nowplaying command
         queue_cog = self.bot.get_cog("QueueCommands")
         if queue_cog and hasattr(queue_cog, "nowplaying"):
             await queue_cog.nowplaying(ctx)
@@ -324,7 +323,6 @@ class PlayCommands(commands.Cog):
         self, ctx: commands.Context, source: str, escaped_query: str, player
     ):
         """Play a direct URL without search results."""
-        # Check if user is DJ for queue limit bypass
         is_dj = await player._check_dj(ctx.author, ctx.guild)
 
         item = {"title": source, "requester": ctx.author.id, "source": source}

@@ -161,6 +161,10 @@ class VolumeModal(discord.ui.Modal, title="Set Volume"):
 
                 if is_dj:
                     await vc.set_volume(volume)
+                    from modules.music.player_actions import _save_volume_to_config
+
+                    await _save_volume_to_config(self.player, self.ctx.guild.id, volume)
+
                     await interaction.response.send_message(
                         f"🔊 **{interaction.user.display_name}** set volume to {volume}%"
                     )
@@ -173,6 +177,12 @@ class VolumeModal(discord.ui.Modal, title="Set Volume"):
                     )
                     if vote_result["passed"]:
                         await vc.set_volume(volume)
+                        from modules.music.player_actions import _save_volume_to_config
+
+                        await _save_volume_to_config(
+                            self.player, self.ctx.guild.id, volume
+                        )
+
                         await interaction.response.send_message(
                             f"🔊 **{interaction.user.display_name}** set volume to {volume}% ({vote_result['votes']}/{vote_result['needed']} votes)"
                         )
@@ -231,8 +241,17 @@ class VolumeView(View):
             vc = self.ctx.guild.voice_client
             if vc:
                 try:
-                    # Set volume (Pomice uses 0-1000 range, volume*10 to convert from 0-100)
-                    await vc.set_volume(volume * 10)
+                    # Set volume (volume is already in 0-200 range)
+                    await vc.set_volume(volume)
+                    # Save volume to config if RememberLastVolume is enabled
+                    from modules.music.player_actions import _save_volume_to_config
+
+                    player_cog = self.ctx.bot.get_cog("MusicPlayer")
+                    if player_cog:
+                        await _save_volume_to_config(
+                            player_cog, self.ctx.guild.id, volume
+                        )
+
                     await interaction.response.send_message(
                         f"🔊 **{interaction.user.display_name}** set volume to {volume}%"
                     )
@@ -497,6 +516,7 @@ class PlayerControlView(View):
         player,
         message: discord.Message = None,
         persistent=False,
+        is_announcement=False,
     ):
         # For !np command: 2 minute timeout. For auto-announcement: persistent (no timeout)
         super().__init__(timeout=None if persistent else 120)
@@ -505,6 +525,9 @@ class PlayerControlView(View):
         self.guild_id = ctx.guild.id
         self.message = message
         self.persistent = persistent
+        self.is_announcement = (
+            is_announcement  # True for announcement player, False for !np
+        )
 
     async def on_timeout(self):
         """Disable all buttons when view times out."""
@@ -648,54 +671,44 @@ class PlayerControlView(View):
     )
     async def repeat_button(self, interaction: discord.Interaction, button: Button):
         """Cycle through repeat modes."""
-        # Check if user is in voice channel
-        if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message(
-                "❌ You must be in a voice channel!", ephemeral=True
-            )
+        from modules.music.player_actions import (
+            handle_repeat_action,
+            validate_user_in_voice,
+            validate_same_voice_channel,
+        )
+
+        # Validation checks
+        error = validate_user_in_voice(interaction.user)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
             return
 
         vc = interaction.guild.voice_client
         if not vc:
-            await interaction.response.send_message("❌ Not connected", ephemeral=True)
-            return
-
-        # Check if user is in same channel as bot
-        if interaction.user.voice.channel.id != vc.channel.id:
             await interaction.response.send_message(
-                "❌ You must be in the same voice channel as the bot!", ephemeral=True
+                "❌ Not connected to voice channel.", ephemeral=True
             )
             return
 
+        error = validate_same_voice_channel(interaction.user, vc)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        # Cycle to next mode
         current = self.player.repeat_mode.get(self.guild_id, "off")
         modes = ["off", "track", "queue"]
         next_mode = modes[(modes.index(current) + 1) % len(modes)]
 
-        is_dj = await self.player._check_dj(interaction.user, interaction.guild)
+        # Handle repeat action using unified function
+        result = await handle_repeat_action(
+            self.player, interaction.guild, interaction.user, next_mode
+        )
 
-        if is_dj:
-            self.player.repeat_mode[self.guild_id] = next_mode
-            mode_text = {"off": "Off", "track": "Track", "queue": "Queue"}[next_mode]
-            await interaction.response.send_message(
-                f"🔁 **{interaction.user.display_name}** set repeat to **{mode_text}**"
-            )
+        if result["ephemeral"]:
+            await interaction.response.send_message(result["message"], ephemeral=True)
         else:
-            vote_result = await self.player.handle_vote_action(
-                self.guild_id, interaction.user.id, f"repeat_{next_mode}", None
-            )
-            if vote_result["passed"]:
-                self.player.repeat_mode[self.guild_id] = next_mode
-                mode_text = {"off": "Off", "track": "Track", "queue": "Queue"}[
-                    next_mode
-                ]
-                await interaction.response.send_message(
-                    f"🔁 **{interaction.user.display_name}** set repeat to **{mode_text}** ({vote_result['votes']}/{vote_result['needed']} votes)"
-                )
-            else:
-                await interaction.response.send_message(
-                    f"🗳️ **{interaction.user.display_name}** voted to change repeat ({vote_result['votes']}/{vote_result['needed']} needed)",
-                    ephemeral=True,
-                )
+            await interaction.response.send_message(result["message"])
 
     @discord.ui.button(
         emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="player:settings"
@@ -715,12 +728,23 @@ class PlayerControlView(View):
     )
     async def close_button(self, interaction: discord.Interaction, button: Button):
         """Close the player display (does not stop playback)."""
+        username = interaction.user.display_name
+
+        # Delete or clear the message
         if self.message:
             try:
                 await self.message.delete()
             except:
                 await self.message.edit(view=None)
-        await interaction.response.send_message("🗑️ Player closed", ephemeral=True)
+
+        # For announcement player: public message with username
+        # For !np player: ephemeral message without username
+        if self.is_announcement:
+            await interaction.response.send_message(
+                f"🗑️ **{username}** closed the player"
+            )
+        else:
+            await interaction.response.send_message("🗑️ Player closed", ephemeral=True)
 
 
 class NowPlayingCommands(commands.Cog):

@@ -5,6 +5,44 @@ This module provides common functions used by both slash commands and player but
 
 import discord
 from typing import Union, Optional, Dict, Any
+import logging
+
+LOG = logging.getLogger(__name__)
+
+
+async def _save_volume_to_config(player, guild_id: int, volume: int):
+    """
+    Save volume to config if RememberLastVolume is enabled.
+
+    Args:
+        player: MusicPlayer cog instance
+        guild_id: Guild ID
+        volume: Volume level (0-200 range)
+    """
+    try:
+        # Get music config
+        cfg = player._get_music_config(guild_id)
+        remember_volume = cfg.get("RememberLastVolume", False)
+
+        if remember_volume:
+            # Convert from 0-200 range to 0.0-2.0 range for config
+            volume_config = volume / 100.0
+
+            # Import here to avoid circular imports
+            from modules.setconfig import edit_json_file
+
+            # Save to config (access level 2 = hidden, no permissions needed)
+            edit_json_file(
+                guild_id,
+                "Music.RememberLastVolumeBetweenSessions",
+                volume_config,
+                actor_user_id=None,  # System action, no user needed
+            )
+            LOG.debug(
+                f"Saved volume {volume}% ({volume_config}) to config for guild {guild_id}"
+            )
+    except Exception as e:
+        LOG.warning(f"Failed to save volume to config for guild {guild_id}: {e}")
 
 
 async def handle_pause_action(
@@ -231,6 +269,8 @@ async def handle_volume_action(
     if is_dj:
         try:
             await vc.set_volume(volume)
+            # Save volume to config if RememberLastVolume is enabled
+            await _save_volume_to_config(player, guild.id, volume)
             return {
                 "success": True,
                 "message": f"🔊 **{user.display_name}** set volume to {volume}%",
@@ -250,6 +290,8 @@ async def handle_volume_action(
         if vote_result["passed"]:
             try:
                 await vc.set_volume(volume)
+                # Save volume to config if RememberLastVolume is enabled
+                await _save_volume_to_config(player, guild.id, volume)
                 return {
                     "success": True,
                     "message": f"🔊 **{user.display_name}** set volume to {volume}% ({vote_result['votes']}/{vote_result['needed']} votes)",
