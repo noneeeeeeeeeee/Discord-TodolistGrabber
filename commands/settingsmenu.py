@@ -89,6 +89,118 @@ def _can_edit(meta: dict, is_owner: bool) -> bool:
     return False
 
 
+class ChoiceSelectionView(View):
+    """Dropdown selector for settings with fixed choices."""
+
+    def __init__(self, parent_view, meta: dict):
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        self.meta = meta
+        self.selected_path = parent_view.selected_path
+
+        # Build dropdown options from choices
+        choices = meta.get("choices", [])
+        if isinstance(choices, list) and len(choices) <= 25:
+            select = Select(placeholder="Select a value")
+            for choice in choices:
+                select.add_option(label=str(choice), value=str(choice))
+            select.callback = self.on_choice_select
+            self.add_item(select)
+
+    async def on_choice_select(self, interaction: discord.Interaction):
+        selected = self.children[0].values[0]
+
+        try:
+            # For list[str] types, keep as single value or handle appropriately
+            t = self.meta.get("type", "str")
+            if t == "list[str]":
+                # For list types with choices, this is typically adding to a list
+                # but for simplicity, we'll set it as a comma-separated string
+                raw_value = selected
+            else:
+                raw_value = selected
+
+            coerced = coerce_value_for_path(self.selected_path, raw_value)
+            edit_json_file(
+                self.parent_view.ctx.guild.id,
+                self.selected_path,
+                coerced,
+                actor_user_id=self.parent_view.ctx.author.id,
+            )
+            self.parent_view.cfg = json_get(self.parent_view.ctx.guild.id)
+            await self.parent_view.message.edit(
+                embed=self.parent_view._embed(message=f"Set to: {selected}"),
+                view=self.parent_view,
+            )
+            await interaction.response.send_message(
+                f"✅ Value updated to: **{selected}**", ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Error: {str(e)}", ephemeral=True
+            )
+
+
+class RoleSelectionView(View):
+    """Dropdown selector for role selection."""
+
+    def __init__(self, parent_view, meta: dict):
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        self.meta = meta
+        self.selected_path = parent_view.selected_path
+
+        # Get guild roles
+        guild = parent_view.ctx.guild
+        roles = [r for r in guild.roles if not r.is_default() and not r.managed][:25]
+
+        if roles:
+            select = Select(placeholder="Select a role")
+            # Add "None" option for nullable roles
+            if "null" in meta.get("type", ""):
+                select.add_option(label="None (Clear Role)", value="null", emoji="🚫")
+
+            for role in roles:
+                select.add_option(label=role.name, value=str(role.id), emoji="👤")
+            select.callback = self.on_role_select
+            self.add_item(select)
+
+    async def on_role_select(self, interaction: discord.Interaction):
+        selected = self.children[0].values[0]
+
+        try:
+            if selected == "null":
+                coerced = None
+            else:
+                coerced = coerce_value_for_path(self.selected_path, selected)
+
+            edit_json_file(
+                self.parent_view.ctx.guild.id,
+                self.selected_path,
+                coerced,
+                actor_user_id=self.parent_view.ctx.author.id,
+            )
+            self.parent_view.cfg = json_get(self.parent_view.ctx.guild.id)
+
+            if selected == "null":
+                display = "None"
+            else:
+                role = interaction.guild.get_role(int(selected))
+                display = role.name if role else f"Role ID: {selected}"
+
+            await self.parent_view.message.edit(
+                embed=self.parent_view._embed(message=f"Set to: {display}"),
+                view=self.parent_view,
+            )
+            await interaction.response.send_message(
+                f"✅ Role updated to: **{display}**", ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Error: {str(e)}", ephemeral=True
+            )
+
+
 class SettingsView(View):
     def __init__(self, bot: commands.Bot, ctx: commands.Context, schema, cfg):
         super().__init__(timeout=60)
@@ -225,6 +337,25 @@ class SettingsView(View):
         if not self.selected_path:
             return
         meta = self.current_meta() or {}
+        t = meta.get("type", "str")
+
+        # If setting has fixed choices, show dropdown
+        if "choices" in meta and meta["choices"]:
+            view = ChoiceSelectionView(self, meta)
+            await interaction.response.send_message(
+                "Select a value:", view=view, ephemeral=True
+            )
+            return
+
+        # If setting is role type, show role selector
+        if t in ("role", "role|null"):
+            view = RoleSelectionView(self, meta)
+            await interaction.response.send_message(
+                "Select a role:", view=view, ephemeral=True
+            )
+            return
+
+        # Otherwise show modal input
         placeholder = meta.get("type", "str")
         cur_val = _format_value(_safe_get(self.cfg, self.selected_path))
         modal = SetValueModal(
@@ -239,15 +370,10 @@ class SettingsView(View):
             return
         if modal.result is None:
             return
-        # Convert common mention/ID inputs for role/channel
+        # Convert common mention/ID inputs for channel
         raw_input = modal.result
-        t = meta.get("type", "str")
         try:
-            if t in ("role", "role|null"):
-                # accept <@&id> or plain id or 'null'
-                m = re.search(r"(\d{15,25})", raw_input)
-                raw_value = m.group(1) if m else raw_input
-            elif t in ("channel|Default",):
+            if t in ("channel|Default",):
                 m = re.search(r"(\d{15,25})", raw_input)
                 raw_value = m.group(1) if m else raw_input
             elif t in ("int", "int|null"):
@@ -305,71 +431,63 @@ class SettingsView(View):
             pass
 
     def _embed(self, message: str = None, error: str = None):
-        title = "Settings Menu"
-        desc = "Select a module, then a setting to edit."
-        if message:
-            desc = f"{desc}\n\n✅ {message}"
-        if error:
-            desc = f"{desc}\n\n❌ {error}"
-        embed = discord.Embed(
-            title=title, description=desc, color=discord.Color.blurple()
-        )
+        # Build breadcrumb navigation
+        breadcrumb = "Settings"
         if self.selected_section:
-            embed.add_field(name="Module", value=self.selected_section, inline=True)
-            # Provide extra guidance for Music settings
-            if self.selected_section == "Music":
-                embed.add_field(
-                    name="Music Settings",
-                    value="Configure DJ role, volume, queue limits and playlist behaviour here. Central-only settings (owner) propagate to all guilds.",
-                    inline=False,
-                )
-            if not self.selected_path:
-                summary_lines = []
-                for path, meta in self.visible_paths[:10]:
-                    value = _format_value(_safe_get(self.cfg, path))
-                    summary_lines.append(
-                        f"`{meta['key']}` → `{value}` ({_access_label(meta.get('access', 0))})"
-                    )
-                if len(self.visible_paths) > 10:
-                    summary_lines.append(
-                        f"…and {len(self.visible_paths) - 10} more setting(s)."
-                    )
-                embed.add_field(
-                    name="Available Settings",
-                    value=(
-                        "\n".join(summary_lines)
-                        if summary_lines
-                        else "No settings visible."
-                    ),
-                    inline=False,
-                )
-        if self.selected_path:
+            breadcrumb += f" > {self.selected_section}"
+            if self.selected_path:
+                meta = self.current_meta() or {}
+                setting_name = meta.get("key", self.selected_path.split(".")[-1])
+                breadcrumb += f" > {setting_name}"
+
+        title = "Settings Menu"
+
+        # Module level view
+        if self.selected_section and not self.selected_path:
+            module_desc = {
+                "Music": "Configure DJ role, queue limits, playlist behavior, and player settings. Central-only settings (owner) propagate to all guilds.",
+                "Noticeboard": "Configure noticeboard updates, ping schedules, and notifications.",
+                "General": "General bot configuration and administrative settings.",
+                "GoogleClassroom": "Google Classroom integration settings (Not yet implemented).",
+            }.get(
+                self.selected_section,
+                f"Configure {self.selected_section} module settings.",
+            )
+
+            desc = f"**{self.selected_section} Module**\n{module_desc}"
+        # Setting detail view
+        elif self.selected_path:
             meta = self.current_meta() or {}
-            cur_val = _safe_get(self.cfg, self.selected_path)
-            embed.add_field(name="Setting", value=self.selected_path, inline=False)
-            embed.add_field(name="Type", value=meta.get("type", "str"), inline=True)
-            embed.add_field(
-                name="Access", value=_access_label(meta.get("access", 0)), inline=True
-            )
-            embed.add_field(
-                name="Current", value=f"`{_format_value(cur_val)}`", inline=False
-            )
+            setting_name = meta.get("key", self.selected_path.split(".")[-1])
+            desc = f"**{setting_name}**\n"
+
             if "description" in meta:
-                embed.add_field(
-                    name="Description", value=meta["description"], inline=False
-                )
+                desc += f"{meta['description']}\n\n"
+
+            cur_val = _safe_get(self.cfg, self.selected_path)
+            desc += f"**Type:** {meta.get('type', 'str')}\t\t**Access:** {_access_label(meta.get('access', 0))}\n"
+            desc += f"**Current Value:** `{_format_value(cur_val)}`\n"
+
             if "min" in meta or "max" in meta:
-                embed.add_field(
-                    name="Range",
-                    value=f"{meta.get('min','-')} .. {meta.get('max','-')}",
-                    inline=True,
-                )
+                desc += f"**Range:** {meta.get('min','-')} to {meta.get('max','-')}\n"
+
             if "choices" in meta:
-                embed.add_field(
-                    name="Choices",
-                    value=", ".join(map(str, meta["choices"])),
-                    inline=False,
-                )
+                desc += f"**Choices:** {', '.join(map(str, meta['choices']))}\n"
+        # Root level view
+        else:
+            desc = "Select a module to configure its settings."
+
+        if message:
+            desc += f"\n\n✅ {message}"
+        if error:
+            desc += f"\n\n❌ {error}"
+
+        embed = discord.Embed(
+            title=title,
+            description=f"{breadcrumb}\n\n{desc}",
+            color=discord.Color.blurple(),
+        )
+
         return embed
 
     async def start(self):

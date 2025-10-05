@@ -102,13 +102,12 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "access": 1,
         },
         "DJRole": {"type": "role|null", "default": None, "access": 0},
-        "DJRoleRequired": {"type": "bool", "default": True, "access": 0},
-        "Volume": {
-            "type": "float",
-            "default": 0.5,
-            "min": 0.0,
-            "max": 1.0,
+        "DJMode": {
+            "type": "str",
+            "default": "DJ Vote Bypass",
             "access": 0,
+            "choices": ["DJ Only", "DJ Vote Bypass", "Disabled", "User Only"],
+            "description": "DJ Only: Only DJ role can control. DJ Vote Bypass: DJ bypasses votes, others vote. Disabled: Anyone can control without voting, User Only: Everyone has to follow the requirements of the NonDJ Role.",
         },
         "RememberLastVolume": {
             "type": "bool",
@@ -146,10 +145,10 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
         "TrackMaxDuration": {
             "type": "int",
             "default": 600,
-            "min": 10,
+            "min": 0,
             "max": 43200,
             "access": 3,
-            "description": "Maximum track duration in seconds. Set to 0 to disable.",
+            "description": "Maximum track duration in seconds. Set to 0 to disable limit.",
         },
         "RemoveNonSongsUsingSponsorBlock": {
             "type": "bool",

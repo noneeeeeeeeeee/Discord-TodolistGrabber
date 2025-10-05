@@ -64,7 +64,7 @@ class SkipCommands(commands.Cog):
         if self._is_dj(ctx):
             vc = ctx.guild.voice_client
             if vc and is_voice_playing(vc):
-                vc.stop()
+                await vc.stop()
                 await ctx.send("Skipped by DJ.")
                 return
             q = player.queues.get(ctx.guild.id)

@@ -20,106 +20,82 @@ class ControlCommands(commands.Cog):
     )
     async def pause(self, ctx: commands.Context):
         """Pause playback with voting system."""
+        from modules.music.player_actions import (
+            handle_pause_action,
+            validate_user_in_voice,
+            validate_same_voice_channel,
+            validate_playing,
+        )
+
         player = self._get_player()
         if not player:
             await ctx.send(":x: Player backend not available.")
             return
 
         vc = ctx.guild.voice_client
-        if not vc or not is_voice_playing(vc):
-            await ctx.send(":x: Nothing is playing.")
+
+        # Validation checks
+        error = validate_user_in_voice(ctx.author)
+        if error:
+            await ctx.send(error)
             return
 
-        # Check if user is in voice channel
-        if not ctx.author.voice or ctx.author.voice.channel.id != vc.channel.id:
-            await ctx.send(":x: You must be in the voice channel!")
+        error = validate_same_voice_channel(ctx.author, vc)
+        if error:
+            await ctx.send(error)
             return
 
-        # Check DJ permissions
-        is_dj = await player._check_dj(ctx.author, ctx.guild)
+        error = validate_playing(vc)
+        if error:
+            await ctx.send(error)
+            return
 
-        if is_dj:
-            # DJ bypass
-            await vc.set_pause(True)
-            await ctx.send("⏸️ Paused playback.")
-        else:
-            # Voting required
-            vote_result = await player.handle_vote_action(
-                ctx.guild.id, ctx.author.id, "pause", vc.channel
-            )
-
-            if vote_result["passed"]:
-                await vc.set_pause(True)
-                await ctx.send(
-                    f"⏸️ Vote passed! Paused playback. ({vote_result['votes']}/{vote_result['needed']} votes)"
-                )
-            else:
-                await ctx.send(
-                    f"🗳️ Vote registered. Need {vote_result['needed']} votes to pause. "
-                    f"({vote_result['votes']}/{vote_result['needed']})"
-                )
+        # Handle pause action
+        result = await handle_pause_action(
+            player, ctx.guild, ctx.author, vc, ctx.channel
+        )
+        await ctx.send(result["message"])
 
     @commands.hybrid_command(
         name="resume", description="Resume playback (requires voting or DJ)."
     )
     async def resume(self, ctx: commands.Context):
         """Resume playback with voting system."""
+        from modules.music.player_actions import (
+            handle_resume_action,
+            validate_user_in_voice,
+            validate_same_voice_channel,
+            validate_paused,
+        )
+
         player = self._get_player()
         if not player:
             await ctx.send(":x: Player backend not available.")
             return
 
         vc = ctx.guild.voice_client
-        if not vc or not is_voice_paused(vc):
-            await ctx.send(":x: Nothing to resume.")
+
+        # Validation checks
+        error = validate_user_in_voice(ctx.author)
+        if error:
+            await ctx.send(error)
             return
 
-        # Check if user is in voice channel
-        if not ctx.author.voice or ctx.author.voice.channel.id != vc.channel.id:
-            await ctx.send(":x: You must be in the voice channel!")
+        error = validate_same_voice_channel(ctx.author, vc)
+        if error:
+            await ctx.send(error)
             return
 
-        # Check DJ permissions
-        is_dj = await player._check_dj(ctx.author, ctx.guild)
-
-        if is_dj:
-            # DJ bypass
-            await vc.set_pause(False)
-            await ctx.send("▶️ Resumed playback.")
-        else:
-            # Voting required
-            vote_result = await player.handle_vote_action(
-                ctx.guild.id, ctx.author.id, "resume", vc.channel
-            )
-
-            if vote_result["passed"]:
-                await vc.set_pause(False)
-                await ctx.send(
-                    f"▶️ Vote passed! Resumed playback. ({vote_result['votes']}/{vote_result['needed']} votes)"
-                )
-            else:
-                await ctx.send(
-                    f"🗳️ Vote registered. Need {vote_result['needed']} votes to resume. "
-                    f"({vote_result['votes']}/{vote_result['needed']})"
-                )
-
-    @commands.hybrid_command(
-        name="stop", description="Stop and clear queue (DJ/Admin)."
-    )
-    async def stop(self, ctx: commands.Context):
-        # permission check
-        if not (
-            ctx.author.guild_permissions.administrator
-            or ctx.author.guild_permissions.manage_guild
-        ):
-            await ctx.send(":x: Admin/DJ required.")
+        error = validate_paused(vc)
+        if error:
+            await ctx.send(error)
             return
-        vc = ctx.guild.voice_client
-        if vc:
-            await vc.stop()
-        player = self._get_player()
-        player.queues[ctx.guild.id].clear()
-        await ctx.send("Stopped and cleared queue.")
+
+        # Handle resume action
+        result = await handle_resume_action(
+            player, ctx.guild, ctx.author, vc, ctx.channel
+        )
+        await ctx.send(result["message"])
 
     @commands.hybrid_command(
         name="disconnect",
@@ -127,16 +103,44 @@ class ControlCommands(commands.Cog):
         description="Disconnect the bot from the voice channel.",
     )
     async def disconnect(self, ctx: commands.Context):
-        if not (
-            ctx.author.guild_permissions.administrator
-            or ctx.author.guild_permissions.manage_guild
-        ):
-            await ctx.send(":x: Admin/DJ required.")
+        player = self._get_player()
+        if not player:
+            await ctx.send(":x: Player backend not available.")
             return
+
+        # Check DJ mode permissions
+        permission = await player._check_dj_mode_permission(
+            ctx.author, ctx.guild, "disconnect"
+        )
+
+        if not permission["allowed"]:
+            await ctx.send(permission["error"])
+            return
+
+        if permission["needs_vote"]:
+            vc = ctx.guild.voice_client
+            if not vc:
+                await ctx.send("❌ Bot is not connected to a voice channel.")
+                return
+
+            if not ctx.author.voice or ctx.author.voice.channel.id != vc.channel.id:
+                await ctx.send("❌ You must be in the same voice channel!")
+                return
+
+            vote_result = await player.handle_vote_action(
+                ctx.guild.id, ctx.author.id, "disconnect", vc.channel
+            )
+
+            if not vote_result["passed"]:
+                await ctx.send(
+                    f"🗳️ Vote registered. Need {vote_result['needed']} votes to disconnect. "
+                    f"({vote_result['votes']}/{vote_result['needed']})"
+                )
+                return
 
         vc = ctx.guild.voice_client
         if not vc or not is_voice_connected(vc):
-            await ctx.send("Bot is not connected to a voice channel.")
+            await ctx.send("❌ Bot is not connected to a voice channel.")
             return
 
         try:
@@ -145,9 +149,11 @@ class ControlCommands(commands.Cog):
             await ctx.send(f":x: Failed to disconnect: {exc}")
             return
 
-        player = self._get_player()
         if player:
             try:
+                # Clean up state (on_voice_state_update will also handle this)
+                player._playing_flags[ctx.guild.id] = False
+                player.queues[ctx.guild.id].clear()
                 player.reset_session_state(ctx.guild.id)
             except Exception:
                 pass
@@ -159,24 +165,64 @@ class ControlCommands(commands.Cog):
         await ctx.send(":wave: Disconnected from voice channel.")
 
     @commands.hybrid_command(
-        name="volume", aliases=["vol"], description="Set default volume (0-200)."
+        name="volume", aliases=["vol"], description="Set playback volume ."
     )
     async def volume(self, ctx: commands.Context, value: int):
-        if value < 0 or value > 200:
-            await ctx.send(":x: Volume must be 0-200.")
+        """Set volume with voting system. Range: 0-200"""
+        player = self._get_player()
+        if not player:
+            await ctx.send(":x: Player backend not available.")
             return
-        try:
-            from modules.setconfig import edit_json_file
 
-            edit_json_file(
-                ctx.guild.id,
-                "Music.Volume",
-                float(value) / 100.0,
-                actor_user_id=ctx.author.id,
+        if value < 0 or value > 200:
+            await ctx.send(":x: Volume must be between 0 and 200.")
+            return
+
+        vc = ctx.guild.voice_client
+        if not vc:
+            await ctx.send(":x: Not connected to voice channel.")
+            return
+
+        # Check if user is in voice channel
+        if not ctx.author.voice or ctx.author.voice.channel.id != vc.channel.id:
+            await ctx.send(":x: You must be in the same voice channel!")
+            return
+
+        # Check DJ mode permissions
+        permission = await player._check_dj_mode_permission(
+            ctx.author, ctx.guild, "volume"
+        )
+
+        if not permission["allowed"]:
+            await ctx.send(permission["error"])
+            return
+
+        if permission["needs_vote"]:
+            vote_result = await player.handle_vote_action(
+                ctx.guild.id, ctx.author.id, f"volume_{value}", vc.channel
             )
-            await ctx.send(f"Default volume set to {value}%.")
+
+            if not vote_result["passed"]:
+                await ctx.send(
+                    f"🗳️ **{ctx.author.display_name}** voted to set volume to {value}% "
+                    f"({vote_result['votes']}/{vote_result['needed']} needed)"
+                )
+                return
+
+        # Set volume (Pomice uses 0-1000 range, we cap at 200 for safety)
+        try:
+            await vc.set_volume(value)
+            # Announce publicly - include vote count if vote passed
+            if permission.get("needs_vote") and vote_result.get("passed"):
+                await ctx.send(
+                    f"🔊 **{ctx.author.display_name}** set volume to {value}% ({vote_result['votes']}/{vote_result['needed']} votes)"
+                )
+            else:
+                await ctx.send(
+                    f"🔊 **{ctx.author.display_name}** set volume to {value}%"
+                )
         except Exception as e:
-            await ctx.send(f":x: Failed: {e}")
+            await ctx.send(f":x: Failed to set volume: {e}")
 
     @commands.hybrid_command(
         name="repeat", description="Set repeat mode (requires voting or DJ)."

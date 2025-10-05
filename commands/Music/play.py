@@ -23,10 +23,7 @@ class SearchResultsView(View):
         self.message = None
         self.selected_index = None
 
-        # Add select menu with current page's tracks
-        self._update_select_menu()
-
-        # Add navigation buttons
+        # Add navigation buttons FIRST
         prev_button = Button(
             label="◀ Previous", style=discord.ButtonStyle.gray, disabled=page == 0
         )
@@ -45,8 +42,11 @@ class SearchResultsView(View):
         cancel_button.callback = self.cancel
         self.add_item(cancel_button)
 
-    def _update_select_menu(self):
-        """Update the select menu with tracks from current page."""
+        # Add select menu LAST (it will appear first in Discord UI)
+        self._add_select_menu()
+
+    def _add_select_menu(self):
+        """Add select menu with tracks from current page."""
         start_idx = self.page * 10
         end_idx = min(start_idx + 10, len(self.results))
         page_results = self.results[start_idx:end_idx]
@@ -71,18 +71,21 @@ class SearchResultsView(View):
         select = Select(
             placeholder=f"Select a track (Page {self.page + 1}/{self.max_pages})",
             options=options,
-            custom_id="track_select",
         )
         select.callback = self.on_select
+        self.add_item(select)
 
-        # Remove old select if exists and add new one at front
+    def _update_select_menu(self):
+        """Update the select menu with tracks from current page."""
+        # Remove old select if exists
         for item in self.children[:]:
             if isinstance(item, Select):
                 self.remove_item(item)
 
-        self.children.insert(0, select)
+        # Add new select menu
+        self._add_select_menu()
 
-    async def on_select(self, interaction: discord.Interaction):
+    async def on_select(self, interaction: discord.Interaction, select: Select):
         """Handle track selection."""
         if interaction.user.id != self.ctx.author.id:
             await interaction.response.send_message(
@@ -90,12 +93,15 @@ class SearchResultsView(View):
             )
             return
 
-        self.selected_index = int(interaction.values[0])
+        self.selected_index = int(select.values[0])
         await interaction.response.defer()
 
         # Queue the selected track
         player = self.ctx.bot.get_cog("MusicPlayer")
         selected_track = self.results[self.selected_index]
+
+        # Check if user is DJ for queue limit bypass
+        is_dj = await player._check_dj(self.ctx.author, self.ctx.guild)
 
         item = {
             "title": selected_track.get("title", "Unknown"),
@@ -112,7 +118,7 @@ class SearchResultsView(View):
             return
 
         enqueue_result = await player.enqueue(
-            self.ctx.guild, item, player=connection.player
+            self.ctx.guild, item, player=connection.player, is_dj=is_dj
         )
 
         if enqueue_result.success:
@@ -243,9 +249,10 @@ class PlayCommands(commands.Cog):
         Play a song or search for tracks.
 
         Usage:
-          !play <search term>  - Search for tracks (shows top 10 results)
-          !play <URL>          - Play directly from URL
-          !p <search>          - Same as above
+          !play search <term> - Show dropdown with top 25 results
+          !play <term>        - Play first match immediately
+          !play <URL>         - Play directly from URL
+          !p <search>         - Same as above
         """
         if not check_guild_config_available(ctx.guild.id):
             await ctx.send("Server not setup. Please run !setup or /setup.")
@@ -266,9 +273,11 @@ class PlayCommands(commands.Cog):
 
         q = query.strip()
 
-        # Clean up common user mistakes - remove "search" prefix if user typed it
+        # Check if user explicitly wants search dropdown
+        show_dropdown = False
         if q.lower().startswith("search "):
             q = q[7:].strip()  # Remove "search " prefix
+            show_dropdown = True
 
         escaped_query = q.replace("`", "\\`")
 
@@ -281,8 +290,12 @@ class PlayCommands(commands.Cog):
             await self._play_direct(ctx, q, escaped_query, player)
             return
 
-        # Search for tracks and show results
-        await self._search_and_display(ctx, q, escaped_query, player)
+        # If user typed "search" explicitly, show dropdown
+        if show_dropdown:
+            await self._search_and_display(ctx, q, escaped_query, player)
+        else:
+            # Otherwise play first result immediately
+            await self._play_first_result(ctx, q, escaped_query, player)
 
     async def _show_now_playing(self, ctx: commands.Context):
         """Show currently playing track when no query provided."""
@@ -307,6 +320,9 @@ class PlayCommands(commands.Cog):
         self, ctx: commands.Context, source: str, escaped_query: str, player
     ):
         """Play a direct URL without search results."""
+        # Check if user is DJ for queue limit bypass
+        is_dj = await player._check_dj(ctx.author, ctx.guild)
+
         item = {"title": source, "requester": ctx.author.id, "source": source}
 
         connection = await player.ensure_player_connected(ctx.guild, ctx.author.id)
@@ -338,7 +354,9 @@ class PlayCommands(commands.Cog):
 
         search_message = await ctx.send(f":mag_right: Loading `{escaped_query}`...")
 
-        enqueue_result = await player.enqueue(ctx.guild, item, player=connection.player)
+        enqueue_result = await player.enqueue(
+            ctx.guild, item, player=connection.player, is_dj=is_dj
+        )
         if not enqueue_result.success:
             reason = (
                 player.get_last_enqueue_error(ctx.guild.id)
@@ -358,6 +376,94 @@ class PlayCommands(commands.Cog):
                     f":clock130: Queued `{added_title}`\n" f"-# Position: {position}"
                 )
             )
+
+    async def _play_first_result(
+        self, ctx: commands.Context, query: str, escaped_query: str, player
+    ):
+        """Search and play the first result immediately."""
+        # Check if user is DJ for queue limit bypass
+        is_dj = await player._check_dj(ctx.author, ctx.guild)
+
+        # Connect to voice first
+        connection = await player.ensure_player_connected(ctx.guild, ctx.author.id)
+        if not connection.player:
+            reason = (
+                player.get_last_enqueue_error(ctx.guild.id)
+                or connection.error
+                or "Unable to join the voice channel."
+            )
+            await ctx.send(f":x: {reason}")
+            return
+
+        if connection.joined:
+            joined_name = connection.joined_channel or "Voice Channel"
+            await ctx.send(f":arrow_right: Joined `{joined_name}`")
+
+        search_message = await ctx.send(
+            f":mag_right: Searching for `{escaped_query}`..."
+        )
+
+        try:
+            vc = ctx.guild.voice_client
+            if not vc:
+                await search_message.edit(content=":x: Not connected to voice channel.")
+                return
+
+            # Search YouTube and get first result
+            search_results = await vc.get_tracks(query=f"ytsearch:{query}")
+
+            if not search_results:
+                await search_message.edit(
+                    content=f":x: No results found for `{escaped_query}`."
+                )
+                return
+
+            # Get first track
+            first_track = None
+            if hasattr(search_results, "tracks") and search_results.tracks:
+                first_track = search_results.tracks[0]
+            elif isinstance(search_results, list) and search_results:
+                first_track = search_results[0]
+            else:
+                first_track = search_results
+
+            if not first_track:
+                await search_message.edit(
+                    content=f":x: No results found for `{escaped_query}`."
+                )
+                return
+
+            # Play the first result using its URI
+            track_uri = getattr(first_track, "uri", None)
+            if not track_uri:
+                await search_message.edit(content=":x: Invalid track data.")
+                return
+
+            # Enqueue the track
+            item = {"title": track_uri, "requester": ctx.author.id, "source": track_uri}
+            enqueue_result = await player.enqueue(
+                ctx.guild, item, player=connection.player, is_dj=is_dj
+            )
+
+            if not enqueue_result.success:
+                reason = enqueue_result.error or "Failed to add track."
+                await search_message.edit(content=f":x: {reason}")
+                return
+
+            added_title = (enqueue_result.track_title or track_uri).replace("`", "\\`")
+            if enqueue_result.started_playback:
+                await search_message.edit(content=f"▶️ Now playing: **{added_title}**")
+            else:
+                position = (
+                    enqueue_result.queue_position or connection.player.queue.count
+                )
+                await search_message.edit(
+                    content=f":clock130: Queued `{added_title}`\n-# Position: {position}"
+                )
+
+        except Exception as e:
+            LOG.error(f"Play first result failed: {e}", exc_info=True)
+            await search_message.edit(content=f":x: Failed to play: {str(e)}")
 
     async def _search_and_display(
         self, ctx: commands.Context, query: str, escaped_query: str, player
@@ -421,7 +527,7 @@ class PlayCommands(commands.Cog):
                 )
                 return
 
-            # Limit to 50 results max, remove duplicates by identifier
+            # Limit to 25 results max (optimized for dropdown), remove duplicates by identifier
             seen_ids = set()
             unique_tracks = []
             for track in all_tracks:
@@ -431,7 +537,7 @@ class PlayCommands(commands.Cog):
                 if track_id not in seen_ids:
                     seen_ids.add(track_id)
                     unique_tracks.append(track)
-                    if len(unique_tracks) >= 50:
+                    if len(unique_tracks) >= 25:
                         break
 
             # Convert to our format

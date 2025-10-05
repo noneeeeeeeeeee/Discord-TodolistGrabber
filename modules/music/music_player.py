@@ -176,17 +176,13 @@ class MusicPlayer(commands.Cog):
         self._bootstrap_error: Optional[str] = None
         self._now_playing_messages: Dict[int, discord.Message] = {}
         self._session_autoplay_disabled = defaultdict(bool)
-        LOG.setLevel(logging.DEBUG)
-        root_logger = logging.getLogger()
-        if not root_logger.handlers:
-            logging.basicConfig(level=logging.DEBUG)
-        elif root_logger.level > logging.DEBUG:
-            root_logger.setLevel(logging.DEBUG)
-        for logger_name in ("pomice", "pomice.node", "pomice.player"):
-            try:
-                logging.getLogger(logger_name).setLevel(logging.DEBUG)
-            except Exception:
-                continue
+        # Logging disabled for production
+        # LOG.setLevel(logging.INFO)
+        # for logger_name in ("pomice", "pomice.node", "pomice.player"):
+        #     try:
+        #         logging.getLogger(logger_name).setLevel(logging.WARNING)
+        #     except Exception:
+        #         continue
         self._disconnect_messages = self._load_disconnect_messages()
         self._bootstrap_node.start()
 
@@ -798,9 +794,27 @@ class MusicPlayer(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
+        # Check if bot itself was disconnected
         if member.bot and getattr(member, "id", None) == getattr(
             self.bot.user, "id", None
         ):
+            # Bot was in a channel and now isn't (disconnected)
+            if before.channel and not after.channel:
+                guild = before.channel.guild
+                if guild:
+                    # Clean up all state for this guild
+                    guild_id = guild.id
+                    self._playing_flags[guild_id] = False
+                    self._current_entries.pop(guild_id, None)
+                    self.queues[guild_id].clear()
+                    self.voteskip.pop(guild_id, None)
+                    self.repeat_mode.pop(guild_id, None)
+                    self.shuffle_flags.pop(guild_id, None)
+                    self.connection_cooldowns.pop(guild_id, None)
+                    self.clear_votes_for_guild(guild_id)
+                    await self._cancel_idle(guild_id)
+                    await self._delete_now_playing_message(guild_id)
+                    LOG.debug(f"Cleaned up state for guild {guild_id} after disconnect")
             return
 
         guild = getattr(member, "guild", None)
@@ -1004,18 +1018,18 @@ class MusicPlayer(commands.Cog):
             voice_channel = getattr(player, "channel", None)
             channel_name = getattr(voice_channel, "name", "Unknown channel")
 
-            # Create clickable title if URI exists
+            # Create embed matching !np command style
             if uri:
-                embed_title = f"🎵 {title}"
                 embed = discord.Embed(
-                    title=embed_title,
-                    url=uri,
-                    color=discord.Color.blurple(),
+                    title="Now Playing",
+                    description=f"[{title}]({uri})",
+                    color=0x510F7B,  # Rythm's purple color
                 )
             else:
                 embed = discord.Embed(
-                    title=f"🎵 {title}",
-                    color=discord.Color.blurple(),
+                    title="Now Playing",
+                    description=title,
+                    color=0x510F7B,
                 )
 
             # Add thumbnail from artwork
@@ -1033,7 +1047,7 @@ class MusicPlayer(commands.Cog):
                     url=f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
                 )
 
-            # Create visual seekbar with duration
+            # Add duration with seekbar
             dur = getattr(track, "length", None)
             if dur:
                 total_seconds = int(dur / 1000)
@@ -1041,40 +1055,56 @@ class MusicPlayer(commands.Cog):
                 duration_str = f"{minutes:02d}:{seconds:02d}"
 
                 # Visual seekbar (at start of track)
-                seekbar_length = 16
-                seekbar = "▰" + "▱" * (seekbar_length - 1)
-
-                embed.add_field(
-                    name="Duration",
-                    value=f"`00:00` {seekbar} `{duration_str}`",
-                    inline=False,
+                seekbar = "▰" + "▱" * 15
+                embed.description += (
+                    f"\n\n**Duration**\n00:00 {seekbar} {duration_str}\n"
                 )
-            else:
-                duration_str = "Live"
 
-            # Add requester footer
+            # Add requester as author
             if requester_id:
                 try:
                     requester = guild.get_member(requester_id)
                     if requester:
-                        embed.set_footer(
-                            text=f"Requested by {requester.display_name}",
+                        embed.set_author(
+                            name=f"Requested By: {requester.display_name}",
                             icon_url=requester.display_avatar.url,
                         )
                     else:
-                        embed.set_footer(text=f"Requested by User#{requester_id}")
+                        embed.set_author(name=f"Requested By: User#{requester_id}")
                 except Exception:
-                    embed.set_footer(text=f"Requested by <@{requester_id}>")
+                    embed.set_author(name=f"Requested By: <@{requester_id}>")
 
+            # Add voice channel location with speaker emoji
             embed.add_field(
-                name="Voice Channel",
-                value=channel_name,
+                name=" ",
+                value=f":speaker: {channel_name}",
                 inline=False,
             )
 
-            content = f":musical_note: Now Playing: `{title}`"
-            message = await txt.send(content=content, embed=embed)
-            self._now_playing_messages[guild.id] = message
+            # Import PlayerControlView for interactive buttons
+            try:
+                from commands.Music.nowplaying import PlayerControlView
+                import discord.ext.commands as cmd_module
+
+                # Create a fake context for the view
+                class FakeContext:
+                    def __init__(self, bot, guild, author_id):
+                        self.bot = bot
+                        self.guild = guild
+                        self.author = type("obj", (object,), {"id": author_id})
+
+                fake_ctx = FakeContext(
+                    self.bot, guild, requester_id or self.bot.user.id
+                )
+                view = PlayerControlView(fake_ctx, self, persistent=True)
+                message = await txt.send(embed=embed, view=view)
+                view.message = message
+                self._now_playing_messages[guild.id] = message
+            except Exception as e:
+                # Fallback: send without buttons if import fails
+                LOG.debug(f"Failed to add buttons to announcement: {e}")
+                message = await txt.send(embed=embed)
+                self._now_playing_messages[guild.id] = message
         except Exception:
             pass
 
@@ -1292,6 +1322,7 @@ lavalink:
         *,
         from_autoplay: bool = False,
         player: Optional["pomice.Player"] = None,
+        is_dj: bool = False,
     ) -> EnqueueResult:
         if not self._node_ready.is_set():
             try:
@@ -1416,16 +1447,20 @@ lavalink:
             len(tracks),
         )
         for tr in tracks:
+            # Check queue limit (DJ can bypass)
             if (
                 not from_autoplay
+                and not is_dj
                 and queue_limit_enabled
                 and total_in_queue + queued >= queue_limit
             ):
                 self._set_enqueue_error(
                     guild.id,
-                    "Queue limit reached for this guild. Clear some tracks and try again.",
+                    f"❌ Queue limit reached ({queue_limit} tracks). DJs can bypass this limit.",
                 )
                 break
+
+            # Check track duration limit (always enforced, even for DJ)
             track_length_ms = getattr(tr, "length", 0)
             if track_max_duration > 0 and track_length_ms > track_max_duration * 1000:
                 filtered_by_duration += 1
@@ -1591,6 +1626,150 @@ lavalink:
             return False, len(s), self.votes_needed(guild)
         s.add(user_id)
         return True, len(s), self.votes_needed(guild)
+
+    async def _check_dj(self, user: discord.Member, guild: discord.Guild) -> bool:
+        """
+        Check if user has DJ role or admin permissions.
+        Returns True if user has DJ permissions, False otherwise.
+        """
+        # Check admin permissions first
+        if user.guild_permissions.administrator or user.guild_permissions.manage_guild:
+            return True
+
+        # Check DJ role
+        cfg = self._get_music_config(guild.id)
+        dj_role_id = cfg.get("DJRole")
+
+        if dj_role_id:
+            try:
+                return any(r.id == int(dj_role_id) for r in user.roles)
+            except Exception:
+                pass
+
+        return False
+
+    async def _check_dj_mode_permission(
+        self, user: discord.Member, guild: discord.Guild, action: str
+    ) -> dict:
+        """
+        Check if user can perform action based on DJ mode settings.
+
+        Returns dict with:
+            - allowed: bool - Can perform action without voting
+            - needs_vote: bool - Needs to vote for action
+            - error: Optional[str] - Error message if not allowed
+        """
+        cfg = self._get_music_config(guild.id)
+        dj_mode = cfg.get("DJMode", "DJ Vote Bypass")
+        is_dj = await self._check_dj(user, guild)
+
+        # DJ Only mode: Only DJ can control
+        if dj_mode == "DJ Only":
+            if is_dj:
+                return {"allowed": True, "needs_vote": False, "error": None}
+            else:
+                return {
+                    "allowed": False,
+                    "needs_vote": False,
+                    "error": "❌ DJ role required to control music.",
+                }
+
+        # DJ Vote Bypass: DJ bypasses votes, others must vote
+        elif dj_mode == "DJ Vote Bypass":
+            if is_dj:
+                return {"allowed": True, "needs_vote": False, "error": None}
+            else:
+                return {"allowed": True, "needs_vote": True, "error": None}
+
+        # User Only: Everyone treated as non-DJ, must vote
+        elif dj_mode == "User Only":
+            return {"allowed": True, "needs_vote": True, "error": None}
+
+        # Disabled: Anyone can control without voting
+        elif dj_mode == "Disabled":
+            return {"allowed": True, "needs_vote": False, "error": None}
+
+        # Default to DJ Vote Bypass behavior
+        else:
+            if is_dj:
+                return {"allowed": True, "needs_vote": False, "error": None}
+            else:
+                return {"allowed": True, "needs_vote": True, "error": None}
+
+    async def handle_vote_action(
+        self,
+        guild_id: int,
+        user_id: int,
+        action: str,
+        voice_channel: Optional[discord.VoiceChannel] = None,
+    ) -> dict:
+        """
+        Handle voting for music actions.
+
+        Args:
+            guild_id: Guild ID
+            user_id: User ID voting
+            action: Action being voted on (e.g., "pause", "skip", "repeat_off")
+            voice_channel: Voice channel to count members from
+
+        Returns:
+            dict with:
+                - passed: bool - Whether vote threshold reached
+                - votes: int - Current vote count
+                - needed: int - Votes needed to pass
+        """
+        # Create vote key for this action
+        vote_key = f"{guild_id}_{action}"
+
+        if not hasattr(self, "_active_votes"):
+            self._active_votes = defaultdict(set)
+
+        # Add user's vote
+        self._active_votes[vote_key].add(user_id)
+        current_votes = len(self._active_votes[vote_key])
+
+        # Calculate needed votes
+        needed_votes = 1
+        if voice_channel:
+            try:
+                members = [m for m in voice_channel.members if not m.bot]
+                listeners = len(members)
+                if listeners > 1:
+                    needed_votes = math.ceil(
+                        listeners * (DEFAULT_VOTESKIP_PERCENT / 100.0)
+                    )
+                    needed_votes = max(1, needed_votes)
+            except Exception:
+                needed_votes = 1
+
+        # Check if vote passed
+        passed = current_votes >= needed_votes
+
+        # Clear votes if passed
+        if passed:
+            self._active_votes.pop(vote_key, None)
+
+        return {"passed": passed, "votes": current_votes, "needed": needed_votes}
+
+    def clear_votes_for_guild(self, guild_id: int) -> None:
+        """Clear all active votes for a guild."""
+        if not hasattr(self, "_active_votes"):
+            return
+
+        keys_to_remove = [
+            k for k in self._active_votes.keys() if k.startswith(f"{guild_id}_")
+        ]
+        for key in keys_to_remove:
+            self._active_votes.pop(key, None)
+
+    async def _delete_now_playing_message(self, guild_id: int) -> None:
+        """Delete the now playing message for a guild."""
+        message = self._now_playing_messages.pop(guild_id, None)
+        if message:
+            try:
+                await message.delete()
+            except Exception:
+                pass
 
 
 async def setup(bot):

@@ -363,14 +363,6 @@ class LavalinkManager:
                 "WEBEMBEDDED",
             ]
 
-        remote_cipher_url = os.getenv("YOUTUBE_PLUGIN_REMOTE_CIPHER_URL")
-        remote_cipher_password = os.getenv("YOUTUBE_PLUGIN_REMOTE_CIPHER_PASSWORD")
-        if remote_cipher_url:
-            remote_block: dict[str, Any] = {"url": remote_cipher_url}
-            if remote_cipher_password:
-                remote_block["password"] = remote_cipher_password
-            config["remoteCipher"] = remote_block
-
         po_token = os.getenv("YOUTUBE_PLUGIN_POTOKEN")
         visitor_data = os.getenv("YOUTUBE_PLUGIN_VISITOR_DATA")
         if po_token or visitor_data:
