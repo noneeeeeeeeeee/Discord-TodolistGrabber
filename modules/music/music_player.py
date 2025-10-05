@@ -648,9 +648,103 @@ class MusicPlayer(commands.Cog):
     async def on_pomice_websocket_closed(
         self, event: pomice.WebSocketClosedEvent
     ) -> None:
-        reason = getattr(getattr(event, "payload", None), "reason", None)
-        LOG.warning("Pomice node websocket closed: %s", reason or event)
+        payload = getattr(event, "payload", None)
+        reason = getattr(payload, "reason", None)
+        code = getattr(payload, "code", None)
+        by_remote = getattr(payload, "by_remote", None)
+
+        LOG.warning(
+            "🔴 Pomice websocket closed: code=%s reason=%s by_remote=%s event=%s",
+            code,
+            reason,
+            by_remote,
+            event,
+        )
+
+        # Clear node ready flag
         self._node_ready.clear()
+        LOG.info("Node ready flag cleared")
+
+        # If session destroyed (4014) or similar critical errors, attempt reconnection
+        if code in (4014, 4015, 4009) or code is None:
+            LOG.info(
+                "Session destroyed or error (code %s), attempting reconnection...", code
+            )
+            asyncio.create_task(self._attempt_reconnection())
+        else:
+            LOG.info("Websocket closed with code %s, no reconnection triggered", code)
+
+    async def _attempt_reconnection(self):
+        """Attempt to reconnect to Lavalink after websocket closure."""
+        LOG.info("Starting reconnection attempt after websocket closure...")
+        await asyncio.sleep(2)  # Brief delay before reconnecting
+
+        try:
+            # Get node pool
+            node_pool_cls = getattr(pomice, "NodePool", None)
+            if not node_pool_cls:
+                LOG.error("NodePool not available for reconnection")
+                return
+
+            # Try to destroy and remove all existing nodes
+            try:
+                existing_nodes = getattr(node_pool_cls, "_nodes", {})
+                LOG.info("Found %d existing nodes to clean up", len(existing_nodes))
+
+                for node_id, node in list(existing_nodes.items()):
+                    try:
+                        # Try to close websocket if it exists
+                        if hasattr(node, "_websocket") and node._websocket:
+                            await node._websocket.close()
+                        # Try to destroy the node properly
+                        if hasattr(node, "destroy"):
+                            await node.destroy()
+                    except Exception as e:
+                        LOG.warning("Error cleaning up node %s: %s", node_id, e)
+
+                # Clear the nodes dict
+                existing_nodes.clear()
+                LOG.info("Cleared all existing nodes")
+            except Exception as e:
+                LOG.warning("Error during node cleanup: %s", e)
+
+            # Now attempt to create fresh connection
+            identifier = LAVALINK_REGION or f"default-{LAVALINK_HOST}:{LAVALINK_PORT}"
+
+            for attempt in range(1, 6):  # 5 attempts
+                try:
+                    LOG.info("Reconnection attempt %d/5...", attempt)
+
+                    await node_pool_cls.create_node(
+                        bot=self.bot,
+                        host=LAVALINK_HOST,
+                        port=LAVALINK_PORT,
+                        password=LAVALINK_PASSWORD,
+                        identifier=str(identifier),
+                        secure=LAVALINK_SECURE,
+                        loop=getattr(self.bot, "loop", None),
+                        logger=LOG,
+                    )
+
+                    LOG.info("Successfully created new node connection")
+
+                    # Wait a moment for websocket to fully establish
+                    await asyncio.sleep(0.5)
+
+                    self._node_ready.set()
+                    self._bootstrap_error = None
+                    LOG.info("✅ Reconnection successful!")
+                    return
+
+                except Exception as e:
+                    LOG.warning("Reconnection attempt %d/5 failed: %s", attempt, e)
+                    if attempt < 5:
+                        await asyncio.sleep(2.0)
+
+            LOG.error("❌ All reconnection attempts failed")
+
+        except Exception as e:
+            LOG.error("Reconnection process failed: %s", e, exc_info=True)
 
     @commands.Cog.listener()
     async def on_pomice_track_start(self, *args, **kwargs):
@@ -857,7 +951,28 @@ class MusicPlayer(commands.Cog):
     async def ensure_player_connected(
         self, guild: discord.Guild, requester_id: int
     ) -> EnsureConnectionResult:
-        await self._node_ready.wait()
+        # Check if node is available, if not attempt reconnection
+        if not self._node_ready.is_set():
+            LOG.warning("Node not ready, checking if reconnection needed...")
+            node_pool_cls = getattr(pomice, "NodePool", None)
+            if node_pool_cls:
+                existing_nodes = getattr(node_pool_cls, "_nodes", {})
+                if not existing_nodes:
+                    LOG.warning("No nodes found, triggering reconnection...")
+                    asyncio.create_task(self._attempt_reconnection())
+
+        # Wait for node with timeout to prevent hanging
+        try:
+            await asyncio.wait_for(self._node_ready.wait(), timeout=20.0)
+        except asyncio.TimeoutError:
+            LOG.error("Timeout waiting for node to be ready")
+            message = (
+                "Music service is currently reconnecting. Please try again in a moment."
+            )
+            result = EnsureConnectionResult(player=None)
+            self._set_enqueue_error(guild.id, message)
+            result.error = message
+            return result
 
         result = EnsureConnectionResult(player=None)
 

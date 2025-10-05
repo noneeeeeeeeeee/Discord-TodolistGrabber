@@ -72,7 +72,11 @@ class SearchResultsView(View):
             placeholder=f"Select a track (Page {self.page + 1}/{self.max_pages})",
             options=options,
         )
-        select.callback = self.on_select
+
+        async def select_callback(interaction: discord.Interaction):
+            await self.on_select(interaction, select)
+
+        select.callback = select_callback
         self.add_item(select)
 
     def _update_select_menu(self):

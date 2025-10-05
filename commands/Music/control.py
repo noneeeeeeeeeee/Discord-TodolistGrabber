@@ -173,6 +173,10 @@ class ControlCommands(commands.Cog):
         if not player:
             await ctx.send(":x: Player backend not available.")
             return
+        if value is None:
+            await ctx.send(
+                f":speaker: Current volume is {ctx.guild.voice_client.volume}%"
+            )
 
         if value < 0 or value > 200:
             await ctx.send(":x: Volume must be between 0 and 200.")
@@ -183,7 +187,6 @@ class ControlCommands(commands.Cog):
             await ctx.send(":x: Not connected to voice channel.")
             return
 
-        # Check if user is in voice channel
         if not ctx.author.voice or ctx.author.voice.channel.id != vc.channel.id:
             await ctx.send(":x: You must be in the same voice channel!")
             return
