@@ -290,25 +290,20 @@ async def fetch_usccb_daily_readings(date=None) -> Optional[str]:
     if hasattr(date, "date"):
         date = date.date()
 
-    # Build URL using MMDDYY format as requested
     url_date = date.strftime("%m%d%y")
     url = f"https://bible.usccb.org/bible/readings/{url_date}.cfm"
 
-    # Prepare cache location (project root .cache)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_file = CACHE_DIR / f"usccb_{date.isoformat()}.txt"
 
-    # Cleanup old cache files (older than 3 days)
     purge_usccb_cache(max_age_days=2)
 
-    # Return cached if present
     if cache_file.exists():
         try:
             return cache_file.read_text(encoding="utf-8")
         except Exception:
             pass
 
-    # Synchronous request executed in threadpool to keep API async
     def _sync_fetch():
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) Gecko/20100101 Firefox/117.0",

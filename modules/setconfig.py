@@ -157,17 +157,25 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "access": 3,
             "description": "Maximum track duration in seconds. Set to 0 to disable limit.",
         },
-        "RemoveNonSongsUsingSponsorBlock": {
-            "type": "bool",
-            "default": True,
-            "access": 0,
-            "description": "If true, segments like intros, outros, and ads will be auto skipped using SponsorBlock.",
-        },
         "SponsorBlockEnabled": {
             "type": "bool",
             "default": True,
             "access": 0,
             "description": "Enable Lavalink SponsorBlock plugin integration.",
+        },
+        "VoteSkipPercent": {
+            "type": "float",
+            "default": 0.5,
+            "min": 0.1,
+            "max": 1.0,
+            "access": 3,
+            "description": "Percentage of voice channel members required to vote skip (0.1 = 10%, 1.0 = 100%).",
+        },
+        "AutoPlay": {
+            "type": "bool",
+            "default": False,
+            "access": 0,
+            "description": "Default AutoPlay state for new sessions. Users can toggle per session, but this sets the default.",
         },
         "SponsorBlockCategories": {
             "type": "list[str]",

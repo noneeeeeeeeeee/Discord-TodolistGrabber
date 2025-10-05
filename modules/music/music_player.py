@@ -176,6 +176,9 @@ class MusicPlayer(commands.Cog):
         self._bootstrap_error: Optional[str] = None
         self._now_playing_messages: Dict[int, discord.Message] = {}
         self._session_autoplay_disabled = defaultdict(bool)
+        self._command_channels: Dict[int, discord.abc.Messageable] = (
+            {}
+        )  # Store command invocation channels
         # Logging disabled for production
         # LOG.setLevel(logging.INFO)
         # for logger_name in ("pomice", "pomice.node", "pomice.player"):
@@ -197,6 +200,46 @@ class MusicPlayer(commands.Cog):
 
     def reset_session_state(self, guild_id: int) -> None:
         self._session_autoplay_disabled.pop(guild_id, None)
+
+    def set_command_channel(
+        self, guild_id: int, channel: discord.abc.Messageable
+    ) -> None:
+        """Store the channel where a command was invoked for announcements."""
+        self._command_channels[guild_id] = channel
+
+    def check_user_in_bot_vc(
+        self, member: discord.Member, guild: discord.Guild
+    ) -> Tuple[bool, Optional[str]]:
+        """Check if user is in the same VC as the bot.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (is_valid, error_message)
+                - (True, None) if validation passes
+                - (False, error_message) if validation fails
+        """
+        # Check if bot is connected
+        bot_vc = guild.voice_client
+        if not bot_vc or not isinstance(bot_vc, pomice.Player):
+            return True, None  # Bot not connected, allow command
+
+        # Check if bot is actually connected to a channel
+        if not is_voice_connected(bot_vc):
+            return True, None  # Bot not actually connected
+
+        # Check if user is in a voice channel
+        user_vc = getattr(member, "voice", None)
+        if not user_vc or not getattr(user_vc, "channel", None):
+            return False, ":x: You must be in a voice channel to use music commands."
+
+        # Check if user is in the same VC as bot
+        bot_channel = getattr(bot_vc, "channel", None)
+        if bot_channel and user_vc.channel.id != bot_channel.id:
+            return (
+                False,
+                f":x: You must be in the same voice channel as the bot (<#{bot_channel.id}>) to use this command.",
+            )
+
+        return True, None
 
     @staticmethod
     def _clamp_seconds(value: Any, default: int) -> int:
@@ -295,6 +338,11 @@ class MusicPlayer(commands.Cog):
     def _get_announcement_channel(
         self, guild: discord.Guild
     ) -> Optional[discord.abc.Messageable]:
+        # First, check if we have a stored command channel for this guild
+        if guild.id in self._command_channels:
+            return self._command_channels[guild.id]
+
+        # Fallback: find first available text channel with send permissions
         member = getattr(guild, "me", None)
         if member is None and getattr(self.bot, "user", None):
             member = guild.get_member(self.bot.user.id)  # type: ignore[arg-type]

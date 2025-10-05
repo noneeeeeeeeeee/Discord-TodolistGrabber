@@ -100,27 +100,52 @@ class ChoiceSelectionView(View):
 
         # Build dropdown options from choices
         choices = meta.get("choices", [])
+        setting_type = meta.get("type", "str")
+        is_list_type = "list[" in setting_type
+        is_nullable = "|null" in setting_type or "|None" in setting_type
+
         if isinstance(choices, list) and len(choices) <= 25:
-            select = Select(placeholder="Select a value")
+            max_values = 1
+            if is_list_type:
+                max_values = len(choices)
+
+            select = Select(
+                placeholder="Select value(s)" if is_list_type else "Select a value",
+                min_values=0 if is_nullable else 1,
+                max_values=max_values,
+            )
+
+            if is_nullable and not is_list_type:
+                select.add_option(
+                    label="None (Clear Value)", value="__NULL__", emoji="🚫"
+                )
+
             for choice in choices:
                 select.add_option(label=str(choice), value=str(choice))
+
             select.callback = self.on_choice_select
             self.add_item(select)
 
     async def on_choice_select(self, interaction: discord.Interaction):
-        selected = self.children[0].values[0]
+        selected_values = self.children[0].values
+        setting_type = self.meta.get("type", "str")
+        is_list_type = "list[" in setting_type
 
         try:
-            # For list[str] types, keep as single value or handle appropriately
-            t = self.meta.get("type", "str")
-            if t == "list[str]":
-                # For list types with choices, this is typically adding to a list
-                # but for simplicity, we'll set it as a comma-separated string
-                raw_value = selected
+            if not selected_values or (
+                len(selected_values) == 1 and selected_values[0] == "__NULL__"
+            ):
+                coerced = None
+                display = "None"
+            elif is_list_type:
+                raw_value = selected_values
+                coerced = coerce_value_for_path(self.selected_path, raw_value)
+                display = ", ".join(selected_values)
             else:
-                raw_value = selected
+                raw_value = selected_values[0]
+                coerced = coerce_value_for_path(self.selected_path, raw_value)
+                display = raw_value
 
-            coerced = coerce_value_for_path(self.selected_path, raw_value)
             edit_json_file(
                 self.parent_view.ctx.guild.id,
                 self.selected_path,
@@ -129,11 +154,11 @@ class ChoiceSelectionView(View):
             )
             self.parent_view.cfg = json_get(self.parent_view.ctx.guild.id)
             await self.parent_view.message.edit(
-                embed=self.parent_view._embed(message=f"Set to: {selected}"),
+                embed=self.parent_view._embed(message=f"Set to: {display}"),
                 view=self.parent_view,
             )
             await interaction.response.send_message(
-                f"✅ Value updated to: **{selected}**", ephemeral=True
+                f"✅ Value updated to: **{display}**", ephemeral=True
             )
         except Exception as e:
             await interaction.response.send_message(

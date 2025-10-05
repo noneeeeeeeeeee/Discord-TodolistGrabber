@@ -224,6 +224,11 @@ class QueueCommands(commands.Cog):
             await ctx.send("Player backend not available.")
             return
 
+        is_valid, error_msg = player.check_user_in_bot_vc(ctx.author, ctx.guild)
+        if not is_valid:
+            await ctx.send(error_msg, delete_after=10)
+            return
+
         current = player._current_entries.get(ctx.guild.id)
         upcoming = list(player.queues.get(ctx.guild.id, []))
 
@@ -388,25 +393,6 @@ class QueueCommands(commands.Cog):
         await ctx.send("Queue reversed.")
 
     @commands.hybrid_command(
-        name="removeduplicates", description="Remove duplicates from queue."
-    )
-    async def removeduplicates(self, ctx: commands.Context):
-        player = self.bot.get_cog("MusicPlayer")
-        q = player.queues.get(ctx.guild.id, deque())
-        seen = set()
-        newq = deque()
-        removed = 0
-        for it in q:
-            key = it.get("title", "").lower()
-            if key in seen:
-                removed += 1
-                continue
-            seen.add(key)
-            newq.append(it)
-        player.queues[ctx.guild.id] = newq
-        await ctx.send(f"Removed {removed} duplicate(s).")
-
-    @commands.hybrid_command(
         name="clearqueue",
         description="Clear queue tracks. Supports ranges (1-5), lists (1,2,3), or clear all.",
         aliases=["cq"],
@@ -426,6 +412,11 @@ class QueueCommands(commands.Cog):
         player = self.bot.get_cog("MusicPlayer")
         if not player:
             await ctx.send("Player backend not available.")
+            return
+
+        is_valid, error_msg = player.check_user_in_bot_vc(ctx.author, ctx.guild)
+        if not is_valid:
+            await ctx.send(error_msg, delete_after=10)
             return
 
         queue = player.queues.get(ctx.guild.id, deque())
@@ -556,6 +547,11 @@ class QueueCommands(commands.Cog):
         player = self.bot.get_cog("MusicPlayer")
         if not player:
             await ctx.send("Player backend not available.")
+            return
+
+        is_valid, error_msg = player.check_user_in_bot_vc(ctx.author, ctx.guild)
+        if not is_valid:
+            await ctx.send(error_msg, delete_after=10)
             return
 
         queue = player.queues.get(ctx.guild.id, deque())

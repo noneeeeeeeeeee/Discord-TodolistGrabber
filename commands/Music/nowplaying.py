@@ -901,6 +901,12 @@ class NowPlayingCommands(commands.Cog):
             await ctx.send("❌ Player backend not available.")
             return
 
+        # VC validation check
+        is_valid, error_msg = player.check_user_in_bot_vc(ctx.author, ctx.guild)
+        if not is_valid:
+            await ctx.send(error_msg, delete_after=10)
+            return
+
         current = player._current_entries.get(ctx.guild.id)
         if not current:
             await ctx.send("❌ Nothing is currently playing.")

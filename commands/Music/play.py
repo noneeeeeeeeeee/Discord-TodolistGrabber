@@ -267,6 +267,13 @@ class PlayCommands(commands.Cog):
             await ctx.send("Player backend not available.")
             return
 
+        is_valid, error_msg = player.check_user_in_bot_vc(ctx.author, ctx.guild)
+        if not is_valid:
+            await ctx.send(error_msg, delete_after=10)
+            return
+
+        player.set_command_channel(ctx.guild.id, ctx.channel)
+
         if ctx.interaction and not ctx.interaction.response.is_done():
             await ctx.defer()
 

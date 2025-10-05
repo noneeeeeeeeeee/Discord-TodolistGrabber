@@ -34,7 +34,11 @@ class SkipCommands(commands.Cog):
             await ctx.send("Player backend missing.")
             return
 
-        # Handle skipto functionality if index provided
+        is_valid, error_msg = player.check_user_in_bot_vc(ctx.author, ctx.guild)
+        if not is_valid:
+            await ctx.send(error_msg, delete_after=10)
+            return
+
         if index is not None:
             if not self._is_dj(ctx):
                 await ctx.send(":x: DJ/Admin required to skip to specific position.")
