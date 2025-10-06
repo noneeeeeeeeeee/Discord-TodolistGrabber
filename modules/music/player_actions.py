@@ -67,7 +67,7 @@ async def handle_pause_action(
         await vc.set_pause(True)
         return {
             "success": True,
-            "message": f"⏸️ **{user.display_name}** paused the player",
+            "message": f"⏸️ **{user.display_name}** paused the player. `/resume` to continue.",
             "ephemeral": False,
         }
     else:
@@ -112,7 +112,7 @@ async def handle_resume_action(
         await vc.set_pause(False)
         return {
             "success": True,
-            "message": f"▶️ **{user.display_name}** resumed the player",
+            "message": f"▶️ **{user.display_name}** resumed the player. `/pause` to pause.",
             "ephemeral": False,
         }
     else:
@@ -205,7 +205,7 @@ async def handle_repeat_action(
     Handle repeat mode change with DJ check and voting.
 
     Args:
-        mode: "off", "track", or "queue"
+        mode: "off" or "track"
 
     Returns dict with:
     - success: bool
@@ -215,7 +215,7 @@ async def handle_repeat_action(
     # Check DJ permissions
     is_dj = await player._check_dj(user, guild)
 
-    mode_text = {"off": "Off", "track": "Track", "queue": "Queue"}[mode]
+    mode_text = "On" if mode == "track" else "Off"
 
     if is_dj:
         player.repeat_mode[guild.id] = mode

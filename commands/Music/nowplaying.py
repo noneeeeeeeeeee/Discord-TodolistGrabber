@@ -92,19 +92,13 @@ class RepeatOptionsView(View):
         placeholder="Choose repeat mode",
         options=[
             discord.SelectOption(
-                label="Off", value="off", description="Disable repeat", emoji="⏹️"
+                label="Off", value="off", description="Disable track repeat", emoji="⏹️"
             ),
             discord.SelectOption(
-                label="Track",
+                label="On",
                 value="track",
                 description="Repeat current track",
                 emoji="🔂",
-            ),
-            discord.SelectOption(
-                label="Queue",
-                value="queue",
-                description="Repeat entire queue",
-                emoji="🔁",
             ),
         ],
     )
@@ -843,7 +837,12 @@ class NowPlayingCommands(commands.Cog):
             )
 
         # Add requester as author
-        if requester_id:
+        is_autoplay = current.get("autoplay", False)
+
+        if is_autoplay:
+            # Show special autoplay indicator
+            embed.set_author(name="✨ By: Autoplay")
+        elif requester_id:
             try:
                 requester = ctx.guild.get_member(requester_id)
                 if requester:

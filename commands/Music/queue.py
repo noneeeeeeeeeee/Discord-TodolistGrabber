@@ -114,8 +114,9 @@ class QueuePaginationView(View):
                 inline=False,
             )
 
-        repeat = self.player.repeat_mode.get(self.ctx.guild.id, "none").title()
-        embed.add_field(name="🔁 Repeat Mode", value=repeat, inline=True)
+        repeat_mode = self.player.repeat_mode.get(self.ctx.guild.id, "off")
+        repeat_status = "On" if repeat_mode == "track" else "Off"
+        embed.add_field(name="🔁 Repeat", value=repeat_status, inline=True)
 
         autoplay_enabled = self.player.is_session_autoplay_enabled(self.ctx.guild.id)
         autoplay_status = "Enabled" if autoplay_enabled else "Disabled (session)"
@@ -299,8 +300,9 @@ class QueueCommands(commands.Cog):
                 inline=False,
             )
 
-        repeat = player.repeat_mode.get(ctx.guild.id, "none").title()
-        embed.add_field(name="🔁 Repeat Mode", value=repeat, inline=True)
+        repeat_mode = player.repeat_mode.get(ctx.guild.id, "off")
+        repeat_status = "On" if repeat_mode == "track" else "Off"
+        embed.add_field(name="🔁 Repeat", value=repeat_status, inline=True)
 
         autoplay_enabled = player.is_session_autoplay_enabled(ctx.guild.id)
         autoplay_status = "Enabled" if autoplay_enabled else "Disabled (session)"

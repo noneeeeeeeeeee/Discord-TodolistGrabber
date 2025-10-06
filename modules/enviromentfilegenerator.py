@@ -25,6 +25,11 @@ def check_and_load_env_file():
             "LAVALINK_PORT=2333\n"
             "LAVALINK_PASSWORD=youshallnotpass\n"
             "LAVALINK_SECURE=false\n"
+            "\n"
+            "# Spotify API (Optional - for intelligent autoplay recommendations)\n"
+            "# Get credentials from: https://developer.spotify.com/dashboard\n"
+            "SPOTIFY_CLIENT_ID=YOUR_SPOTIFY_CLIENT_ID\n"
+            "SPOTIFY_CLIENT_SECRET=YOUR_SPOTIFY_CLIENT_SECRET\n"
         )
         with open(env_path, "w") as env_file:
             env_file.write(example_env_content)

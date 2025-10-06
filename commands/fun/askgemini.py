@@ -12,7 +12,7 @@ class AskGemini(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.user_usage = {}
-        self.model = genai.GenerativeModel("gemini-1.5-flash")
+        self.model = genai.GenerativeModel("gemini-2.0-flash")
 
     @commands.hybrid_command(
         name="askgemini", description="Ask a question to the Gemini API."

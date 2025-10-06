@@ -175,7 +175,7 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "type": "bool",
             "default": False,
             "access": 0,
-            "description": "Default AutoPlay state for new sessions. Users can toggle per session, but this sets the default.",
+            "description": "Default AutoPlay state for new sessions. Users can toggle per session, but this sets the default. This is a beta feature, expect bugs.",
         },
         "SponsorBlockCategories": {
             "type": "list[str]",

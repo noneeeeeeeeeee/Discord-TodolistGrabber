@@ -50,7 +50,6 @@ class ControlCommands(commands.Cog):
             await ctx.send(error)
             return
 
-        # Handle pause action
         result = await handle_pause_action(
             player, ctx.guild, ctx.author, vc, ctx.channel
         )
