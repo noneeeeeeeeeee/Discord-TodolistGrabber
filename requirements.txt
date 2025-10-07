@@ -1,7 +1,7 @@
 discord.py
 python-dotenv
 requests
-google-generativeai
+google-genai
 PyNaCl
 beautifulsoup4
 tzdata

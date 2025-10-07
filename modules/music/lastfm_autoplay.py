@@ -3,10 +3,14 @@ import asyncio
 import time
 import logging
 import json
+import re
+from collections import Counter
 from typing import List, Optional, Tuple, Dict, Any
 from pathlib import Path
+
 import aiohttp
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 LOG = logging.getLogger(__name__)
 
@@ -38,6 +42,8 @@ CACHE_MAX_AGE = 60 * 60 * 24 * 15
 HISTORY_LIMIT = 50
 DURATION_TOLERANCE_SECONDS = 5
 DURATION_TOLERANCE_PERCENT = 0.12
+METADATA_CACHE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 GOOD_TITLE_KEYWORDS = (
     # explicit "official" phrases first (phrase match)
@@ -115,6 +121,7 @@ BAD_TITLE_KEYWORDS = (
     "fan edit",
     "fanmix",
     "fan mix",
+    "audio",
     # performance / live
     "live",
     "live at",
@@ -152,6 +159,26 @@ BAD_TITLE_KEYWORDS = (
     "promotional",
     "promotion",
     "promos",
+    # Music Mix (Multiple Music from the same artist in one video)
+    "music mix",
+    "top hits",
+    "best of",
+    "2018",
+    "2019",
+    "2020",
+    "2021",
+    "2022",
+    "2023",
+    "2024",
+    "2025",
+    "2016",
+    "2017",
+    "amazing",
+    "greatest",
+    "hits",
+    "collection",
+    "compilation",
+    "playlist",
 )
 
 # Last.fm API Configuration
@@ -181,14 +208,20 @@ class LastFMAutoplay:
         self._genre_history: Dict[int, List[str]] = (
             {}
         )  # Guild -> List of recent genres (for diversity)
+        self._metadata_cache: Dict[str, Dict[str, Any]] = {}
+        self._metadata_cache_file = self._cache_dir / "track_metadata.json"
+        self._metadata_lock = asyncio.Lock()
         self._initialized = False
-        self._gemini_model = None
+        self._gemini_client: Optional[genai.Client] = None
+        self._gemini_search_tool: Optional[types.Tool] = None
+        self._gemini_base_config: Optional[types.GenerateContentConfig] = None
         self._gemini_available = False
 
         # Initialize Last.fm API
         self._init_lastfm_client()
         self._init_gemini()
         self._load_cache()
+        self._load_metadata_cache()
         # History is now loaded per-guild on-demand
 
     def _init_lastfm_client(self):
@@ -213,23 +246,115 @@ class LastFMAutoplay:
             if not gemini_api_key:
                 LOG.warning(
                     f"⚠️ [Last.fm AutoPlay] {GEMINI_API_KEY_ENV} not found in .env. "
-                    "Gemini parsing disabled, autoplay will be disabled."
+                    "Gemini parsing disabled; falling back to heuristic parsing."
                 )
                 LOG.warning("Get a free API key from https://ai.google.dev/")
-                # Disable Last.fm autoplay if Gemini is not available
-                self._initialized = False
+                self._gemini_available = False
                 return
 
-            genai.configure(api_key=gemini_api_key)
-            self._gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+            self._gemini_client = genai.Client(api_key=gemini_api_key)
+            self._gemini_search_tool = types.Tool(google_search=types.GoogleSearch())
+            self._gemini_base_config = types.GenerateContentConfig(
+                tools=[self._gemini_search_tool]
+            )
             self._gemini_available = True
 
         except Exception as e:
             LOG.error(
-                f"❌ [Last.fm AutoPlay] Failed to initialize Gemini: {e}. AutoPlay will be disabled."
+                f"❌ [Last.fm AutoPlay] Failed to initialize Gemini: {e}. Heuristic parsing will be used instead."
             )
+            self._gemini_client = None
+            self._gemini_search_tool = None
+            self._gemini_base_config = None
             self._gemini_available = False
-            self._initialized = False
+
+    @staticmethod
+    def _strip_code_fence(payload: str) -> str:
+        """Remove Markdown code fences from Gemini responses."""
+
+        if not isinstance(payload, str):
+            return ""
+
+        stripped = payload.strip()
+        fence_match = re.match(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL)
+        if fence_match:
+            return fence_match.group(1).strip()
+        return stripped
+
+    @staticmethod
+    def _extract_json_dict(text: str) -> Optional[Dict[str, Any]]:
+        """Try to parse a JSON object from a Gemini text fragment."""
+
+        if not isinstance(text, str):
+            return None
+
+        cleaned = LastFMAutoplay._strip_code_fence(text)
+        if not cleaned:
+            return None
+
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = cleaned[start : end + 1]
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    def _collect_gemini_texts(self, response: Any) -> List[str]:
+        """Gather all textual payloads from a Gemini response."""
+
+        texts: List[str] = []
+        if response is None:
+            return texts
+
+        primary_text = getattr(response, "text", None)
+        if isinstance(primary_text, str) and primary_text.strip():
+            texts.append(primary_text)
+
+        parsed_payload = getattr(response, "parsed", None)
+        if isinstance(parsed_payload, dict):
+            try:
+                texts.append(json.dumps(parsed_payload))
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(parsed_payload, list):
+            for item in parsed_payload:
+                if isinstance(item, (dict, list)):
+                    try:
+                        texts.append(json.dumps(item))
+                    except (TypeError, ValueError):
+                        continue
+
+        for candidate in getattr(response, "candidates", []) or []:
+            content = getattr(candidate, "content", None)
+            if not content:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    texts.append(part_text)
+
+        return texts
+
+    def _parse_gemini_json(self, response: Any) -> Optional[Dict[str, Any]]:
+        """Extract the first valid JSON object from a Gemini response."""
+
+        for candidate_text in self._collect_gemini_texts(response):
+            data = self._extract_json_dict(candidate_text)
+            if isinstance(data, dict):
+                return data
+        return None
 
     def _load_cache(self):
         """Load Last.fm->YouTube mapping cache from disk."""
@@ -262,6 +387,171 @@ class LastFMAutoplay:
 
         except Exception as e:
             LOG.warning(f"Failed to save Last.fm cache: {e}")
+
+    def _load_metadata_cache(self) -> None:
+        """Load cached enriched track metadata (Gemini + Last.fm)."""
+        if not self._metadata_cache_file.exists():
+            return
+
+        try:
+            with open(self._metadata_cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    self._metadata_cache = data
+        except Exception as e:
+            LOG.warning(f"Failed to load track metadata cache: {e}")
+
+    def _save_metadata_cache(self) -> None:
+        """Persist enriched track metadata to disk."""
+        try:
+            with open(self._metadata_cache_file, "w", encoding="utf-8") as f:
+                json.dump(self._metadata_cache, f, indent=2)
+        except Exception as e:
+            LOG.warning(f"Failed to save track metadata cache: {e}")
+
+    @staticmethod
+    def _make_track_metadata_key(artist: str, track: str) -> str:
+        return f"{artist.lower().strip()}|||{track.lower().strip()}"
+
+    @staticmethod
+    def _normalize_tag(tag: str) -> str:
+        return tag.strip().lower()
+
+    def _should_refresh_metadata(self, entry: Dict[str, Any]) -> bool:
+        timestamp = entry.get("timestamp", 0)
+        return (time.time() - timestamp) > METADATA_CACHE_MAX_AGE
+
+    async def _fetch_track_tags_from_lastfm(self, artist: str, track: str) -> List[str]:
+        tags: List[str] = []
+        async with aiohttp.ClientSession() as session:
+            data = await self._lastfm_get(
+                {"method": "track.getTopTags", "artist": artist, "track": track},
+                session,
+            )
+            if data:
+                tag_list = data.get("toptags", {}).get("tag", [])
+                if isinstance(tag_list, dict):
+                    tag_list = [tag_list]
+                for tag_obj in tag_list[:10]:
+                    tag_name = tag_obj.get("name")
+                    if tag_name:
+                        tags.append(self._normalize_tag(tag_name))
+        return tags
+
+    async def _classify_track_with_gemini(
+        self,
+        artist: str,
+        track: str,
+        existing_tags: List[str],
+    ) -> Dict[str, Any]:
+        """Use Gemini with Google Search grounding to enrich track metadata."""
+        if not self._gemini_available or not self._gemini_client:
+            return {}
+
+        instructions = (
+            "You are a music metadata enrichment assistant. Given an artist and track, "
+            "return concise JSON with keys: tags (list of canonical genres), moods "
+            "(list of 1-3 mood descriptors), and energy (one word describing energy level). "
+            "Normalize genres to standard Spotify-like labels. Use Google Search grounding "
+            "to verify ambiguous cases."
+        )
+        prompt = (
+            "Artist: {artist}\n"
+            "Track: {track}\n"
+            "Existing tags: {tags}\n"
+            "Respond with JSON only."
+        ).format(artist=artist, track=track, tags=existing_tags or "[]")
+
+        def _call_gemini() -> Optional[Any]:
+            try:
+                return self._gemini_client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=(
+                            [self._gemini_search_tool]
+                            if self._gemini_search_tool
+                            else None
+                        ),
+                        system_instruction=instructions,
+                    ),
+                )
+            except Exception as exc:  # Rate limits or network errors
+                LOG.debug(f"⚠️ [Gemini] Metadata enrichment failed: {exc}")
+                return None
+
+        response = await asyncio.to_thread(_call_gemini)
+        if response is None:
+            return {}
+
+        structured = self._parse_gemini_json(response)
+        if structured:
+            return structured
+
+        texts = self._collect_gemini_texts(response)
+        if texts:
+            preview = self._strip_code_fence(texts[0])[:200]
+            LOG.debug(f"⚠️ [Gemini] Failed to parse JSON response. Raw: {preview}")
+        return {}
+
+    async def _get_track_profile(
+        self, artist: str, track: str, require_enrichment: bool = False
+    ) -> Dict[str, Any]:
+        """Return enriched track metadata, combining Last.fm and Gemini."""
+
+        metadata_key = self._make_track_metadata_key(artist, track)
+
+        async with self._metadata_lock:
+            cache_entry = self._metadata_cache.get(metadata_key, {})
+
+            if cache_entry and not self._should_refresh_metadata(cache_entry):
+                return cache_entry
+
+        # Fetch Last.fm tags first (primary source)
+        tags = await self._fetch_track_tags_from_lastfm(artist, track)
+
+        metadata: Dict[str, Any] = {
+            "artist": artist,
+            "track": track,
+            "tags": tags,
+            "moods": [],
+            "energy": None,
+            "sources": ["lastfm"] if tags else [],
+            "timestamp": time.time(),
+        }
+
+        need_gemini = require_enrichment or len(tags) < 3
+
+        if need_gemini:
+            enriched = await self._classify_track_with_gemini(artist, track, tags)
+            if enriched:
+                gemini_tags = [
+                    self._normalize_tag(tag)
+                    for tag in enriched.get("tags", [])
+                    if isinstance(tag, str)
+                ]
+                # Merge tags prioritizing Last.fm first, then Gemini unique ones
+                merged_tags = (
+                    list(dict.fromkeys(tags + gemini_tags)) if tags else gemini_tags
+                )
+                if merged_tags:
+                    metadata["tags"] = merged_tags
+                metadata["moods"] = [
+                    mood.strip()
+                    for mood in enriched.get("moods", [])
+                    if isinstance(mood, str)
+                ][:5]
+                energy = enriched.get("energy")
+                if isinstance(energy, str):
+                    metadata["energy"] = energy.strip()
+                metadata.setdefault("sources", []).append("gemini")
+
+        async with self._metadata_lock:
+            metadata["timestamp"] = time.time()
+            self._metadata_cache[metadata_key] = metadata
+            self._save_metadata_cache()
+
+        return metadata
 
     def _load_guild_history(self, guild_id: int) -> None:
         """Load recommendation history for a specific guild from disk."""
@@ -299,7 +589,7 @@ class LastFMAutoplay:
 
     def is_available(self) -> bool:
         """Check if Last.fm autoplay is available."""
-        return self._initialized and self.api_key is not None and self._gemini_available
+        return self._initialized and self.api_key is not None
 
     def _normalize_artist_for_diversity(self, artist: str) -> str:
         """Normalize artist name for diversity scoring to catch variations."""
@@ -355,6 +645,67 @@ class LastFMAutoplay:
             except Exception as e:
                 LOG.warning(f"Failed to delete all history files: {e}")
 
+    @staticmethod
+    def _sanitize_artist_name(value: str) -> str:
+        cleaned = value or ""
+        cleaned = re.sub(r"(?i)\b(feat|ft|featuring|x)\b.*", "", cleaned)
+        cleaned = re.sub(r"[|•/]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        primary_parts = re.split(r"\s*(?:,|;| with )\s*", cleaned)
+        if primary_parts:
+            cleaned = primary_parts[0]
+        return cleaned.strip(" -|•")
+
+    @staticmethod
+    def _sanitize_title_text(value: str) -> str:
+        cleaned = value or ""
+        cleaned = re.sub(r"\[[^\]]*\]", " ", cleaned)
+        cleaned = re.sub(r"\([^)]*\)", " ", cleaned)
+        cleaned = re.sub(
+            r"(?i)\b(official(?:\s+(music|lyric|audio|video))?|official|lyrics?|audio|video|mv|visualizer|hd|4k|8k|live|performance|karaoke|teaser|trailer)\b",
+            " ",
+            cleaned,
+        )
+        cleaned = re.sub(r"[|•/]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip(" -|•")
+
+    def _fallback_parse_track(
+        self, raw_title: str, channel_name: str
+    ) -> Optional[Dict[str, str]]:
+        """Simple heuristic parsing when Gemini is unavailable."""
+
+        base_title = raw_title or ""
+        if not base_title.strip():
+            return None
+
+        normalized = self._sanitize_title_text(base_title)
+
+        candidates: List[Tuple[str, str]] = []
+        separators = [" - ", " – ", " — ", " ~ ", " : "]
+        for sep in separators:
+            if sep in normalized:
+                left, right = normalized.split(sep, 1)
+                candidates.append((left.strip(), right.strip()))
+
+        if not candidates and "-" in normalized:
+            left, right = normalized.split("-", 1)
+            candidates.append((left.strip(), right.strip()))
+
+        for artist_raw, title_raw in candidates:
+            artist = self._sanitize_artist_name(artist_raw)
+            title = self._sanitize_title_text(title_raw)
+            if artist and title:
+                return {"artist": artist, "title": title}
+
+        channel_artist = self._sanitize_artist_name(channel_name or "")
+        if channel_artist:
+            title = self._sanitize_title_text(normalized)
+            if channel_artist and title:
+                return {"artist": channel_artist, "title": title}
+
+        return None
+
     async def _parse_track_with_gemini(
         self, raw_title: str, channel_name: str
     ) -> Optional[Dict[str, str]]:
@@ -369,7 +720,13 @@ class LastFMAutoplay:
         Returns:
             Dict with 'artist' and 'title' keys, or None if parsing failed
         """
-        if not self._gemini_model:
+        if not self._gemini_available or not self._gemini_client:
+            fallback = self._fallback_parse_track(raw_title, channel_name)
+            if fallback:
+                LOG.warning(
+                    "⚠️ [Last.fm] Gemini unavailable, using heuristic track parsing"
+                )
+                return fallback
             LOG.warning("⚠️ [Last.fm] Gemini not available, cannot parse track")
             return None
 
@@ -403,47 +760,53 @@ Output: {{"artist": "Taylor Swift", "title": "Anti-Hero"}}
 
 Respond with ONLY the JSON object, no other text."""
 
+        config = self._gemini_base_config
+        if config is None and self._gemini_search_tool:
+            config = types.GenerateContentConfig(tools=[self._gemini_search_tool])
+
         try:
             response = await asyncio.to_thread(
-                self._gemini_model.generate_content, prompt
+                self._gemini_client.models.generate_content,
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=config,
             )
-            response_text = response.text.strip()
-
-            # Remove markdown code blocks if present
-            if "```json" in response_text:
-                response_text = (
-                    response_text.split("```json")[1].split("```")[0].strip()
-                )
-            elif "```" in response_text:
-                response_text = response_text.split("```")[1].split("```")[0].strip()
-
-            parsed = json.loads(response_text)
-
-            if "artist" in parsed and "title" in parsed:
-                artist = parsed["artist"].strip()
-                title = parsed["title"].strip()
-
-                if artist and title:
-                    return {"artist": artist, "title": title}
-                else:
-                    LOG.warning(
-                        f"⚠️ [Gemini] Parsed result has empty artist or title: {parsed}"
-                    )
-                    return None
-            else:
-                LOG.warning(
-                    f"⚠️ [Gemini] Response missing 'artist' or 'title' fields: {parsed}"
-                )
-                return None
-
-        except json.JSONDecodeError as e:
-            LOG.error(
-                f"❌ [Gemini] Failed to parse JSON response: {response_text[:200]} - {e}"
-            )
-            return None
         except Exception as e:
             LOG.error(f"❌ [Gemini] Error parsing track: {e}")
             return None
+
+        structured = self._parse_gemini_json(response)
+        if structured:
+            artist = str(structured.get("artist", "")).strip()
+            title = str(structured.get("title", "")).strip()
+            if artist and title:
+                LOG.debug(
+                    f"🎧 [Gemini] Parsed track metadata → artist='{artist}', title='{title}'"
+                )
+                return {"artist": artist, "title": title}
+            LOG.warning(
+                f"⚠️ [Gemini] Parsed result missing required fields: {structured}"
+            )
+        else:
+            texts = self._collect_gemini_texts(response)
+            if texts:
+                preview = self._strip_code_fence(texts[0])[:200]
+                LOG.debug(f"⚠️ [Gemini] Failed to parse JSON response. Raw: {preview}")
+            else:
+                LOG.debug("⚠️ [Gemini] Empty response payload while parsing track")
+
+        fallback = self._fallback_parse_track(raw_title, channel_name)
+        if fallback:
+            LOG.warning(
+                "⚠️ [Last.fm] Falling back to heuristic track parsing due to Gemini failure"
+            )
+            LOG.debug(
+                f"🎧 [Heuristic] Parsed track metadata → artist='{fallback['artist']}', title='{fallback['title']}'"
+            )
+            return fallback
+
+        LOG.error("❌ [Gemini] Unable to derive artist/title from provided metadata")
+        return None
 
     async def _lastfm_get(
         self, params: Dict[str, Any], session: aiohttp.ClientSession
@@ -676,9 +1039,9 @@ Respond with ONLY the JSON object, no other text."""
             if len(results) >= limit:
                 break
 
-        LOG.debug(
-            "🎧 [Last.fm] Added %d top tracks for artist '%s'", len(results), artist
-        )
+            LOG.debug(
+                f"🎧 [Last.fm] Added {len(results)} top tracks for artist '{artist}'"
+            )
         return results
 
     async def _get_similar_tracks(
@@ -924,6 +1287,8 @@ Respond with ONLY the JSON object, no other text."""
         artist = parsed["artist"]
         title = parsed["title"]
 
+        LOG.debug(f"🎧 [Last.fm] Using parsed artist/title: '{artist}' - '{title}'")
+
         # Phase 2: Build a blended recommendation pool from multiple sources
         recommendations_pool: List[Dict[str, Any]] = []
 
@@ -1055,50 +1420,77 @@ Respond with ONLY the JSON object, no other text."""
                 if already_played:
                     continue
 
-            # Calculate diversity score with Spotify-like cooldown system
             normalized_artist = self._normalize_artist_for_diversity(similar_artist)
             artist_repeat_count = recent_artists.get(normalized_artist, 0)
-
-            # Check cooldown status
             cooldown_remaining = self._artist_cooldowns[guild_id].get(
                 normalized_artist, 0
             )
 
-            diversity_score = 0
-
-            # Artist on cooldown (needs 3 different artists before eligible)
+            diversity_penalty = 0
             if cooldown_remaining > 0:
-                diversity_score = 1000 + cooldown_remaining * 100  # Very high penalty
-            # Same artist as current track or played 2+ times recently
+                diversity_penalty = 1000 + cooldown_remaining * 100
             elif artist_repeat_count >= 2:
-                diversity_score = 500 + artist_repeat_count * 50  # High penalty
-            # Artist played once - still okay but lower priority
+                diversity_penalty = 500 + artist_repeat_count * 50
             elif artist_repeat_count == 1:
-                diversity_score = 50
-            # New artist - highest priority
-            else:
-                diversity_score = 0
+                diversity_penalty = 50
 
-            # Spotify-lite: Bonus for genre diversity (encourage exploration)
-            # If we know recent genres, prefer tracks from different genres
+            # Retrieve enriched metadata (tags/mood) for scoring
+            track_profile = await self._get_track_profile(
+                similar_artist, similar_name, require_enrichment=True
+            )
+            candidate_tags = track_profile.get("tags", [])
+
+            session_tags = []
             if guild_id in self._genre_history and self._genre_history[guild_id]:
-                # Check if this track's source indicates genre
-                track_source = similar_track.get("source", "")
-                if track_source in ["similar-genre", "tag-top-track", "genre-fallback"]:
-                    diversity_score -= 10
+                session_top = Counter(self._genre_history[guild_id]).most_common(5)
+                session_tags = [tag for tag, _ in session_top]
+
+            tag_overlap = 0.0
+            novelty = 0.5
+            if candidate_tags and session_tags:
+                overlap = len(set(candidate_tags) & set(session_tags))
+                tag_overlap = overlap / max(len(session_tags), 1)
+                novelty = max(0.0, min(1.0, 1.0 - tag_overlap))
+            elif candidate_tags:
+                tag_overlap = 0.5
+                novelty = 0.7
+
+            if artist_repeat_count == 0:
+                artist_diversity_factor = 1.0
+            elif artist_repeat_count == 1:
+                artist_diversity_factor = 0.5
+            else:
+                artist_diversity_factor = 0.0
+
+            # Encourage genre-based sources slightly when session history exists
+            track_source = similar_track.get("source", "")
+            if session_tags and track_source in {
+                "similar-genre",
+                "tag-top-track",
+                "genre-fallback",
+            }:
+                novelty = min(1.0, novelty + 0.1)
+
+            similarity_score = (
+                (tag_overlap * 0.5) + (artist_diversity_factor * 0.3) + (novelty * 0.2)
+            )
 
             scored_candidates.append(
                 {
                     "artist": similar_artist,
                     "track": similar_name,
                     "track_key": track_key,
-                    "diversity_score": diversity_score,
-                    "source": similar_track.get("source", "unknown"),
+                    "diversity_penalty": diversity_penalty,
+                    "similarity_score": similarity_score,
+                    "source": track_source or "unknown",
+                    "tags": candidate_tags,
                 }
             )
 
-        # Sort by diversity score (ascending) to prioritize new artists
-        scored_candidates.sort(key=lambda x: x["diversity_score"])
+        # Sort by penalty first (lower better), then by similarity score (higher better)
+        scored_candidates.sort(
+            key=lambda x: (x["diversity_penalty"], -x["similarity_score"])
+        )
 
         # Resolve top candidates to playable tracks
         for candidate in scored_candidates:
@@ -1141,6 +1533,9 @@ Respond with ONLY the JSON object, no other text."""
                 normalized_selected = self._normalize_artist_for_diversity(
                     similar_artist
                 )
+                recent_artists[normalized_selected] = (
+                    recent_artists.get(normalized_selected, 0) + 1
+                )
 
                 # Decrement cooldown for all artists except the one just played
                 for artist_key in list(self._artist_cooldowns[guild_id].keys()):
@@ -1159,12 +1554,18 @@ Respond with ONLY the JSON object, no other text."""
                 elif normalized_selected in self._artist_cooldowns[guild_id]:
                     self._artist_cooldowns[guild_id][normalized_selected] = 0
 
-                # This helps avoid getting stuck in one genre
-                track_tags = await self._get_track_tags(similar_artist, similar_name)
+                # Track primary genre to avoid getting stuck in a single lane
+                track_tags = candidate.get("tags") or []
+                if not track_tags:
+                    profile = await self._get_track_profile(
+                        similar_artist, similar_name
+                    )
+                    track_tags = profile.get("tags", [])
+
                 if track_tags:
                     if guild_id not in self._genre_history:
                         self._genre_history[guild_id] = []
-                    self._genre_history[guild_id].append(track_tags[0].lower())
+                    self._genre_history[guild_id].append(track_tags[0])
                     if len(self._genre_history[guild_id]) > 20:
                         self._genre_history[guild_id] = self._genre_history[guild_id][
                             -20:
@@ -1178,22 +1579,9 @@ Respond with ONLY the JSON object, no other text."""
         return recommendations
 
     async def _get_track_tags(self, artist: str, track: str) -> List[str]:
-        """Get genre tags for a specific track."""
-        tags = []
-        async with aiohttp.ClientSession() as session:
-            data = await self._lastfm_get(
-                {"method": "track.getTopTags", "artist": artist, "track": track},
-                session,
-            )
-            if data:
-                tag_list = data.get("toptags", {}).get("tag", [])
-                if isinstance(tag_list, dict):
-                    tag_list = [tag_list]
-                for tag_obj in tag_list[:5]:  # Get top 5 tags
-                    tag_name = tag_obj.get("name")
-                    if tag_name:
-                        tags.append(tag_name)
-        return tags
+        """Get normalized tags for a specific track (cached + enriched)."""
+        profile = await self._get_track_profile(artist, track)
+        return profile.get("tags", [])
 
     async def _get_similar_tags(self, tag: str, limit: int = 5) -> List[str]:
         """Get similar genres/tags from Last.fm API (Spotify-lite: genre exploration)."""

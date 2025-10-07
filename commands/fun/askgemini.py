@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-import google.generativeai as genai
+from google import genai
 import os
 import time
 from modules.enviromentfilegenerator import check_and_load_env_file
@@ -12,7 +12,7 @@ class AskGemini(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.user_usage = {}
-        self.model = genai.GenerativeModel("gemini-2.0-flash")
+        self.model = genai.GenerativeModel("gemini-2.5-flash")
 
     @commands.hybrid_command(
         name="askgemini", description="Ask a question to the Gemini API."

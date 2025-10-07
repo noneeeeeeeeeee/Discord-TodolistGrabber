@@ -1377,6 +1377,17 @@ class MusicPlayer(commands.Cog):
                     )
 
             if not recommendations:
+                # Resort to YouTube-based fallback recommendations
+                yt_success = await self._youtube_autoplay_fallback(
+                    player, current_entry, guild_id
+                )
+                if yt_success:
+                    LOG.info(
+                        "[AutoPlay] ▶️ Switched to YouTube fallback recommendations"
+                    )
+                    return True
+
+            if not recommendations:
                 # Send message to channel
                 await self._send_autoplay_no_recommendations_message(
                     player.guild,

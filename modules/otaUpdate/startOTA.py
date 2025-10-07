@@ -11,6 +11,27 @@ import traceback
 import stat
 from check import check_update
 
+
+def _parse_tasklist_for_pids(
+    raw_output: str, image_name: str, *, exclude_pid: int | None = None
+) -> list[int]:
+    """Extract process IDs for the given image name from tasklist output."""
+
+    pids: list[int] = []
+    for line in raw_output.splitlines():
+        if image_name.lower() not in line.lower():
+            continue
+        tokens = line.split()
+        for token in tokens:
+            if token.isdigit():
+                pid = int(token)
+                if exclude_pid is not None and pid == exclude_pid:
+                    break
+                pids.append(pid)
+                break
+    return pids
+
+
 # File paths, constants, and custom module imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 UPDATE_VARS_PATH = os.path.join(SCRIPT_DIR, "updateVars.json")
@@ -443,14 +464,37 @@ def stop_bot_process():
             text=True,
         )
         current_pid = os.getpid()
-        if "python.exe" in result.stdout:
+        other_pids = _parse_tasklist_for_pids(
+            result.stdout, "python.exe", exclude_pid=current_pid
+        )
+
+        if other_pids:
             print_progress("Process", "Stopping bot...")
-            tasks = result.stdout.splitlines()
-            for task in tasks:
-                if "python.exe" in task:
-                    pid = int(task.split()[1])
-                    if pid != current_pid:
-                        os.system(f"taskkill /f /pid {pid} /t")
+            for pid in other_pids:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"], check=False)
+
+            # Wait briefly for processes to exit to avoid race conditions.
+            for attempt in range(10):
+                time.sleep(1)
+                check_result = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq python.exe"],
+                    capture_output=True,
+                    text=True,
+                )
+                remaining = _parse_tasklist_for_pids(
+                    check_result.stdout, "python.exe", exclude_pid=current_pid
+                )
+                if not remaining:
+                    break
+                if attempt == 9:
+                    log_error(
+                        "Process",
+                        "Timed out waiting for python.exe to exit after taskkill.",
+                    )
+                    print_progress(
+                        "Process",
+                        "Timed out waiting for all Python processes to exit.",
+                    )
             print_progress("Process", "Bot stopped successfully.")
         else:
             print_progress("Process", "Bot is not running. No need to stop.")
@@ -461,7 +505,58 @@ def stop_bot_process():
         )
         log_error("Process", "Failed to check or stop the bot.", e)
         raise
-    print_progress("Process", "Bot stopped successfully.")
+
+
+def stop_lavalink_process():
+    print_progress("Process", "Checking if Lavalink is running...")
+    try:
+        lavalink_marker = "Lavalink.jar"
+        pids: set[int] = set()
+
+        if os.name == "nt":
+            # Use PowerShell to inspect running processes with the Lavalink marker in the command line.
+            ps_command = (
+                "(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine "
+                "-like '*" + lavalink_marker + "*' }).ProcessId"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_command],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                for token in result.stdout.replace("\r", " ").split():
+                    if token.isdigit():
+                        pid = int(token)
+                        if pid != os.getpid():
+                            pids.add(pid)
+            else:
+                log_error(
+                    "Process",
+                    f"PowerShell lookup for Lavalink failed: {result.stderr.strip()}",
+                )
+        else:
+            # Unix-like fallback using pkill.
+            subprocess.run(["pkill", "-f", lavalink_marker], check=False)
+            return
+
+        if not pids:
+            print_progress("Process", "Lavalink is not running. No need to stop.")
+            return
+
+        print_progress(
+            "Process",
+            "Stopping Lavalink...",
+        )
+        for pid in pids:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"], check=False)
+        print_progress("Process", "Lavalink stopped successfully.")
+    except Exception as e:
+        log_error("Process", "Failed to stop Lavalink process.", e)
+        print_progress(
+            "Process",
+            "Unable to automatically stop Lavalink. Please verify it manually.",
+        )
 
 
 def check_files_required():
@@ -579,6 +674,7 @@ def perform_ota_update():
 
         # Stop the bot
         stop_bot_process()
+        stop_lavalink_process()
 
         # Update Dependencies
         update_dependencies()
@@ -638,8 +734,24 @@ def perform_ota_update():
         # Start the bot
         time.sleep(1)
         print_progress("Process", "Starting bot...")
-        subprocess.Popen(["python", os.path.join(ROOT_DIR, "main.py")], close_fds=True)
-        print_progress("Process", "Bot started successfully.")
+        python_executable = sys.executable or "python"
+        main_script = os.path.join(ROOT_DIR, "main.py")
+        start_kwargs: dict[str, object] = {"cwd": ROOT_DIR}
+        if os.name == "nt":
+            creation_flags = 0
+            creation_flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            creation_flags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+            start_kwargs["creationflags"] = creation_flags
+            start_kwargs["close_fds"] = True
+        else:
+            start_kwargs["start_new_session"] = True
+
+        try:
+            subprocess.Popen([python_executable, main_script], **start_kwargs)
+            print_progress("Process", "Bot started successfully.")
+        except Exception as e:
+            log_error("Process", "Failed to start bot process.", e)
+            raise
         print("<<<---OTA Update completed successfully. The bot will now start.--->>>")
         # Exit updater
         time.sleep(5)
