@@ -178,6 +178,9 @@ class LastFMAutoplay:
         self._artist_cooldowns: Dict[int, Dict[str, int]] = (
             {}
         )  # Guild -> Artist -> Cooldown counter
+        self._genre_history: Dict[int, List[str]] = (
+            {}
+        )  # Guild -> List of recent genres (for diversity)
         self._initialized = False
         self._gemini_model = None
         self._gemini_available = False
@@ -323,6 +326,8 @@ class LastFMAutoplay:
                 self._recent_autoplayed.pop(guild_id)
             if guild_id in self._artist_cooldowns:
                 self._artist_cooldowns.pop(guild_id)
+            if guild_id in self._genre_history:
+                self._genre_history.pop(guild_id)
 
             # Delete the file
             history_file = self._cache_dir / f"{guild_id}_history.json"
@@ -340,6 +345,7 @@ class LastFMAutoplay:
             # Clear all guilds
             self._recent_autoplayed.clear()
             self._artist_cooldowns.clear()
+            self._genre_history.clear()
 
             # Delete all history files
             try:
@@ -565,6 +571,44 @@ Respond with ONLY the JSON object, no other text."""
                                     "source": "tag-top-track",
                                 }
                             )
+
+                # Strategy 3: Spotify-lite genre exploration - use similar tags
+                if len(out) < limit and tags:
+                    # Get similar genres to explore multi-dimensional taste space
+                    primary_tag = tags[0] if tags else None
+                    if primary_tag:
+                        similar_tags = await self._get_similar_tags(
+                            primary_tag, limit=3
+                        )
+                        for similar_tag in similar_tags:
+                            jtag = await self._lastfm_get(
+                                {
+                                    "method": "tag.getTopTracks",
+                                    "tag": similar_tag,
+                                    "limit": 5,
+                                },
+                                session,
+                            )
+                            if not jtag:
+                                continue
+                            tracks = jtag.get("tracks", {}).get("track", [])
+                            if isinstance(tracks, dict):
+                                tracks = [tracks]
+                            for tr in tracks[:5]:
+                                a = (
+                                    tr.get("artist", {}).get("name")
+                                    if isinstance(tr.get("artist"), dict)
+                                    else None
+                                )
+                                n = tr.get("name")
+                                if a and n:
+                                    out.append(
+                                        {
+                                            "artist": {"name": a},
+                                            "name": n,
+                                            "source": "similar-genre",
+                                        }
+                                    )
 
         # Dedupe and limit
         seen = set()
@@ -899,9 +943,7 @@ Respond with ONLY the JSON object, no other text."""
             == normalized_current_artist
         )
 
-        similar_tracks = await self._get_similar_tracks(
-            artist, title, limit=limit * 2  # Grab extra for filtering
-        )
+        similar_tracks = await self._get_similar_tracks(artist, title, limit=limit * 2)
 
         # Only fetch same-artist tracks if artist hasn't been played much recently
         artist_top_tracks = []
@@ -909,7 +951,7 @@ Respond with ONLY the JSON object, no other text."""
             recent_artist_count < 2
         ):  # Only if artist played less than 2 times in recent history
             artist_top_tracks = await self._get_artist_top_tracks(
-                artist, exclude_titles=[title], limit=1  # Reduce to max 1 track
+                artist, exclude_titles=[title], limit=1
             )
 
         # Interleave similar tracks with same-artist picks for variety
@@ -948,7 +990,7 @@ Respond with ONLY the JSON object, no other text."""
                             f"✅ [Last.fm] Found {len(genre_tracks)} tracks from genre '{tag}'"
                         )
                         recommendations_pool.extend(genre_tracks)
-                        break  # Found tracks, stop trying tags
+                        break
 
             # If still no tracks, try default genre as last resort
             if not recommendations_pool:
@@ -981,11 +1023,6 @@ Respond with ONLY the JSON object, no other text."""
         # Initialize cooldown tracking for this guild if not exists
         if guild_id not in self._artist_cooldowns:
             self._artist_cooldowns[guild_id] = {}
-
-        # Spotify-like artist cooldown system:
-        # - Allow same artist up to 2 times
-        # - After 2 plays, artist goes on cooldown (needs 3 different artists before eligible again)
-        # - Cooldown counter decrements with each different artist played
 
         scored_candidates = []
         for similar_track in recommendations_pool:
@@ -1041,6 +1078,14 @@ Respond with ONLY the JSON object, no other text."""
             # New artist - highest priority
             else:
                 diversity_score = 0
+
+            # Spotify-lite: Bonus for genre diversity (encourage exploration)
+            # If we know recent genres, prefer tracks from different genres
+            if guild_id in self._genre_history and self._genre_history[guild_id]:
+                # Check if this track's source indicates genre
+                track_source = similar_track.get("source", "")
+                if track_source in ["similar-genre", "tag-top-track", "genre-fallback"]:
+                    diversity_score -= 10
 
             scored_candidates.append(
                 {
@@ -1110,11 +1155,20 @@ Respond with ONLY the JSON object, no other text."""
                 # Update cooldown for the artist just played
                 artist_play_count = recent_artists.get(normalized_selected, 0) + 1
                 if artist_play_count >= 2:
-                    # Artist has played 2 times, put on cooldown (needs 3 different artists)
                     self._artist_cooldowns[guild_id][normalized_selected] = 3
                 elif normalized_selected in self._artist_cooldowns[guild_id]:
-                    # Artist was on cooldown but now played, reset cooldown
                     self._artist_cooldowns[guild_id][normalized_selected] = 0
+
+                # This helps avoid getting stuck in one genre
+                track_tags = await self._get_track_tags(similar_artist, similar_name)
+                if track_tags:
+                    if guild_id not in self._genre_history:
+                        self._genre_history[guild_id] = []
+                    self._genre_history[guild_id].append(track_tags[0].lower())
+                    if len(self._genre_history[guild_id]) > 20:
+                        self._genre_history[guild_id] = self._genre_history[guild_id][
+                            -20:
+                        ]
 
         # Save cache and guild history if we added new mappings
         if recommendations:
@@ -1140,6 +1194,27 @@ Respond with ONLY the JSON object, no other text."""
                     if tag_name:
                         tags.append(tag_name)
         return tags
+
+    async def _get_similar_tags(self, tag: str, limit: int = 5) -> List[str]:
+        """Get similar genres/tags from Last.fm API (Spotify-lite: genre exploration)."""
+        similar_tags = []
+        async with aiohttp.ClientSession() as session:
+            resp = await self._lastfm_get(
+                {"method": "tag.getSimilar", "tag": tag, "limit": limit}, session
+            )
+            if not resp:
+                return []
+
+            similartags = resp.get("similartags", {}).get("tag", [])
+            if isinstance(similartags, dict):
+                similartags = [similartags]
+
+            for t in similartags[:limit]:
+                tag_name = t.get("name")
+                if tag_name:
+                    similar_tags.append(tag_name.lower())
+
+        return similar_tags
 
     async def _get_tag_top_tracks(self, tag: str, limit: int = 10) -> list:
         """Get top tracks for a given genre/tag from Last.fm."""
@@ -1172,7 +1247,6 @@ Respond with ONLY the JSON object, no other text."""
         return out
 
 
-# Global instance (to be initialized by music player)
 _lastfm_autoplay_instance: Optional[LastFMAutoplay] = None
 
 
