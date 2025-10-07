@@ -109,6 +109,12 @@ BAD_TITLE_KEYWORDS = (
     "instrumental",
     "midi",
     "black midi",
+    "audio spectrum",
+    "remake",
+    "music project",
+    "fan edit",
+    "fanmix",
+    "fan mix",
     # performance / live
     "live",
     "live at",
@@ -169,6 +175,9 @@ class LastFMAutoplay:
         self._recent_autoplayed: Dict[int, List[Dict[str, str]]] = (
             {}
         )  # In-memory only, per-session
+        self._artist_cooldowns: Dict[int, Dict[str, int]] = (
+            {}
+        )  # Guild -> Artist -> Cooldown counter
         self._initialized = False
         self._gemini_model = None
         self._gemini_available = False
@@ -312,6 +321,8 @@ class LastFMAutoplay:
             # Remove from memory
             if guild_id in self._recent_autoplayed:
                 self._recent_autoplayed.pop(guild_id)
+            if guild_id in self._artist_cooldowns:
+                self._artist_cooldowns.pop(guild_id)
 
             # Delete the file
             history_file = self._cache_dir / f"{guild_id}_history.json"
@@ -328,6 +339,7 @@ class LastFMAutoplay:
         else:
             # Clear all guilds
             self._recent_autoplayed.clear()
+            self._artist_cooldowns.clear()
 
             # Delete all history files
             try:
@@ -871,14 +883,34 @@ Respond with ONLY the JSON object, no other text."""
         # Phase 2: Build a blended recommendation pool from multiple sources
         recommendations_pool: List[Dict[str, Any]] = []
 
+        # Load guild history early to check artist frequency
+        guild_id = track_info.get("guild_id", 0)
+        if guild_id not in self._recent_autoplayed:
+            self._load_guild_history(guild_id)
+            if guild_id not in self._recent_autoplayed:
+                self._recent_autoplayed[guild_id] = []
+
+        # Check how many times this artist has been played recently
+        normalized_current_artist = self._normalize_artist_for_diversity(artist)
+        recent_artist_count = sum(
+            1
+            for hist_entry in self._recent_autoplayed[guild_id]
+            if self._normalize_artist_for_diversity(hist_entry.get("artist", ""))
+            == normalized_current_artist
+        )
+
         similar_tracks = await self._get_similar_tracks(
             artist, title, limit=limit * 2  # Grab extra for filtering
         )
 
-        # Reduce same-artist picks to max 2 (for occasional familiarity only)
-        artist_top_tracks = await self._get_artist_top_tracks(
-            artist, exclude_titles=[title], limit=min(2, limit // 5 or 1)
-        )
+        # Only fetch same-artist tracks if artist hasn't been played much recently
+        artist_top_tracks = []
+        if (
+            recent_artist_count < 2
+        ):  # Only if artist played less than 2 times in recent history
+            artist_top_tracks = await self._get_artist_top_tracks(
+                artist, exclude_titles=[title], limit=1  # Reduce to max 1 track
+            )
 
         # Interleave similar tracks with same-artist picks for variety
         blended_primary: List[Dict[str, Any]] = []
@@ -902,29 +934,41 @@ Respond with ONLY the JSON object, no other text."""
             LOG.warning(
                 f"⚠️ [Last.fm] No recommendations available for '{artist}' - '{title}' after blending sources"
             )
-            # FINAL FALLBACK: Try default genre if all else fails
-            default_genre = "pop"
-            genre_tracks = await self._get_tag_top_tracks(default_genre, limit=limit)
-            if genre_tracks:
-                LOG.warning(
-                    f"⚠️ [Last.fm] Using default genre '{default_genre}' for fallback recommendations."
-                )
-                recommendations_pool.extend(genre_tracks)
-            else:
-                LOG.warning(
-                    f"❌ [Last.fm] No recommendations found even for default genre '{default_genre}'. Likely not music."
-                )
-                return []
 
-        guild_id = track_info.get("guild_id", 0)
+            # Try to get recommendations based on track's genre tags
+            track_tags = await self._get_track_tags(artist, title)
+            if track_tags:
+                LOG.info(
+                    f"🎵 [Last.fm] Found {len(track_tags)} genre tags for track, using for fallback"
+                )
+                for tag in track_tags[:3]:  # Try top 3 tags
+                    genre_tracks = await self._get_tag_top_tracks(tag, limit=limit * 2)
+                    if genre_tracks:
+                        LOG.info(
+                            f"✅ [Last.fm] Found {len(genre_tracks)} tracks from genre '{tag}'"
+                        )
+                        recommendations_pool.extend(genre_tracks)
+                        break  # Found tracks, stop trying tags
+
+            # If still no tracks, try default genre as last resort
+            if not recommendations_pool:
+                default_genre = "pop"
+                genre_tracks = await self._get_tag_top_tracks(
+                    default_genre, limit=limit
+                )
+                if genre_tracks:
+                    LOG.warning(
+                        f"⚠️ [Last.fm] Using default genre '{default_genre}' for fallback recommendations."
+                    )
+                    recommendations_pool.extend(genre_tracks)
+                else:
+                    LOG.warning(
+                        f"❌ [Last.fm] No recommendations found even for default genre '{default_genre}'. Likely not music."
+                    )
+                    return []
+
         recommendations = []
         seen_tracks = set()
-
-        # Load guild history if not in memory (lazy loading)
-        if guild_id not in self._recent_autoplayed:
-            self._load_guild_history(guild_id)
-            if guild_id not in self._recent_autoplayed:
-                self._recent_autoplayed[guild_id] = []  # Initialize empty history
 
         # Build artist frequency map from recent history (normalized for variations)
         recent_artists = {}
@@ -934,7 +978,15 @@ Respond with ONLY the JSON object, no other text."""
                 normalized = self._normalize_artist_for_diversity(hist_artist)
                 recent_artists[normalized] = recent_artists.get(normalized, 0) + 1
 
-        # Score and sort candidates by diversity (penalize recently played artists)
+        # Initialize cooldown tracking for this guild if not exists
+        if guild_id not in self._artist_cooldowns:
+            self._artist_cooldowns[guild_id] = {}
+
+        # Spotify-like artist cooldown system:
+        # - Allow same artist up to 2 times
+        # - After 2 plays, artist goes on cooldown (needs 3 different artists before eligible again)
+        # - Cooldown counter decrements with each different artist played
+
         scored_candidates = []
         for similar_track in recommendations_pool:
             similar_artist = similar_track.get("artist", {})
@@ -966,20 +1018,29 @@ Respond with ONLY the JSON object, no other text."""
                 if already_played:
                     continue
 
-            # Calculate diversity score using normalized artist (lower = more diverse)
+            # Calculate diversity score with Spotify-like cooldown system
             normalized_artist = self._normalize_artist_for_diversity(similar_artist)
             artist_repeat_count = recent_artists.get(normalized_artist, 0)
 
-            # Heavy penalty for same artist (exponential to strongly discourage repetition)
-            normalized_current = self._normalize_artist_for_diversity(artist)
-            if normalized_artist == normalized_current:
-                diversity_score = (
-                    artist_repeat_count * 10 + 100
-                )  # Large penalty for current artist
+            # Check cooldown status
+            cooldown_remaining = self._artist_cooldowns[guild_id].get(
+                normalized_artist, 0
+            )
+
+            diversity_score = 0
+
+            # Artist on cooldown (needs 3 different artists before eligible)
+            if cooldown_remaining > 0:
+                diversity_score = 1000 + cooldown_remaining * 100  # Very high penalty
+            # Same artist as current track or played 2+ times recently
+            elif artist_repeat_count >= 2:
+                diversity_score = 500 + artist_repeat_count * 50  # High penalty
+            # Artist played once - still okay but lower priority
+            elif artist_repeat_count == 1:
+                diversity_score = 50
+            # New artist - highest priority
             else:
-                diversity_score = (
-                    artist_repeat_count * 2
-                )  # Moderate penalty for repeated artists
+                diversity_score = 0
 
             scored_candidates.append(
                 {
@@ -1031,12 +1092,54 @@ Respond with ONLY the JSON object, no other text."""
                         guild_id
                     ][-HISTORY_LIMIT:]
 
+                # Update artist cooldown tracking (Spotify-like algorithm)
+                normalized_selected = self._normalize_artist_for_diversity(
+                    similar_artist
+                )
+
+                # Decrement cooldown for all artists except the one just played
+                for artist_key in list(self._artist_cooldowns[guild_id].keys()):
+                    if artist_key != normalized_selected:
+                        self._artist_cooldowns[guild_id][artist_key] = max(
+                            0, self._artist_cooldowns[guild_id][artist_key] - 1
+                        )
+                        # Remove artist from tracking if cooldown is 0
+                        if self._artist_cooldowns[guild_id][artist_key] == 0:
+                            del self._artist_cooldowns[guild_id][artist_key]
+
+                # Update cooldown for the artist just played
+                artist_play_count = recent_artists.get(normalized_selected, 0) + 1
+                if artist_play_count >= 2:
+                    # Artist has played 2 times, put on cooldown (needs 3 different artists)
+                    self._artist_cooldowns[guild_id][normalized_selected] = 3
+                elif normalized_selected in self._artist_cooldowns[guild_id]:
+                    # Artist was on cooldown but now played, reset cooldown
+                    self._artist_cooldowns[guild_id][normalized_selected] = 0
+
         # Save cache and guild history if we added new mappings
         if recommendations:
             self._save_cache()
             self._save_guild_history(guild_id)
 
         return recommendations
+
+    async def _get_track_tags(self, artist: str, track: str) -> List[str]:
+        """Get genre tags for a specific track."""
+        tags = []
+        async with aiohttp.ClientSession() as session:
+            data = await self._lastfm_get(
+                {"method": "track.getTopTags", "artist": artist, "track": track},
+                session,
+            )
+            if data:
+                tag_list = data.get("toptags", {}).get("tag", [])
+                if isinstance(tag_list, dict):
+                    tag_list = [tag_list]
+                for tag_obj in tag_list[:5]:  # Get top 5 tags
+                    tag_name = tag_obj.get("name")
+                    if tag_name:
+                        tags.append(tag_name)
+        return tags
 
     async def _get_tag_top_tracks(self, tag: str, limit: int = 10) -> list:
         """Get top tracks for a given genre/tag from Last.fm."""

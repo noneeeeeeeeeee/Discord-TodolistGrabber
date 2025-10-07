@@ -763,6 +763,25 @@ class MusicPlayer(commands.Cog):
     async def _before_bootstrap(self):
         await self.bot.wait_until_ready()
 
+        # Clear all guild history files on startup for fresh sessions
+        if self._lastfm_autoplay:
+            try:
+                cache_dir = Path("cache/music")
+                if cache_dir.exists():
+                    deleted_count = 0
+                    for history_file in cache_dir.glob("*_history.json"):
+                        try:
+                            history_file.unlink()
+                            deleted_count += 1
+                        except Exception as e:
+                            LOG.warning(f"Failed to delete {history_file}: {e}")
+                    if deleted_count > 0:
+                        LOG.info(
+                            f"🗑️ [Last.fm] Cleared {deleted_count} guild history files on startup"
+                        )
+            except Exception as e:
+                LOG.warning(f"Failed to clear guild histories on startup: {e}")
+
     async def _try_connect_node(
         self, retry_delay: float = 1.0, attempts: int = 3
     ) -> bool:
@@ -812,7 +831,11 @@ class MusicPlayer(commands.Cog):
         """Clean up history when bot leaves voice channel"""
         if member.id == self.bot.user.id and before.channel and not after.channel:
             guild_id = before.channel.guild.id
-            get_lastfm_autoplay(self.bot).clear_history(guild_id)
+            if self._lastfm_autoplay:
+                self._lastfm_autoplay.clear_history(guild_id)
+                LOG.info(
+                    f"🗑️ [AutoPlay] Cleared Last.fm history for guild {guild_id} on disconnect"
+                )
 
     @commands.Cog.listener()
     async def on_pomice_websocket_closed(
