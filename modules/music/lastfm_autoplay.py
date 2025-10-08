@@ -744,14 +744,17 @@ class LastFMAutoplay:
                 {"method": "track.getTopTags", "artist": artist, "track": track},
                 session,
             )
-            if data:
-                tag_list = data.get("toptags", {}).get("tag", [])
+            if isinstance(data, dict):
+                tag_source = data.get("toptags") or {}
+                tag_list = tag_source.get("tag") if isinstance(tag_source, dict) else []
                 if isinstance(tag_list, dict):
                     tag_list = [tag_list]
-                for tag_obj in tag_list[:10]:
-                    tag_name = tag_obj.get("name")
-                    if tag_name:
-                        tags.append(self._normalize_tag(tag_name))
+                if isinstance(tag_list, list):
+                    for tag_obj in tag_list[:10]:
+                        if isinstance(tag_obj, dict):
+                            tag_name = tag_obj.get("name")
+                            if tag_name:
+                                tags.append(self._normalize_tag(tag_name))
         return tags
 
     async def _classify_track_with_gemini(
@@ -1682,14 +1685,25 @@ Respond with ONLY the JSON object, no other text."""
                 session,  # Increased from 8 to 20
             )
             similar_artists = []
-            if j:
-                sim = j.get("similarartists", {}).get("artist", [])
+            if isinstance(j, dict):
+                similar_section = (
+                    j.get("similarartists")
+                    if isinstance(j.get("similarartists"), dict)
+                    else {}
+                )
+                sim = (
+                    similar_section.get("artist", [])
+                    if isinstance(similar_section, dict)
+                    else []
+                )
                 if isinstance(sim, dict):
                     sim = [sim]
-                for a in sim:
-                    name = a.get("name")
-                    if name:
-                        similar_artists.append(name)
+                if isinstance(sim, list):
+                    for a in sim:
+                        if isinstance(a, dict):
+                            name = a.get("name")
+                            if name:
+                                similar_artists.append(name)
 
             # Get top tracks from similar artists (parallel) - more tracks per artist
             tasks = [
@@ -1702,23 +1716,33 @@ Respond with ONLY the JSON object, no other text."""
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for r in results:
-                if not r or isinstance(r, Exception):
+                if not isinstance(r, dict) or isinstance(r, Exception):
                     continue
-                tracks = r.get("toptracks", {}).get("track", [])
+                toptracks_section = (
+                    r.get("toptracks") if isinstance(r.get("toptracks"), dict) else {}
+                )
+                tracks = (
+                    toptracks_section.get("track", [])
+                    if isinstance(toptracks_section, dict)
+                    else []
+                )
                 if isinstance(tracks, dict):
                     tracks = [tracks]
-                for t in tracks[:5]:  # Increased from 3 to 5
-                    name = t.get("name")
-                    aobj = t.get("artist", {})
-                    aname = aobj.get("name") if isinstance(aobj, dict) else None
-                    if name and aname:
-                        out.append(
-                            {
-                                "artist": {"name": aname},
-                                "name": name,
-                                "source": "similar-artist-top",
-                            }
-                        )
+                if isinstance(tracks, list):
+                    for t in tracks[:5]:  # Increased from 3 to 5
+                        if not isinstance(t, dict):
+                            continue
+                        name = t.get("name")
+                        aobj = t.get("artist", {})
+                        aname = aobj.get("name") if isinstance(aobj, dict) else None
+                        if name and aname:
+                            out.append(
+                                {
+                                    "artist": {"name": aname},
+                                    "name": name,
+                                    "source": "similar-artist-top",
+                                }
+                            )
 
             # Strategy 2: If still empty, use artist tags -> tag top tracks
             if not out:
@@ -1726,37 +1750,62 @@ Respond with ONLY the JSON object, no other text."""
                     {"method": "artist.getTopTags", "artist": artist}, session
                 )
                 tags = []
-                if jtags:
-                    t = jtags.get("toptags", {}).get("tag", [])
+                if isinstance(jtags, dict):
+                    tag_section = (
+                        jtags.get("toptags")
+                        if isinstance(jtags.get("toptags"), dict)
+                        else {}
+                    )
+                    t = (
+                        tag_section.get("tag", [])
+                        if isinstance(tag_section, dict)
+                        else []
+                    )
                     if isinstance(t, dict):
                         t = [t]
-                    for tg in t[:3]:
-                        tags.append(tg.get("name"))
+                    if isinstance(t, list):
+                        for tg in t[:3]:
+                            if isinstance(tg, dict):
+                                name = tg.get("name")
+                                if name:
+                                    tags.append(name)
 
                 for tag in tags:
                     jtag = await self._lastfm_get(
                         {"method": "tag.getTopTracks", "tag": tag, "limit": 5}, session
                     )
-                    if not jtag:
+                    if not isinstance(jtag, dict):
                         continue
-                    tracks = jtag.get("tracks", {}).get("track", [])
+                    tag_tracks_section = (
+                        jtag.get("tracks")
+                        if isinstance(jtag.get("tracks"), dict)
+                        else {}
+                    )
+                    tracks = (
+                        tag_tracks_section.get("track", [])
+                        if isinstance(tag_tracks_section, dict)
+                        else []
+                    )
                     if isinstance(tracks, dict):
                         tracks = [tracks]
-                    for tr in tracks[:5]:
-                        a = (
-                            tr.get("artist", {}).get("name")
-                            if isinstance(tr.get("artist"), dict)
-                            else None
-                        )
-                        n = tr.get("name")
-                        if a and n:
-                            out.append(
-                                {
-                                    "artist": {"name": a},
-                                    "name": n,
-                                    "source": "tag-top-track",
-                                }
+                    if isinstance(tracks, list):
+                        for tr in tracks[:5]:
+                            if not isinstance(tr, dict):
+                                continue
+                            a = (
+                                tr.get("artist", {}).get("name")
+                                if isinstance(tr.get("artist"), dict)
+                                else None
                             )
+                            n = tr.get("name")
+                            if a and n:
+                                out.append(
+                                    {
+                                        "artist": {"name": a},
+                                        "name": n,
+                                        "source": "tag-top-track",
+                                    }
+                                )
 
                 # Strategy 3: Spotify-lite genre exploration - use similar tags
                 if len(out) < limit and tags:
@@ -1775,26 +1824,38 @@ Respond with ONLY the JSON object, no other text."""
                                 },
                                 session,
                             )
-                            if not jtag:
+                            if not isinstance(jtag, dict):
                                 continue
-                            tracks = jtag.get("tracks", {}).get("track", [])
+                            tag_tracks_section = (
+                                jtag.get("tracks")
+                                if isinstance(jtag.get("tracks"), dict)
+                                else {}
+                            )
+                            tracks = (
+                                tag_tracks_section.get("track", [])
+                                if isinstance(tag_tracks_section, dict)
+                                else []
+                            )
                             if isinstance(tracks, dict):
                                 tracks = [tracks]
-                            for tr in tracks[:5]:
-                                a = (
-                                    tr.get("artist", {}).get("name")
-                                    if isinstance(tr.get("artist"), dict)
-                                    else None
-                                )
-                                n = tr.get("name")
-                                if a and n:
-                                    out.append(
-                                        {
-                                            "artist": {"name": a},
-                                            "name": n,
-                                            "source": "similar-genre",
-                                        }
+                            if isinstance(tracks, list):
+                                for tr in tracks[:5]:
+                                    if not isinstance(tr, dict):
+                                        continue
+                                    a = (
+                                        tr.get("artist", {}).get("name")
+                                        if isinstance(tr.get("artist"), dict)
+                                        else None
                                     )
+                                    n = tr.get("name")
+                                    if a and n:
+                                        out.append(
+                                            {
+                                                "artist": {"name": a},
+                                                "name": n,
+                                                "source": "similar-genre",
+                                            }
+                                        )
 
         # Dedupe and limit
         seen = set()
@@ -1839,14 +1900,26 @@ Respond with ONLY the JSON object, no other text."""
                 session,
             )
 
-        if not data:
+        if not isinstance(data, dict):
             return results
 
-        tracks = data.get("toptracks", {}).get("track", [])
+        toptracks_section = (
+            data.get("toptracks") if isinstance(data.get("toptracks"), dict) else {}
+        )
+        tracks = (
+            toptracks_section.get("track", [])
+            if isinstance(toptracks_section, dict)
+            else []
+        )
         if isinstance(tracks, dict):
             tracks = [tracks]
 
+        if not isinstance(tracks, list):
+            return results
+
         for track in tracks[: limit * 2]:  # grab a few extra before filtering
+            if not isinstance(track, dict):
+                continue
             name = track.get("name")
             if not name or name.lower() in excluded:
                 continue
@@ -1905,6 +1978,12 @@ Respond with ONLY the JSON object, no other text."""
 
                     data = await response.json()
 
+                    if not isinstance(data, dict):
+                        LOG.error(
+                            f"Last.fm API error for track '{artist} - {track}': unexpected response type {type(data).__name__}"
+                        )
+                        return []
+
                     # Check for API errors
                     if "error" in data:
                         error_code = data.get("error", "unknown")
@@ -1915,11 +1994,24 @@ Respond with ONLY the JSON object, no other text."""
                         return []
 
                     # Extract similar tracks
-                    similar_tracks = data.get("similartracks", {}).get("track", [])
+                    similar_section = data.get("similartracks")
+                    if not isinstance(similar_section, dict):
+                        LOG.warning(
+                            f"⚠️ [Last.fm] No 'similartracks' payload for '{artist}' - '{track}'."
+                        )
+                        return []
+
+                    similar_tracks = similar_section.get("track", [])
 
                     # Handle case where only 1 track returned (not a list)
                     if isinstance(similar_tracks, dict):
                         similar_tracks = [similar_tracks]
+
+                    if not isinstance(similar_tracks, list):
+                        LOG.warning(
+                            f"⚠️ [Last.fm] Malformed similar tracks list for '{artist}' - '{track}'."
+                        )
+                        return []
 
                     if not similar_tracks:
                         LOG.warning(
@@ -2057,7 +2149,7 @@ Respond with ONLY the JSON object, no other text."""
         if good_keywords > 0:
             score += 0.05
         if bad_keywords > 0:
-            score -= 0.2  # Penalize bad matches
+            score -= 0.4
 
         return max(0.0, min(1.0, score))
 
