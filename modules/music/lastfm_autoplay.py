@@ -62,6 +62,8 @@ GOOD_TITLE_KEYWORDS = (
     "single version",
     "original",
     "original mix",
+    # Third party uploads, but still original content
+    "vevo",
     "hq",
     "hd",
     "4k",
@@ -179,6 +181,12 @@ BAD_TITLE_KEYWORDS = (
     "collection",
     "compilation",
     "playlist",
+    # Subscriber Specials
+    "subscriber special",
+    "subscriber special mix",
+    "subscriber special edition",
+    # Studio Remixes (First-party remix not suggested)
+    "Studio Vocals",
 )
 
 # Last.fm API Configuration
@@ -1537,24 +1545,20 @@ Respond with ONLY the JSON object, no other text."""
                     recent_artists.get(normalized_selected, 0) + 1
                 )
 
-                # Decrement cooldown for all artists except the one just played
                 for artist_key in list(self._artist_cooldowns[guild_id].keys()):
                     if artist_key != normalized_selected:
                         self._artist_cooldowns[guild_id][artist_key] = max(
                             0, self._artist_cooldowns[guild_id][artist_key] - 1
                         )
-                        # Remove artist from tracking if cooldown is 0
                         if self._artist_cooldowns[guild_id][artist_key] == 0:
                             del self._artist_cooldowns[guild_id][artist_key]
 
-                # Update cooldown for the artist just played
                 artist_play_count = recent_artists.get(normalized_selected, 0) + 1
                 if artist_play_count >= 2:
                     self._artist_cooldowns[guild_id][normalized_selected] = 3
                 elif normalized_selected in self._artist_cooldowns[guild_id]:
                     self._artist_cooldowns[guild_id][normalized_selected] = 0
 
-                # Track primary genre to avoid getting stuck in a single lane
                 track_tags = candidate.get("tags") or []
                 if not track_tags:
                     profile = await self._get_track_profile(

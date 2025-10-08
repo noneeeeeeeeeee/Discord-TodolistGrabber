@@ -119,7 +119,6 @@ class LavalinkManager:
 
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.plugins_dir.mkdir(parents=True, exist_ok=True)
-        (self.base_dir / "logs").mkdir(parents=True, exist_ok=True)
 
         async with aiohttp.ClientSession(
             headers=HEADERS,
@@ -317,10 +316,6 @@ class LavalinkManager:
             },
             "plugins": {
                 "youtube": youtube_plugin_settings,
-            },
-            "logging": {
-                "file": {"path": "./logs/"},
-                "level": {"root": "DEBUG", "lavalink": "DEBUG"},
             },
         }
 
