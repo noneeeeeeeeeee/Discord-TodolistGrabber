@@ -154,6 +154,9 @@ class ControlCommands(commands.Cog):
                 player._playing_flags[ctx.guild.id] = False
                 player.queues[ctx.guild.id].clear()
                 player.reset_session_state(ctx.guild.id)
+                lastfm_autoplay = getattr(player, "_lastfm_autoplay", None)
+                if lastfm_autoplay:
+                    lastfm_autoplay.clear_history(ctx.guild.id)
             except Exception:
                 pass
             await player._cancel_idle(ctx.guild.id)

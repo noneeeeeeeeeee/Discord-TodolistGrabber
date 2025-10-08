@@ -18,7 +18,8 @@ def check_and_load_env_file():
             "LOCAL_REGION=YOUR_LOCAL_REGION\n"
             "\n"
             "# Gemini / AI Keys\n"
-            "GeminiApiKey=YOUR_GEMINI_API_KEY\n"
+            "# Provide one or more API keys as a JSON array (first entry is primary).\n"
+            'GeminiApiKeys=["YOUR_PRIMARY_GEMINI_API_KEY", "YOUR_SECONDARY_GEMINI_API_KEY"]\n'
             "\n"
             "# Lavalink Audio Server Settings\n"
             "LAVALINK_HOST=127.0.0.1\n"

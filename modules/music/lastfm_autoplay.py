@@ -3,9 +3,11 @@ import asyncio
 import time
 import logging
 import json
+import random
 import re
-from collections import Counter
-from typing import List, Optional, Tuple, Dict, Any
+from collections import Counter, deque
+from datetime import datetime
+from typing import Deque, Dict, Any, List, Optional, Tuple
 from pathlib import Path
 
 import aiohttp
@@ -15,18 +17,53 @@ from google.genai import types
 LOG = logging.getLogger(__name__)
 
 
-# Replace logger methods with print wrappers so messages always appear on stdout
+LOG_LEVEL = 2  # 0=ERROR, 1=INFO, 2=DEBUG (Higher number more verbose)
+SESSION_HISTORY_LIMIT = 50
+RECENT_TRACK_WINDOW_SECONDS = 90 * 60  # 90 minutes
+FAILED_TRACK_COOLDOWN_SECONDS = 30 * 60  # 30 minutes
+GROUNDING_DAILY_LIMIT = 500  # 500 requests per day
+CACHE_FLUSH_INTERVAL_SECONDS = 120  # Flush caches at most every 2 minutes
+METRICS_HISTORY_LIMIT = 200  # Retain recent recommendation metrics
+ESCAPE_REASON_HISTORY_LIMIT = 16
+
+# Recommendation tuning
+CACHE_MAX_AGE = 60 * 60 * 24 * 15  # 15 days TTL for Last.fm->YouTube cache
+METADATA_CACHE_MAX_AGE = 60 * 60 * 24 * 90  # 90 days TTL for metadata
+DURATION_TOLERANCE_SECONDS = 5  # +/- 5 seconds tolerance
+DURATION_TOLERANCE_PERCENT = 0.12  # +/- 12% duration tolerance
+CANDIDATE_POOL_TARGET = 60  # Aim for ~60 candidates before filtering
+ENRICH_TOP_N = 16  # How many top Last.fm tags to fetch and use for Gemini enrichment
+RESOLVE_TOP_K = 6  # How many top YouTube search results to consider for matching
+ARTIST_REPEAT_LIMIT = 3  # Max times the same artist can appear in session history
+ARTIST_COOLDOWN_CYCLES = 3  # How many tracks before an artist can reappear
+SKIP_THRESHOLD = 0.8  # Similarity threshold to skip a candidate
+FINISH_THRESHOLD = 0.9  # Similarity threshold to finish a candidate
+EPSILON_EXPLORE = 0.08  # Exploration factor for candidate selection
+
+# Gemini configuration
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+
+
 def _install_print_logger(logger: logging.Logger) -> None:
-    """Override common logger methods to print to stdout for visibility."""
+    """Override logger methods to honour LOG_LEVEL with stdout prints."""
+
+    level_thresholds = {
+        "debug": 2,
+        "info": 1,
+        "warning": 1,
+        "error": 0,
+        "critical": 0,
+    }
 
     def _make(method_name: str):
+        threshold = level_thresholds.get(method_name, 1)
+
         def _m(*args, **kwargs):
+            if LOG_LEVEL < threshold:
+                return
             try:
-                if args:
-                    msg = args[0]
-                else:
-                    msg = ""
-                print(f"[{method_name.upper()}] {msg}")
+                msg = args[0] if args else ""
+                print(f"[AUTO][{method_name.upper()}] {msg}")
             except Exception:
                 pass
 
@@ -37,13 +74,6 @@ def _install_print_logger(logger: logging.Logger) -> None:
 
 
 _install_print_logger(LOG)
-# Configuration
-CACHE_MAX_AGE = 60 * 60 * 24 * 15
-HISTORY_LIMIT = 50
-DURATION_TOLERANCE_SECONDS = 5
-DURATION_TOLERANCE_PERCENT = 0.12
-METADATA_CACHE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
-GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 GOOD_TITLE_KEYWORDS = (
     # explicit "official" phrases first (phrase match)
@@ -71,6 +101,28 @@ GOOD_TITLE_KEYWORDS = (
     "remastered",  # sometimes official remaster is desired
     "explicit",  # indicates official release (may be part of title)
 )
+
+EMOJI_PATTERNS = re.compile(
+    "["
+    "\U0001f600-\U0001f64f"  # emoticons
+    "\U0001f300-\U0001f5ff"  # symbols & pictographs
+    "\U0001f680-\U0001f6ff"  # transport & map symbols
+    "\U0001f1e0-\U0001f1ff"  # flags (iOS)
+    "\U00002700-\U000027bf"  # dingbats
+    "\U0001f926-\U0001f937"  # gestures
+    "\U00010000-\U0010ffff"  # other unicode
+    "\u2640-\u2642"  # gender symbols
+    "\u2600-\u2b55"  # misc symbols
+    "\u200d"  # zero width joiner
+    "\u23cf"  # eject symbol
+    "\u23e9"  # fast forward
+    "\u231a"  # watch
+    "\ufe0f"  # variation selector
+    "\u3030"  # wavy dash
+    "]+",
+    flags=re.UNICODE,
+)  # Soon to be implemented
+
 
 BAD_TITLE_KEYWORDS = (
     # pitch/speed/time manipulations
@@ -124,6 +176,7 @@ BAD_TITLE_KEYWORDS = (
     "fanmix",
     "fan mix",
     "audio",
+    "covered by",
     # performance / live
     "live",
     "live at",
@@ -181,10 +234,12 @@ BAD_TITLE_KEYWORDS = (
     "collection",
     "compilation",
     "playlist",
-    # Subscriber Specials
+    # Subscriber Specials & Spam Entries
     "subscriber special",
+    "plz",
     "subscriber special mix",
     "subscriber special edition",
+    "hz",
     # Studio Remixes (First-party remix not suggested)
     "Studio Vocals",
 )
@@ -194,7 +249,7 @@ LASTFM_API_BASE = "http://ws.audioscrobbler.com/2.0/"
 LASTFM_API_KEY_ENV = "LASTFM_API_KEY"
 
 # Gemini API Configuration
-GEMINI_API_KEY_ENV = "GeminiApiKey"
+GEMINI_API_KEYS_ENV = "GeminiApiKeys"
 
 
 class LastFMAutoplay:
@@ -207,7 +262,7 @@ class LastFMAutoplay:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._cache_file = self._cache_dir / "lastfm_mappings.json"
         self._cache: Dict[str, Tuple[str, float]] = {}
-        self._recent_autoplayed: Dict[int, List[Dict[str, str]]] = (
+        self._recent_autoplayed: Dict[int, List[Dict[str, Any]]] = (
             {}
         )  # In-memory only, per-session
         self._artist_cooldowns: Dict[int, Dict[str, int]] = (
@@ -224,13 +279,32 @@ class LastFMAutoplay:
         self._gemini_search_tool: Optional[types.Tool] = None
         self._gemini_base_config: Optional[types.GenerateContentConfig] = None
         self._gemini_available = False
+        self._gemini_api_keys: List[str] = []
+        self._gemini_key_index: int = 0
+        self._active_gemini_key: Optional[str] = None
+        self._gemini_key_cooldowns: Dict[str, float] = {}
+        self._session_history: Dict[int, Deque[Dict[str, Any]]] = {}
+        self._recent_track_set: Dict[int, Dict[str, float]] = {}
+        self._failed_resolve_map: Dict[int, Dict[str, float]] = {}
+        self._grounding_state: Dict[str, Any] = {
+            "date": self._grounding_date_key(),
+            "count": 0,
+        }
+        self._rng = random.Random()
+        self._last_metadata_flush = 0.0
+        self._last_mapping_flush = 0.0
+        self._metrics: Dict[int, Dict[str, Any]] = {}
+        self._metrics_global: Dict[str, Any] = {
+            "date": self._grounding_date_key(),
+            "grounding_calls_today": 0,
+        }
+        self._gemini_retry_after = 0.0
 
         # Initialize Last.fm API
         self._init_lastfm_client()
         self._init_gemini()
         self._load_cache()
         self._load_metadata_cache()
-        # History is now loaded per-guild on-demand
 
     def _init_lastfm_client(self):
         """Initialize Last.fm API with API key."""
@@ -250,31 +324,261 @@ class LastFMAutoplay:
     def _init_gemini(self):
         """Initialize Gemini AI for intelligent track parsing."""
         try:
-            gemini_api_key = os.getenv(GEMINI_API_KEY_ENV)
-            if not gemini_api_key:
+            keys = self._load_gemini_keys()
+            if not keys:
                 LOG.warning(
-                    f"⚠️ [Last.fm AutoPlay] {GEMINI_API_KEY_ENV} not found in .env. "
+                    "⚠️ [Last.fm AutoPlay] No Gemini API keys configured. "
                     "Gemini parsing disabled; falling back to heuristic parsing."
                 )
-                LOG.warning("Get a free API key from https://ai.google.dev/")
-                self._gemini_available = False
+                LOG.warning('Set GeminiApiKeys=["KEY1",...] in .env to enable Gemini.')
+                self._disable_gemini()
                 return
 
-            self._gemini_client = genai.Client(api_key=gemini_api_key)
-            self._gemini_search_tool = types.Tool(google_search=types.GoogleSearch())
-            self._gemini_base_config = types.GenerateContentConfig(
-                tools=[self._gemini_search_tool]
-            )
-            self._gemini_available = True
+            self._gemini_api_keys = keys
+            self._gemini_key_cooldowns = {key: 0.0 for key in keys}
 
+            for idx in range(len(keys)):
+                if self._activate_gemini_key(idx):
+                    if len(keys) > 1:
+                        LOG.info(
+                            f"✅ [Last.fm AutoPlay] Gemini initialized with {len(keys)} API keys."
+                        )
+                    else:
+                        LOG.info(
+                            "✅ [Last.fm AutoPlay] Gemini initialized successfully!"
+                        )
+                    return
+
+            LOG.error(
+                "❌ [Last.fm AutoPlay] Failed to initialize Gemini with any provided API key."
+            )
+            self._disable_gemini()
         except Exception as e:
             LOG.error(
                 f"❌ [Last.fm AutoPlay] Failed to initialize Gemini: {e}. Heuristic parsing will be used instead."
             )
-            self._gemini_client = None
-            self._gemini_search_tool = None
-            self._gemini_base_config = None
+            self._disable_gemini()
+
+    def _disable_gemini(self) -> None:
+        self._gemini_client = None
+        self._gemini_search_tool = None
+        self._gemini_base_config = None
+        self._gemini_available = False
+        self._active_gemini_key = None
+        self._gemini_api_keys = []
+        self._gemini_key_cooldowns = {}
+
+    def _load_gemini_keys(self) -> List[str]:
+        raw_keys = os.getenv(GEMINI_API_KEYS_ENV)
+        keys: List[str] = []
+        if raw_keys:
+            parsed: Any = None
+            try:
+                parsed = json.loads(raw_keys)
+            except json.JSONDecodeError:
+                parsed = None
+
+            if isinstance(parsed, list):
+                keys = [str(k).strip() for k in parsed if str(k).strip()]
+            elif isinstance(parsed, str):
+                keys = [parsed.strip()]
+            else:
+                keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique_keys = []
+        for key in keys:
+            if key and key not in seen:
+                unique_keys.append(key)
+                seen.add(key)
+        return unique_keys
+
+    def _activate_gemini_key(self, index: int) -> bool:
+        if not self._gemini_api_keys:
+            return False
+        index = index % len(self._gemini_api_keys)
+        candidate_key = self._gemini_api_keys[index]
+
+        try:
+            self._gemini_client = genai.Client(api_key=candidate_key)
+            self._gemini_search_tool = types.Tool(google_search=types.GoogleSearch())
+            self._gemini_base_config = types.GenerateContentConfig(
+                tools=[self._gemini_search_tool],
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            )
+            self._gemini_key_index = index
+            self._active_gemini_key = candidate_key
+            self._gemini_key_cooldowns[candidate_key] = 0.0
+            self._gemini_available = True
+            return True
+        except Exception as exc:
+            LOG.error(
+                f"❌ [Last.fm AutoPlay] Gemini API key #{index + 1} failed to initialize: {exc}"
+            )
+            self._gemini_key_cooldowns[candidate_key] = time.time() + 600
+            return False
+
+    def _ensure_gemini_ready(self) -> bool:
+        if not self._gemini_api_keys:
+            return False
+
+        now = time.time()
+
+        active_key = self._active_gemini_key
+        if active_key:
+            if now >= self._gemini_key_cooldowns.get(active_key, 0.0):
+                if self._gemini_client is not None:
+                    self._gemini_available = True
+                    self._gemini_retry_after = 0.0
+                    return True
+
+        total_keys = len(self._gemini_api_keys)
+        for offset in range(total_keys):
+            idx = (self._gemini_key_index + offset) % total_keys
+            key = self._gemini_api_keys[idx]
+            cooldown_until = self._gemini_key_cooldowns.get(key, 0.0)
+            if now < cooldown_until:
+                continue
+            if idx == self._gemini_key_index and self._gemini_client is not None:
+                self._active_gemini_key = key
+                self._gemini_available = True
+                self._gemini_retry_after = 0.0
+                return True
+            if self._activate_gemini_key(idx):
+                if offset != 0:
+                    LOG.info(
+                        f"✅ [Last.fm AutoPlay] Switched to Gemini API key #{idx + 1}."
+                    )
+                self._gemini_retry_after = 0.0
+                return True
+
+        if self._gemini_key_cooldowns:
+            soonest = min(self._gemini_key_cooldowns.values())
+            if soonest > now:
+                self._gemini_retry_after = max(self._gemini_retry_after, soonest)
+
+        self._active_gemini_key = None
+        self._gemini_available = False
+        return False
+
+    @staticmethod
+    def _grounding_date_key() -> str:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+    def _reset_grounding_counter_if_needed(self) -> None:
+        current = self._grounding_date_key()
+        if self._grounding_state.get("date") != current:
+            self._grounding_state["date"] = current
+            self._grounding_state["count"] = 0
+            self._metrics_global["date"] = current
+            self._metrics_global["grounding_calls_today"] = 0
+
+    def _can_use_grounded_call(self) -> bool:
+        self._reset_grounding_counter_if_needed()
+        return self._grounding_state.get("count", 0) < GROUNDING_DAILY_LIMIT
+
+    def _register_grounded_call(self) -> None:
+        self._reset_grounding_counter_if_needed()
+        self._grounding_state["count"] = self._grounding_state.get("count", 0) + 1
+        self._record_grounding_metrics()
+
+    def _maybe_flush_metadata_cache(self, force: bool = False) -> None:
+        now = time.time()
+        if force or (now - self._last_metadata_flush) >= CACHE_FLUSH_INTERVAL_SECONDS:
+            self._save_metadata_cache()
+            self._last_metadata_flush = now
+
+    def _maybe_flush_mapping_cache(self, force: bool = False) -> None:
+        now = time.time()
+        if force or (now - self._last_mapping_flush) >= CACHE_FLUSH_INTERVAL_SECONDS:
+            self._save_cache()
+            self._last_mapping_flush = now
+
+    def _metrics_bucket(self, guild_id: int) -> Dict[str, Any]:
+        bucket = self._metrics.setdefault(
+            guild_id,
+            {
+                "recommendations": deque(maxlen=METRICS_HISTORY_LIMIT),
+                "failed_resolves": 0,
+                "escape_hatch_count": 0,
+                "escape_hatch_reasons": deque(maxlen=ESCAPE_REASON_HISTORY_LIMIT),
+                "last_updated": time.time(),
+            },
+        )
+        bucket["last_updated"] = time.time()
+        return bucket
+
+    def _record_recommendation_metric(
+        self, guild_id: int, candidate: Dict[str, Any]
+    ) -> None:
+        bucket = self._metrics_bucket(guild_id)
+        bucket["recommendations"].append(
+            {
+                "timestamp": time.time(),
+                "artist": candidate.get("artist"),
+                "track": candidate.get("track"),
+                "source": candidate.get("source"),
+                "quality_score": candidate.get("quality_score"),
+                "score": candidate.get("score"),
+            }
+        )
+
+    def _record_escape_hatch_metric(self, guild_id: int, reason: str) -> None:
+        bucket = self._metrics_bucket(guild_id)
+        bucket["escape_hatch_count"] += 1
+        bucket["escape_hatch_reasons"].append(
+            {"timestamp": time.time(), "reason": reason}
+        )
+
+    def _increment_failed_resolve_metric(self, guild_id: int) -> None:
+        bucket = self._metrics_bucket(guild_id)
+        bucket["failed_resolves"] += 1
+
+    def _record_grounding_metrics(self) -> None:
+        today = self._grounding_date_key()
+        if self._metrics_global.get("date") != today:
+            self._metrics_global["date"] = today
+            self._metrics_global["grounding_calls_today"] = 0
+        self._metrics_global["grounding_calls_today"] = self._grounding_state.get(
+            "count", 0
+        )
+
+    def _enter_gemini_cooldown(
+        self, retry_seconds: float, reason: str, key: Optional[str] = None
+    ) -> None:
+        cooldown = max(retry_seconds, 1.0)
+        target = time.time() + cooldown
+        key = key or self._active_gemini_key
+
+        if key:
+            self._gemini_key_cooldowns[key] = target
+
+        if target > self._gemini_retry_after:
+            self._gemini_retry_after = target
+
+        LOG.warning(
+            f"⚠️ [Gemini] Metadata enrichment paused for {cooldown:.1f}s ({reason})."
+        )
+
+        if not self._ensure_gemini_ready():
             self._gemini_available = False
+
+    @staticmethod
+    def _is_rate_limited_message(message: str) -> bool:
+        lower = message.lower()
+        return "429" in lower or "quota" in lower or "resource_exhausted" in lower
+
+    @staticmethod
+    def _extract_retry_delay_seconds_from_text(message: str) -> Optional[float]:
+        lowered = message.lower()
+        match = re.search(r"retry(?: in)?\s*(\d+(?:\.\d+)?)s", lowered)
+        if match:
+            return float(match.group(1))
+        match = re.search(r"retrydelay['\"]:\s*['\"]?(\d+)(?:s)?", lowered)
+        if match:
+            return float(match.group(1))
+        return None
 
     @staticmethod
     def _strip_code_fence(payload: str) -> str:
@@ -379,6 +683,7 @@ class LastFMAutoplay:
                             entry.get("playable", ""),
                             entry.get("timestamp", 0),
                         )
+                self._last_mapping_flush = time.time()
         except Exception as e:
             LOG.warning(f"Failed to load Last.fm cache: {e}")
 
@@ -392,6 +697,7 @@ class LastFMAutoplay:
 
             with open(self._cache_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            self._last_mapping_flush = time.time()
 
         except Exception as e:
             LOG.warning(f"Failed to save Last.fm cache: {e}")
@@ -406,6 +712,7 @@ class LastFMAutoplay:
                 data = json.load(f)
                 if isinstance(data, dict):
                     self._metadata_cache = data
+                    self._last_metadata_flush = time.time()
         except Exception as e:
             LOG.warning(f"Failed to load track metadata cache: {e}")
 
@@ -414,11 +721,12 @@ class LastFMAutoplay:
         try:
             with open(self._metadata_cache_file, "w", encoding="utf-8") as f:
                 json.dump(self._metadata_cache, f, indent=2)
+            self._last_metadata_flush = time.time()
         except Exception as e:
             LOG.warning(f"Failed to save track metadata cache: {e}")
 
     @staticmethod
-    def _make_track_metadata_key(artist: str, track: str) -> str:
+    def _make_track_key(artist: str, track: str) -> str:
         return f"{artist.lower().strip()}|||{track.lower().strip()}"
 
     @staticmethod
@@ -451,8 +759,15 @@ class LastFMAutoplay:
         artist: str,
         track: str,
         existing_tags: List[str],
+        allow_grounding: bool = False,
     ) -> Dict[str, Any]:
         """Use Gemini with Google Search grounding to enrich track metadata."""
+        if not self._ensure_gemini_ready():
+            LOG.debug(
+                "⚠️ [Gemini] No available API keys for metadata enrichment; skipping."
+            )
+            return {}
+
         if not self._gemini_available or not self._gemini_client:
             return {}
 
@@ -470,27 +785,91 @@ class LastFMAutoplay:
             "Respond with JSON only."
         ).format(artist=artist, track=track, tags=existing_tags or "[]")
 
+        use_grounding = allow_grounding and self._can_use_grounded_call()
+
+        error_state: Dict[str, Any] = {
+            "message": "",
+            "retry": None,
+            "rate_limited": False,
+        }
+
         def _call_gemini() -> Optional[Any]:
             try:
+                config = types.GenerateContentConfig(
+                    system_instruction=instructions,
+                    tools=(
+                        [self._gemini_search_tool]
+                        if use_grounding and self._gemini_search_tool
+                        else None
+                    ),
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                )
                 return self._gemini_client.models.generate_content(
                     model=GEMINI_MODEL,
                     contents=prompt,
-                    config=types.GenerateContentConfig(
-                        tools=(
-                            [self._gemini_search_tool]
-                            if self._gemini_search_tool
-                            else None
-                        ),
-                        system_instruction=instructions,
-                    ),
+                    config=config,
                 )
             except Exception as exc:  # Rate limits or network errors
-                LOG.debug(f"⚠️ [Gemini] Metadata enrichment failed: {exc}")
+                message = str(exc)
+                error_state["message"] = message
+                error_state["rate_limited"] = self._is_rate_limited_message(message)
+                retry_attr = getattr(exc, "retry_delay", None) or getattr(
+                    exc, "retry_after", None
+                )
+                if retry_attr is not None:
+                    try:
+                        error_state["retry"] = float(retry_attr.total_seconds())
+                    except AttributeError:
+                        try:
+                            error_state["retry"] = float(retry_attr)
+                        except (TypeError, ValueError):
+                            error_state["retry"] = None
+                if error_state["retry"] is None:
+                    error_state["retry"] = self._extract_retry_delay_seconds_from_text(
+                        message
+                    )
+                LOG.debug(f"⚠️ [Gemini] Metadata enrichment failed: {message}")
                 return None
 
         response = await asyncio.to_thread(_call_gemini)
         if response is None:
+            if error_state["message"]:
+                default_retry = 60.0 if error_state["rate_limited"] else 20.0
+                retry_seconds = error_state.get("retry") or default_retry
+                reason = (
+                    "rate-limit"
+                    if error_state["rate_limited"]
+                    else "metadata enrichment failure"
+                )
+                self._enter_gemini_cooldown(
+                    retry_seconds, reason, key=self._active_gemini_key
+                )
             return {}
+
+        response_error = getattr(response, "error", None)
+        if not response_error and isinstance(response, dict):
+            response_error = response.get("error")
+        if response_error:
+            error_message = (
+                response_error.get("message")
+                if isinstance(response_error, dict)
+                else str(response_error)
+            )
+            retry_seconds = (
+                self._extract_retry_delay_seconds_from_text(error_message) or 60.0
+            )
+            reason = (
+                "rate-limit"
+                if self._is_rate_limited_message(error_message)
+                else "metadata enrichment failure"
+            )
+            self._enter_gemini_cooldown(
+                retry_seconds, reason, key=self._active_gemini_key
+            )
+            return {}
+
+        if use_grounding:
+            self._register_grounded_call()
 
         structured = self._parse_gemini_json(response)
         if structured:
@@ -507,7 +886,7 @@ class LastFMAutoplay:
     ) -> Dict[str, Any]:
         """Return enriched track metadata, combining Last.fm and Gemini."""
 
-        metadata_key = self._make_track_metadata_key(artist, track)
+        metadata_key = self._make_track_key(artist, track)
 
         async with self._metadata_lock:
             cache_entry = self._metadata_cache.get(metadata_key, {})
@@ -531,7 +910,12 @@ class LastFMAutoplay:
         need_gemini = require_enrichment or len(tags) < 3
 
         if need_gemini:
-            enriched = await self._classify_track_with_gemini(artist, track, tags)
+            enriched = await self._classify_track_with_gemini(
+                artist,
+                track,
+                tags,
+                allow_grounding=require_enrichment,
+            )
             if enriched:
                 gemini_tags = [
                     self._normalize_tag(tag)
@@ -557,7 +941,7 @@ class LastFMAutoplay:
         async with self._metadata_lock:
             metadata["timestamp"] = time.time()
             self._metadata_cache[metadata_key] = metadata
-            self._save_metadata_cache()
+            self._maybe_flush_metadata_cache()
 
         return metadata
 
@@ -571,7 +955,48 @@ class LastFMAutoplay:
         try:
             with open(history_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                self._recent_autoplayed[guild_id] = data.get("history", [])
+                raw_history = data.get("history", []) if isinstance(data, dict) else []
+
+                cleaned: List[Dict[str, Any]] = []
+                history_buffer: Deque[Dict[str, Any]] = deque(
+                    maxlen=SESSION_HISTORY_LIMIT
+                )
+                now_ts = time.time()
+                recent_tracks: Dict[str, float] = {}
+
+                for entry in raw_history:
+                    if not isinstance(entry, dict):
+                        continue
+                    artist = entry.get("artist", "")
+                    track = entry.get("track", "")
+                    if not artist or not track:
+                        continue
+
+                    timestamp = float(entry.get("timestamp", now_ts))
+                    resolved_source = entry.get("resolved_source")
+                    quality_score = entry.get("quality_score")
+
+                    record = {
+                        "artist": artist,
+                        "track": track,
+                        "timestamp": timestamp,
+                        "resolved_source": resolved_source,
+                        "quality_score": quality_score,
+                    }
+                    cleaned.append(record)
+                    history_buffer.append(record)
+
+                    track_key = self._make_track_key(artist, track)
+                    if timestamp and (now_ts - timestamp) < RECENT_TRACK_WINDOW_SECONDS:
+                        recent_tracks[track_key] = timestamp
+
+                self._recent_autoplayed[guild_id] = cleaned
+                self._session_history[guild_id] = history_buffer
+                if recent_tracks:
+                    self._recent_track_set[guild_id] = recent_tracks
+                else:
+                    self._recent_track_set.setdefault(guild_id, {})
+                self._failed_resolve_map.setdefault(guild_id, {})
         except Exception as e:
             LOG.warning(f"Failed to load history for guild {guild_id}: {e}")
 
@@ -583,10 +1008,19 @@ class LastFMAutoplay:
         history_file = self._cache_dir / f"{guild_id}_history.json"
 
         try:
+            history_records = list(self._session_history.get(guild_id, []))
+            if not history_records:
+                history_records = self._recent_autoplayed[guild_id][
+                    -SESSION_HISTORY_LIMIT:
+                ]
+
+            self._recent_autoplayed[guild_id] = history_records
+
             data = {
                 "guild_id": guild_id,
-                "history": self._recent_autoplayed[guild_id],
+                "history": history_records,
                 "last_updated": time.time(),
+                "grounding_count": self._grounding_state.get("count", 0),
             }
 
             with open(history_file, "w", encoding="utf-8") as f:
@@ -602,10 +1036,8 @@ class LastFMAutoplay:
     def _normalize_artist_for_diversity(self, artist: str) -> str:
         """Normalize artist name for diversity scoring to catch variations."""
         normalized = artist.lower().strip()
-        # Remove common collaborator separators (order matters - check longest first)
         for sep in [", ", " & ", " ft. ", " feat. ", " featuring ", " x "]:
             if sep in normalized:
-                # Take the first (primary) artist
                 normalized = normalized.split(sep)[0].strip()
                 break
         return normalized
@@ -626,6 +1058,12 @@ class LastFMAutoplay:
                 self._artist_cooldowns.pop(guild_id)
             if guild_id in self._genre_history:
                 self._genre_history.pop(guild_id)
+            if guild_id in self._session_history:
+                self._session_history.pop(guild_id)
+            if guild_id in self._recent_track_set:
+                self._recent_track_set.pop(guild_id)
+            if guild_id in self._failed_resolve_map:
+                self._failed_resolve_map.pop(guild_id)
 
             # Delete the file
             history_file = self._cache_dir / f"{guild_id}_history.json"
@@ -644,6 +1082,10 @@ class LastFMAutoplay:
             self._recent_autoplayed.clear()
             self._artist_cooldowns.clear()
             self._genre_history.clear()
+            self._session_history.clear()
+            self._recent_track_set.clear()
+            self._failed_resolve_map.clear()
+            self._grounding_state = {"date": self._grounding_date_key(), "count": 0}
 
             # Delete all history files
             try:
@@ -677,6 +1119,379 @@ class LastFMAutoplay:
         cleaned = re.sub(r"[|•/]+", " ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned)
         return cleaned.strip(" -|•")
+
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    def _estimate_quality_score(self, title: str) -> float:
+        if not title:
+            return 0.5
+        lower = title.lower()
+        penalty = sum(1 for kw in BAD_TITLE_KEYWORDS if kw in lower)
+        bonus = sum(1 for kw in GOOD_TITLE_KEYWORDS if kw in lower)
+        base = 0.65 + 0.08 * bonus - 0.12 * penalty
+        return self._clamp01(base)
+
+    def _track_recently_played(self, guild_id: int, artist: str, track: str) -> bool:
+        track_key = self._make_track_key(artist, track)
+        now_ts = time.time()
+        recent_map = self._recent_track_set.setdefault(guild_id, {})
+        timestamp = recent_map.get(track_key)
+        if timestamp and (now_ts - timestamp) < RECENT_TRACK_WINDOW_SECONDS:
+            return True
+        if timestamp and (now_ts - timestamp) >= RECENT_TRACK_WINDOW_SECONDS:
+            recent_map.pop(track_key, None)
+        failed_map = self._failed_resolve_map.setdefault(guild_id, {})
+        failed_ts = failed_map.get(track_key)
+        if failed_ts and (now_ts - failed_ts) < FAILED_TRACK_COOLDOWN_SECONDS:
+            return True
+        if failed_ts and (now_ts - failed_ts) >= FAILED_TRACK_COOLDOWN_SECONDS:
+            failed_map.pop(track_key, None)
+        return False
+
+    def _mark_track_played(
+        self,
+        guild_id: int,
+        artist: str,
+        track: str,
+        resolved_source: Optional[str] = None,
+        quality_score: Optional[float] = None,
+    ) -> None:
+        entry = {
+            "artist": artist,
+            "track": track,
+            "timestamp": time.time(),
+            "resolved_source": resolved_source,
+            "quality_score": quality_score,
+        }
+        history_buffer = self._session_history.setdefault(
+            guild_id, deque(maxlen=SESSION_HISTORY_LIMIT)
+        )
+        history_buffer.append(entry)
+        self._recent_autoplayed[guild_id] = list(history_buffer)
+        track_key = self._make_track_key(artist, track)
+        self._recent_track_set.setdefault(guild_id, {})[track_key] = entry["timestamp"]
+
+    def _mark_resolve_failure(self, guild_id: int, artist: str, track: str) -> None:
+        track_key = self._make_track_key(artist, track)
+        self._failed_resolve_map.setdefault(guild_id, {})[track_key] = time.time()
+        self._increment_failed_resolve_metric(guild_id)
+
+    def _recent_artist_counts(self, guild_id: int) -> Counter:
+        buffer = self._session_history.get(guild_id)
+        if not buffer:
+            return Counter()
+        normalized = [
+            self._normalize_artist_for_diversity(entry.get("artist", ""))
+            for entry in buffer
+        ]
+        return Counter(a for a in normalized if a)
+
+    async def _trigger_escape_hatch(
+        self,
+        guild_id: int,
+        reason: str,
+        seed_artist: str,
+        seed_tags: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        self._record_escape_hatch_metric(guild_id, reason)
+        LOG.warning(f"Escape hatch triggered: {reason}")
+        candidates = await self._get_fallback_recommendations(seed_artist, limit=20)
+        if candidates:
+            return candidates
+        tags = seed_tags or []
+        if tags:
+            for tag in tags[:3]:
+                tag_tracks = await self._get_tag_top_tracks(tag, limit=10)
+                if tag_tracks:
+                    return tag_tracks
+        default_tag = "pop"
+        return await self._get_tag_top_tracks(default_tag, limit=10)
+
+    def _make_candidate_entry(
+        self,
+        guild_id: int,
+        artist: str,
+        track: str,
+        source: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not artist or not track:
+            return None
+        key = self._make_track_key(artist, track)
+        if self._track_recently_played(guild_id, artist, track):
+            return None
+        return {
+            "artist": artist,
+            "track": track,
+            "source": source,
+            "quality_score": self._estimate_quality_score(track),
+            "track_key": key,
+        }
+
+    async def _build_candidate_pool(
+        self,
+        guild_id: int,
+        artist: str,
+        title: str,
+        seed_tags: Optional[List[str]],
+    ) -> List[Dict[str, Any]]:
+        pool: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        similar_tracks = await self._get_similar_tracks(
+            artist, title, limit=CANDIDATE_POOL_TARGET
+        )
+        for track in similar_tracks:
+            candidate_artist = track.get("artist", {})
+            if isinstance(candidate_artist, dict):
+                candidate_artist = candidate_artist.get("name", "")
+            candidate_title = track.get("name") or track.get("title") or ""
+            candidate = self._make_candidate_entry(
+                guild_id,
+                candidate_artist,
+                candidate_title,
+                track.get("source", "similar"),
+            )
+            if candidate and candidate["track_key"] not in seen:
+                seen.add(candidate["track_key"])
+                pool.append(candidate)
+
+        if len(pool) < CANDIDATE_POOL_TARGET:
+            top_tracks = await self._get_artist_top_tracks(
+                artist, exclude_titles=[title], limit=10
+            )
+            for track in top_tracks:
+                candidate_artist = track.get("artist", {})
+                if isinstance(candidate_artist, dict):
+                    candidate_artist = candidate_artist.get("name", "")
+                candidate_title = track.get("name") or track.get("title") or ""
+                candidate = self._make_candidate_entry(
+                    guild_id,
+                    candidate_artist,
+                    candidate_title,
+                    track.get("source", "artist-top"),
+                )
+                if candidate and candidate["track_key"] not in seen:
+                    seen.add(candidate["track_key"])
+                    pool.append(candidate)
+
+        if len(pool) < CANDIDATE_POOL_TARGET:
+            fallback_tracks = await self._get_fallback_recommendations(
+                artist, limit=CANDIDATE_POOL_TARGET
+            )
+            for track in fallback_tracks:
+                candidate_artist = track.get("artist", {})
+                if isinstance(candidate_artist, dict):
+                    candidate_artist = candidate_artist.get("name", "")
+                candidate_title = track.get("name") or track.get("title") or ""
+                candidate = self._make_candidate_entry(
+                    guild_id,
+                    candidate_artist,
+                    candidate_title,
+                    track.get("source", "fallback"),
+                )
+                if candidate and candidate["track_key"] not in seen:
+                    seen.add(candidate["track_key"])
+                    pool.append(candidate)
+
+        if len(pool) < CANDIDATE_POOL_TARGET and seed_tags:
+            for tag in seed_tags[:3]:
+                tag_tracks = await self._get_tag_top_tracks(tag, limit=20)
+                for track in tag_tracks:
+                    candidate_artist = track.get("artist") or track.get(
+                        "artist", {}
+                    ).get("name", "")
+                    candidate_title = (
+                        track.get("track")
+                        or track.get("name")
+                        or track.get("title")
+                        or ""
+                    )
+                    candidate = self._make_candidate_entry(
+                        guild_id,
+                        candidate_artist,
+                        candidate_title,
+                        track.get("source", "tag"),
+                    )
+                    if candidate and candidate["track_key"] not in seen:
+                        seen.add(candidate["track_key"])
+                        pool.append(candidate)
+                    if len(pool) >= CANDIDATE_POOL_TARGET:
+                        break
+                if len(pool) >= CANDIDATE_POOL_TARGET:
+                    break
+
+        LOG.info(
+            f"Built candidate pool: {len(pool)} tracks (seed artist '{artist}', seed tags: {seed_tags or []})"
+        )
+        return pool
+
+    async def _score_and_resolve_candidates(
+        self,
+        guild_id: int,
+        seed_artist: str,
+        seed_title: str,
+        seed_tags: List[str],
+        candidate_pool: List[Dict[str, Any]],
+        expected_duration_ms: Optional[int],
+        limit: int,
+    ) -> List[Tuple[str, Any]]:
+        if not candidate_pool:
+            return []
+
+        session_counts = self._recent_artist_counts(guild_id)
+        session_tags_raw = self._genre_history.get(guild_id, [])
+        session_tag_counter = (
+            Counter(session_tags_raw) if session_tags_raw else Counter()
+        )
+        session_tag_set = {tag for tag, _ in session_tag_counter.most_common(5)}
+        metadata_map: Dict[str, Dict[str, Any]] = {}
+
+        top_for_enrichment = candidate_pool[:ENRICH_TOP_N]
+        for idx, candidate in enumerate(top_for_enrichment):
+            metadata_map[candidate["track_key"]] = await self._get_track_profile(
+                candidate["artist"],
+                candidate["track"],
+                require_enrichment=idx < 3,
+            )
+
+        scored_candidates: List[Dict[str, Any]] = []
+        now_ts = time.time()
+
+        for candidate in candidate_pool:
+            artist = candidate["artist"]
+            track = candidate["track"]
+            if (
+                artist.lower() == seed_artist.lower()
+                and track.lower() == seed_title.lower()
+            ):
+                continue
+
+            track_key = candidate["track_key"]
+            metadata = metadata_map.get(track_key)
+            if metadata is None:
+                metadata = await self._get_track_profile(artist, track)
+                metadata_map[track_key] = metadata
+
+            candidate_tags = metadata.get("tags", [])
+            quality_score = candidate.get("quality_score", 0.5)
+
+            seed_overlap = 0.0
+            if seed_tags and candidate_tags:
+                seed_overlap = len(set(seed_tags) & set(candidate_tags)) / max(
+                    len(seed_tags), 1
+                )
+
+            session_overlap = 0.0
+            if session_tag_set and candidate_tags:
+                session_overlap = len(set(candidate_tags) & session_tag_set) / max(
+                    len(session_tag_set), 1
+                )
+
+            artist_norm = self._normalize_artist_for_diversity(artist)
+            artist_count = session_counts.get(artist_norm, 0)
+            artist_affinity = self._clamp01(
+                1.0 - (artist_count / max(ARTIST_REPEAT_LIMIT, 1))
+            )
+            novelty = self._clamp01(
+                (1.0 - max(seed_overlap, session_overlap))
+                + self._rng.uniform(0.0, EPSILON_EXPLORE)
+            )
+            content_sim = seed_overlap
+            session_coherence = session_overlap
+
+            base_score = (
+                content_sim * 0.45
+                + artist_affinity * 0.18
+                + session_coherence * 0.12
+                + quality_score * 0.15
+                + novelty * 0.10
+            )
+
+            cooldown_remaining = self._artist_cooldowns.setdefault(guild_id, {}).get(
+                artist_norm, 0
+            )
+            if artist_count >= ARTIST_REPEAT_LIMIT:
+                base_score -= 0.5
+            if cooldown_remaining > 0:
+                base_score -= 0.2 * cooldown_remaining
+
+            failed_ts = self._failed_resolve_map.setdefault(guild_id, {}).get(track_key)
+            if failed_ts and (now_ts - failed_ts) < FAILED_TRACK_COOLDOWN_SECONDS:
+                base_score = -1.0
+
+            if base_score <= 0:
+                continue
+
+            scored_candidates.append(
+                {
+                    **candidate,
+                    "score": base_score,
+                    "tags": candidate_tags,
+                    "artist_norm": artist_norm,
+                }
+            )
+
+        if LOG_LEVEL >= 2 and scored_candidates:
+            debug_preview = [
+                (c["artist"], c["track"], round(c["score"], 3))
+                for c in scored_candidates[:10]
+            ]
+            LOG.debug(f"Candidate scores preview: {debug_preview}")
+
+        scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        resolved: List[Tuple[str, Any]] = []
+        for candidate in scored_candidates:
+            if len(resolved) >= min(limit, RESOLVE_TOP_K):
+                break
+
+            playable_track = await self._resolve_lastfm_to_youtube(
+                candidate["artist"],
+                candidate["track"],
+                duration_ms=expected_duration_ms,
+            )
+
+            if playable_track:
+                resolved.append((candidate["track_key"], playable_track))
+                self._record_recommendation_metric(guild_id, candidate)
+                self._mark_track_played(
+                    guild_id,
+                    candidate["artist"],
+                    candidate["track"],
+                    candidate.get("source"),
+                    candidate.get("quality_score"),
+                )
+                session_counts[candidate["artist_norm"]] = (
+                    session_counts.get(candidate["artist_norm"], 0) + 1
+                )
+
+                cooldowns = self._artist_cooldowns.setdefault(guild_id, {})
+                cooldowns[candidate["artist_norm"]] = ARTIST_COOLDOWN_CYCLES
+                for other in list(cooldowns.keys()):
+                    if other == candidate["artist_norm"]:
+                        continue
+                    cooldowns[other] = max(0, cooldowns[other] - 1)
+                    if cooldowns[other] == 0:
+                        cooldowns.pop(other, None)
+
+                tags = candidate.get("tags") or []
+                if tags:
+                    genre_track = self._genre_history.setdefault(guild_id, [])
+                    genre_track.append(tags[0])
+                    if len(genre_track) > 60:
+                        del genre_track[:-60]
+            else:
+                self._mark_resolve_failure(
+                    guild_id, candidate["artist"], candidate["track"]
+                )
+
+        if resolved:
+            self._maybe_flush_mapping_cache(force=True)
+            self._save_guild_history(guild_id)
+
+        return resolved
 
     def _fallback_parse_track(
         self, raw_title: str, channel_name: str
@@ -1186,9 +2001,7 @@ Respond with ONLY the JSON object, no other text."""
             if best_match and best_score > 0.3:  # Minimum match threshold
                 # Cache this mapping
                 self._cache[cache_key] = (query, time.time())
-                # Save cache every 10 additions
-                if len(self._cache) % 10 == 0:
-                    self._save_cache()
+                self._maybe_flush_mapping_cache()
 
                 return best_match
 
@@ -1251,19 +2064,8 @@ Respond with ONLY the JSON object, no other text."""
     async def get_recommendations_for_track(
         self, track_info: Dict[str, Any], limit: int = 10
     ) -> List[Tuple[str, Any]]:
-        """
-        Get track recommendations based on current track using Gemini AI parsing.
+        """Return autoplay recommendations with diversity, quality, and loop guards."""
 
-        Uses Gemini to intelligently parse artist/title from YouTube metadata,
-        then queries Last.fm for similar tracks.
-
-        Args:
-            track_info: Dict with 'title', 'author', 'length' keys
-            limit: Maximum number of recommendations to return
-
-        Returns:
-            List of (track_identifier, playable_track) tuples
-        """
         if not self.is_available():
             LOG.debug(
                 "Last.fm autoplay not available (Gemini or Last.fm not configured)"
@@ -1273,319 +2075,94 @@ Respond with ONLY the JSON object, no other text."""
         raw_title = track_info.get("title", "").strip()
         channel_name = track_info.get("author", "").strip()
         expected_duration_ms = track_info.get("length")
+        guild_id = int(track_info.get("guild_id", 0) or 0)
 
         if not raw_title:
-            LOG.warning("⚠️ [Last.fm] Missing track title")
+            LOG.warning("Missing track title for autoplay seed")
             return []
 
-        LOG.info(
-            f"🎵 [Last.fm] Getting recommendations for: '{raw_title}' by '{channel_name}'"
-        )
+        LOG.info(f"Seed track → {channel_name} :: {raw_title}")
 
-        # Phase 1: Parse track with Gemini AI
         parsed = await self._parse_track_with_gemini(raw_title, channel_name)
-
         if not parsed or not parsed.get("artist") or not parsed.get("title"):
             LOG.error(
-                f"❌ [Last.fm] Gemini failed to parse track: '{raw_title}'. "
-                "AutoPlay cannot continue without valid artist/title."
+                "Unable to parse artist/title from seed track; aborting autoplay round"
             )
             return []
 
-        artist = parsed["artist"]
-        title = parsed["title"]
+        seed_artist = parsed["artist"]
+        seed_title = parsed["title"]
 
-        LOG.debug(f"🎧 [Last.fm] Using parsed artist/title: '{artist}' - '{title}'")
-
-        # Phase 2: Build a blended recommendation pool from multiple sources
-        recommendations_pool: List[Dict[str, Any]] = []
-
-        # Load guild history early to check artist frequency
-        guild_id = track_info.get("guild_id", 0)
         if guild_id not in self._recent_autoplayed:
             self._load_guild_history(guild_id)
-            if guild_id not in self._recent_autoplayed:
-                self._recent_autoplayed[guild_id] = []
+        self._recent_autoplayed.setdefault(guild_id, [])
+        self._session_history.setdefault(guild_id, deque(maxlen=SESSION_HISTORY_LIMIT))
+        self._artist_cooldowns.setdefault(guild_id, {})
+        self._genre_history.setdefault(guild_id, [])
+        self._recent_track_set.setdefault(guild_id, {})
+        self._failed_resolve_map.setdefault(guild_id, {})
 
-        # Check how many times this artist has been played recently
-        normalized_current_artist = self._normalize_artist_for_diversity(artist)
-        recent_artist_count = sum(
-            1
-            for hist_entry in self._recent_autoplayed[guild_id]
-            if self._normalize_artist_for_diversity(hist_entry.get("artist", ""))
-            == normalized_current_artist
+        seed_profile = await self._get_track_profile(seed_artist, seed_title)
+        seed_tags = seed_profile.get("tags") or []
+
+        candidate_pool = await self._build_candidate_pool(
+            guild_id, seed_artist, seed_title, seed_tags
+        )
+        candidate_pool = [c for c in candidate_pool if c["quality_score"] >= 0.15]
+
+        if LOG_LEVEL >= 2 and candidate_pool:
+            preview = [
+                (c["artist"], c["track"], round(c["quality_score"], 2))
+                for c in candidate_pool[:5]
+            ]
+            LOG.debug(f"Candidate pool preview: {preview}")
+
+        recommendations = await self._score_and_resolve_candidates(
+            guild_id,
+            seed_artist,
+            seed_title,
+            seed_tags,
+            candidate_pool,
+            expected_duration_ms,
+            limit,
         )
 
-        similar_tracks = await self._get_similar_tracks(artist, title, limit=limit * 2)
-
-        # Only fetch same-artist tracks if artist hasn't been played much recently
-        artist_top_tracks = []
-        if (
-            recent_artist_count < 2
-        ):  # Only if artist played less than 2 times in recent history
-            artist_top_tracks = await self._get_artist_top_tracks(
-                artist, exclude_titles=[title], limit=1
-            )
-
-        # Interleave similar tracks with same-artist picks for variety
-        blended_primary: List[Dict[str, Any]] = []
-        max_primary = max(len(similar_tracks), len(artist_top_tracks))
-        for i in range(max_primary):
-            if i < len(similar_tracks):
-                blended_primary.append(similar_tracks[i])
-            if i < len(artist_top_tracks):
-                blended_primary.append(artist_top_tracks[i])
-
-        recommendations_pool.extend(blended_primary)
-
-        # ALWAYS get fallback to ensure diverse artist pool
-        fallback_tracks = await self._get_fallback_recommendations(
-            artist, limit=limit * 3  # Get more fallback candidates
-        )
-        if fallback_tracks:
-            recommendations_pool.extend(fallback_tracks)
-
-        if not recommendations_pool:
-            LOG.warning(
-                f"⚠️ [Last.fm] No recommendations available for '{artist}' - '{title}' after blending sources"
-            )
-
-            # Try to get recommendations based on track's genre tags
-            track_tags = await self._get_track_tags(artist, title)
-            if track_tags:
-                LOG.info(
-                    f"🎵 [Last.fm] Found {len(track_tags)} genre tags for track, using for fallback"
-                )
-                for tag in track_tags[:3]:  # Try top 3 tags
-                    genre_tracks = await self._get_tag_top_tracks(tag, limit=limit * 2)
-                    if genre_tracks:
-                        LOG.info(
-                            f"✅ [Last.fm] Found {len(genre_tracks)} tracks from genre '{tag}'"
-                        )
-                        recommendations_pool.extend(genre_tracks)
-                        break
-
-            # If still no tracks, try default genre as last resort
-            if not recommendations_pool:
-                default_genre = "pop"
-                genre_tracks = await self._get_tag_top_tracks(
-                    default_genre, limit=limit
-                )
-                if genre_tracks:
-                    LOG.warning(
-                        f"⚠️ [Last.fm] Using default genre '{default_genre}' for fallback recommendations."
-                    )
-                    recommendations_pool.extend(genre_tracks)
-                else:
-                    LOG.warning(
-                        f"❌ [Last.fm] No recommendations found even for default genre '{default_genre}'. Likely not music."
-                    )
-                    return []
-
-        recommendations = []
-        seen_tracks = set()
-
-        # Build artist frequency map from recent history (normalized for variations)
-        recent_artists = {}
-        if guild_id in self._recent_autoplayed:
-            for hist_entry in self._recent_autoplayed[guild_id]:
-                hist_artist = hist_entry.get("artist", "")
-                normalized = self._normalize_artist_for_diversity(hist_artist)
-                recent_artists[normalized] = recent_artists.get(normalized, 0) + 1
-
-        # Initialize cooldown tracking for this guild if not exists
-        if guild_id not in self._artist_cooldowns:
-            self._artist_cooldowns[guild_id] = {}
-
-        scored_candidates = []
-        for similar_track in recommendations_pool:
-            similar_artist = similar_track.get("artist", {})
-            if isinstance(similar_artist, dict):
-                similar_artist = similar_artist.get("name", "")
-
-            similar_name = similar_track.get("name", "")
-            if not similar_name:
-                similar_name = similar_track.get("title", "")
-
-            if not similar_artist or not similar_name:
-                continue
-
-            artist_lower = similar_artist.lower()
-            track_lower = similar_name.lower()
-
-            # Skip if this is the currently playing track
-            if artist_lower == artist.lower() and track_lower == title.lower():
-                continue
-
-            # Check if already in recent history (exact track match)
-            track_key = f"{artist_lower}:{track_lower}"
-            if guild_id in self._recent_autoplayed:
-                already_played = any(
-                    h.get("artist", "").lower() == artist_lower
-                    and h.get("track", "").lower() == track_lower
-                    for h in self._recent_autoplayed[guild_id]
-                )
-                if already_played:
-                    continue
-
-            normalized_artist = self._normalize_artist_for_diversity(similar_artist)
-            artist_repeat_count = recent_artists.get(normalized_artist, 0)
-            cooldown_remaining = self._artist_cooldowns[guild_id].get(
-                normalized_artist, 0
-            )
-
-            diversity_penalty = 0
-            if cooldown_remaining > 0:
-                diversity_penalty = 1000 + cooldown_remaining * 100
-            elif artist_repeat_count >= 2:
-                diversity_penalty = 500 + artist_repeat_count * 50
-            elif artist_repeat_count == 1:
-                diversity_penalty = 50
-
-            # Retrieve enriched metadata (tags/mood) for scoring
-            track_profile = await self._get_track_profile(
-                similar_artist, similar_name, require_enrichment=True
-            )
-            candidate_tags = track_profile.get("tags", [])
-
-            session_tags = []
-            if guild_id in self._genre_history and self._genre_history[guild_id]:
-                session_top = Counter(self._genre_history[guild_id]).most_common(5)
-                session_tags = [tag for tag, _ in session_top]
-
-            tag_overlap = 0.0
-            novelty = 0.5
-            if candidate_tags and session_tags:
-                overlap = len(set(candidate_tags) & set(session_tags))
-                tag_overlap = overlap / max(len(session_tags), 1)
-                novelty = max(0.0, min(1.0, 1.0 - tag_overlap))
-            elif candidate_tags:
-                tag_overlap = 0.5
-                novelty = 0.7
-
-            if artist_repeat_count == 0:
-                artist_diversity_factor = 1.0
-            elif artist_repeat_count == 1:
-                artist_diversity_factor = 0.5
-            else:
-                artist_diversity_factor = 0.0
-
-            # Encourage genre-based sources slightly when session history exists
-            track_source = similar_track.get("source", "")
-            if session_tags and track_source in {
-                "similar-genre",
-                "tag-top-track",
-                "genre-fallback",
-            }:
-                novelty = min(1.0, novelty + 0.1)
-
-            similarity_score = (
-                (tag_overlap * 0.5) + (artist_diversity_factor * 0.3) + (novelty * 0.2)
-            )
-
-            scored_candidates.append(
-                {
-                    "artist": similar_artist,
-                    "track": similar_name,
-                    "track_key": track_key,
-                    "diversity_penalty": diversity_penalty,
-                    "similarity_score": similarity_score,
-                    "source": track_source or "unknown",
-                    "tags": candidate_tags,
-                }
-            )
-
-        # Sort by penalty first (lower better), then by similarity score (higher better)
-        scored_candidates.sort(
-            key=lambda x: (x["diversity_penalty"], -x["similarity_score"])
-        )
-
-        # Resolve top candidates to playable tracks
-        for candidate in scored_candidates:
-            if len(recommendations) >= limit:
-                break
-
-            similar_artist = candidate["artist"]
-            similar_name = candidate["track"]
-            track_key = candidate["track_key"]
-
-            # Deduplicate in this result set
-            if track_key in seen_tracks:
-                continue
-            seen_tracks.add(track_key)
-
-            # Try to resolve to YouTube
-            playable_track = await self._resolve_lastfm_to_youtube(
-                similar_artist,
-                similar_name,
-                duration_ms=expected_duration_ms,
-            )
-
-            if playable_track:
-                recommendations.append((track_key, playable_track))
-
-                # Add to history with artist and track info
-                if guild_id not in self._recent_autoplayed:
-                    self._recent_autoplayed[guild_id] = []
-                self._recent_autoplayed[guild_id].append(
-                    {"artist": similar_artist, "track": similar_name}
-                )
-
-                # Trim history to last N tracks
-                if len(self._recent_autoplayed[guild_id]) > HISTORY_LIMIT:
-                    self._recent_autoplayed[guild_id] = self._recent_autoplayed[
-                        guild_id
-                    ][-HISTORY_LIMIT:]
-
-                # Update artist cooldown tracking (Spotify-like algorithm)
-                normalized_selected = self._normalize_artist_for_diversity(
-                    similar_artist
-                )
-                recent_artists[normalized_selected] = (
-                    recent_artists.get(normalized_selected, 0) + 1
-                )
-
-                for artist_key in list(self._artist_cooldowns[guild_id].keys()):
-                    if artist_key != normalized_selected:
-                        self._artist_cooldowns[guild_id][artist_key] = max(
-                            0, self._artist_cooldowns[guild_id][artist_key] - 1
-                        )
-                        if self._artist_cooldowns[guild_id][artist_key] == 0:
-                            del self._artist_cooldowns[guild_id][artist_key]
-
-                artist_play_count = recent_artists.get(normalized_selected, 0) + 1
-                if artist_play_count >= 2:
-                    self._artist_cooldowns[guild_id][normalized_selected] = 3
-                elif normalized_selected in self._artist_cooldowns[guild_id]:
-                    self._artist_cooldowns[guild_id][normalized_selected] = 0
-
-                track_tags = candidate.get("tags") or []
-                if not track_tags:
-                    profile = await self._get_track_profile(
-                        similar_artist, similar_name
-                    )
-                    track_tags = profile.get("tags", [])
-
-                if track_tags:
-                    if guild_id not in self._genre_history:
-                        self._genre_history[guild_id] = []
-                    self._genre_history[guild_id].append(track_tags[0])
-                    if len(self._genre_history[guild_id]) > 20:
-                        self._genre_history[guild_id] = self._genre_history[guild_id][
-                            -20:
-                        ]
-
-        # Save cache and guild history if we added new mappings
         if recommendations:
-            self._save_cache()
-            self._save_guild_history(guild_id)
+            return recommendations
 
-        return recommendations
+        fallback_raw = await self._trigger_escape_hatch(
+            guild_id, "primary candidate pool empty", seed_artist, seed_tags
+        )
+        fallback_candidates: List[Dict[str, Any]] = []
+        for track in fallback_raw:
+            candidate_artist = track.get("artist")
+            if isinstance(candidate_artist, dict):
+                candidate_artist = candidate_artist.get("name", "")
+            candidate_title = (
+                track.get("track") or track.get("name") or track.get("title") or ""
+            )
+            candidate = self._make_candidate_entry(
+                guild_id,
+                candidate_artist or "",
+                candidate_title,
+                track.get("source", "fallback"),
+            )
+            if candidate:
+                fallback_candidates.append(candidate)
 
-    async def _get_track_tags(self, artist: str, track: str) -> List[str]:
-        """Get normalized tags for a specific track (cached + enriched)."""
-        profile = await self._get_track_profile(artist, track)
-        return profile.get("tags", [])
+        fallback_candidates = [
+            c for c in fallback_candidates if c["quality_score"] >= 0.15
+        ]
+
+        return await self._score_and_resolve_candidates(
+            guild_id,
+            seed_artist,
+            seed_title,
+            seed_tags,
+            fallback_candidates,
+            expected_duration_ms,
+            limit,
+        )
 
     async def _get_similar_tags(self, tag: str, limit: int = 5) -> List[str]:
         """Get similar genres/tags from Last.fm API (Spotify-lite: genre exploration)."""

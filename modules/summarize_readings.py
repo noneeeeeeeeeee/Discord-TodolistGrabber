@@ -126,32 +126,69 @@ import requests
 import asyncio
 from pathlib import Path
 from bs4 import BeautifulSoup
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from datetime import datetime, timedelta
 
 
-_gemini_model = None
-_gemini_configured = False
+_GEMINI_CLIENT = None
+_GEMINI_CLIENT_KEY = None
+_GEMINI_MODEL_NAME = "gemini-2.5-flash-lite"
+_GEMINI_GENERATION_CONFIG = types.GenerateContentConfig(
+    thinking_config=types.ThinkingConfig(thinking_budget=0)
+)
 CACHE_DIR = Path(__file__).resolve().parents[1] / ".cache"
 
 
-def _get_gemini_model():
-    """
-    Lazily configure Gemini and return a GenerativeModel, or None if no key.
-    """
-    global _gemini_model, _gemini_configured
-    api_key = os.getenv("GeminiApiKey")
-    if not api_key:
+def _load_gemini_keys() -> list[str]:
+    raw_keys = os.getenv("GeminiApiKeys", "").strip()
+    if not raw_keys:
+        return []
+
+    parsed = None
+    try:
+        parsed = json.loads(raw_keys)
+    except json.JSONDecodeError:
+        parsed = None
+
+    candidates: list[str]
+    if isinstance(parsed, list):
+        candidates = [str(item).strip() for item in parsed if str(item).strip()]
+    elif isinstance(parsed, str):
+        candidates = [parsed.strip()] if parsed.strip() else []
+    else:
+        candidates = [frag.strip() for frag in raw_keys.split(",") if frag.strip()]
+
+    seen = set()
+    deduped: list[str] = []
+    for key in candidates:
+        if key and key not in seen:
+            deduped.append(key)
+            seen.add(key)
+    return deduped
+
+
+def _get_gemini_client():
+    """Return an initialized Gemini client using the primary configured key."""
+
+    global _GEMINI_CLIENT, _GEMINI_CLIENT_KEY
+
+    keys = _load_gemini_keys()
+    primary = keys[0] if keys else None
+    if not primary:
         return None
-    if not _gemini_configured:
-        try:
-            genai.configure(api_key=api_key)
-            _gemini_configured = True
-        except Exception:
-            return None
-    if _gemini_model is None:
-        _gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-    return _gemini_model
+
+    if _GEMINI_CLIENT and _GEMINI_CLIENT_KEY == primary:
+        return _GEMINI_CLIENT
+
+    try:
+        _GEMINI_CLIENT = genai.Client(api_key=primary)
+        _GEMINI_CLIENT_KEY = primary
+        return _GEMINI_CLIENT
+    except Exception:
+        _GEMINI_CLIENT = None
+        _GEMINI_CLIENT_KEY = None
+        return None
 
 
 def _us_date_str(date_obj) -> str:
@@ -399,8 +436,8 @@ async def summarize_usccb_readings(readings, date=None) -> Optional[dict]:
     if isinstance(cached, dict):
         return cached
 
-    model = _get_gemini_model()
-    if model is None:
+    client = _get_gemini_client()
+    if client is None:
         return None
     prompt = (
         "Summarize the following daily readings and provide a motivational quote with a link embed. "
@@ -409,7 +446,12 @@ async def summarize_usccb_readings(readings, date=None) -> Optional[dict]:
         f"Readings:\n\n{readings}"
     )
     try:
-        resp = model.generate_content(prompt)
+        resp = await asyncio.to_thread(
+            client.models.generate_content,
+            model=_GEMINI_MODEL_NAME,
+            contents=prompt,
+            config=_GEMINI_GENERATION_CONFIG,
+        )
         text = resp.text or ""
         text = _strip_code_fences(text)
         data = json.loads(text)
