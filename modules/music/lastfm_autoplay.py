@@ -109,8 +109,29 @@ def _install_print_logger(logger: logging.Logger) -> None:
             if LOG_LEVEL < threshold:
                 return
             try:
-                msg = args[0] if args else ""
-                print(f"[AUTO][{method_name.upper()}] {msg}")
+                message = ""
+                if args:
+                    fmt = args[0]
+                    if len(args) > 1:
+                        try:
+                            message = str(fmt) % args[1:]
+                        except Exception:
+                            message = " ".join(str(a) for a in args)
+                    else:
+                        message = str(fmt)
+                else:
+                    message = str(kwargs.get("msg", ""))
+
+                if kwargs.get("exc_info"):
+                    exc = kwargs.get("exc_info")
+                    if isinstance(exc, tuple):
+                        import traceback
+
+                        message = (
+                            f"{message}\n{''.join(traceback.format_exception(*exc))}"
+                        )
+
+                print(f"[AUTO][{method_name.upper()}] {message}")
             except Exception:
                 pass
 
@@ -636,13 +657,23 @@ class LastFMAutoplay:
         self, guild_id: int, outcome: str, magnitude: float
     ) -> None:
         state = self._get_exploration_state(guild_id)
-        epsilon = float(state.get("epsilon", EPSILON_BASE))
+        previous_epsilon = float(state.get("epsilon", EPSILON_BASE))
+        epsilon = previous_epsilon
         if outcome in ("hard_skip", "medium_skip", "late_skip"):
             epsilon = min(EPSILON_MAX, epsilon + EPSILON_DELTA_SKIP * magnitude)
         elif outcome == "finish":
             epsilon = max(EPSILON_MIN, epsilon - EPSILON_DELTA_FINISH * magnitude)
         state["epsilon"] = round(epsilon, 5)
         state["events"].append((self._now(), outcome, magnitude))
+        if LOG_LEVEL >= 2 and abs(epsilon - previous_epsilon) >= 1e-4:
+            LOG.debug(
+                "[Explore] Epsilon updated via %s (guild=%s, magnitude=%.2f, %.3f → %.3f)",
+                outcome,
+                guild_id,
+                magnitude,
+                previous_epsilon,
+                epsilon,
+            )
 
     @staticmethod
     def _decayed_multiplier(entry: Dict[str, Any], now: float) -> float:
@@ -1955,6 +1986,7 @@ class LastFMAutoplay:
     ) -> List[Dict[str, Any]]:
         pool: List[Dict[str, Any]] = []
         seen: set[str] = set()
+        source_counts: Counter[str] = Counter()
 
         similar_tracks = await self._get_similar_tracks(
             artist, title, limit=CANDIDATE_POOL_TARGET
@@ -1964,15 +1996,17 @@ class LastFMAutoplay:
             if isinstance(candidate_artist, dict):
                 candidate_artist = candidate_artist.get("name", "")
             candidate_title = track.get("name") or track.get("title") or ""
+            source = track.get("source", "similar")
             candidate = self._make_candidate_entry(
                 guild_id,
                 candidate_artist,
                 candidate_title,
-                track.get("source", "similar"),
+                source,
             )
             if candidate and candidate["track_key"] not in seen:
                 seen.add(candidate["track_key"])
                 pool.append(candidate)
+                source_counts[source] += 1
 
         if len(pool) < CANDIDATE_POOL_TARGET:
             top_tracks = await self._get_artist_top_tracks(
@@ -1983,15 +2017,17 @@ class LastFMAutoplay:
                 if isinstance(candidate_artist, dict):
                     candidate_artist = candidate_artist.get("name", "")
                 candidate_title = track.get("name") or track.get("title") or ""
+                source = track.get("source", "artist-top")
                 candidate = self._make_candidate_entry(
                     guild_id,
                     candidate_artist,
                     candidate_title,
-                    track.get("source", "artist-top"),
+                    source,
                 )
                 if candidate and candidate["track_key"] not in seen:
                     seen.add(candidate["track_key"])
                     pool.append(candidate)
+                    source_counts[source] += 1
 
         if len(pool) < CANDIDATE_POOL_TARGET:
             fallback_tracks = await self._get_fallback_recommendations(
@@ -2002,15 +2038,17 @@ class LastFMAutoplay:
                 if isinstance(candidate_artist, dict):
                     candidate_artist = candidate_artist.get("name", "")
                 candidate_title = track.get("name") or track.get("title") or ""
+                source = track.get("source", "fallback")
                 candidate = self._make_candidate_entry(
                     guild_id,
                     candidate_artist,
                     candidate_title,
-                    track.get("source", "fallback"),
+                    source,
                 )
                 if candidate and candidate["track_key"] not in seen:
                     seen.add(candidate["track_key"])
                     pool.append(candidate)
+                    source_counts[source] += 1
 
         if len(pool) < CANDIDATE_POOL_TARGET and seed_tags:
             for tag in seed_tags[:3]:
@@ -2025,22 +2063,42 @@ class LastFMAutoplay:
                         or track.get("title")
                         or ""
                     )
+                    source = track.get("source", "tag")
                     candidate = self._make_candidate_entry(
                         guild_id,
                         candidate_artist,
                         candidate_title,
-                        track.get("source", "tag"),
+                        source,
                     )
                     if candidate and candidate["track_key"] not in seen:
                         seen.add(candidate["track_key"])
                         pool.append(candidate)
+                        source_counts[source] += 1
                     if len(pool) >= CANDIDATE_POOL_TARGET:
                         break
                 if len(pool) >= CANDIDATE_POOL_TARGET:
                     break
 
+        label_map = {
+            "similar": "Similar",
+            "artist-top": "ArtistTop",
+            "fallback": "Fallback",
+            "tag": "Tag",
+        }
+        source_summary = ", ".join(
+            f"{label_map.get(source, source)}: {count}"
+            for source, count in source_counts.most_common()
+        )
+        tag_summary = "none"
+        if seed_tags:
+            tag_summary = f"{len(seed_tags)} → {', '.join(seed_tags)}"
+
         LOG.info(
-            f"Built candidate pool: {len(pool)} tracks (seed artist '{artist}', seed tags: {seed_tags or []})"
+            "Built candidate pool: %s tracks (Seed Factors → Artist Seed: %s | Tag Seeds: %s | Source breakdown: %s)",
+            len(pool),
+            artist or "unknown",
+            tag_summary,
+            source_summary or "none",
         )
         return pool
 
@@ -2084,6 +2142,23 @@ class LastFMAutoplay:
                     + 0.02 * (dominant_count / max(len(recent_tags), 1)),
                 )
         metadata_map: Dict[str, Dict[str, Any]] = {}
+
+        explore_state = self._get_exploration_state(guild_id)
+        epsilon_baseline = float(explore_state.get("epsilon", EPSILON_BASE))
+        epsilon_rate = epsilon_baseline
+        if diversity_pressure > 0.0:
+            epsilon_rate = min(EPSILON_MAX, epsilon_rate + diversity_pressure)
+
+        enrichment_cutoff = min(len(candidate_pool), ENRICH_TOP_N)
+        LOG.debug(
+            "[Ranking] Reducing candidate size: start=%s → enrichment_top=%s (epsilon=%.3f → %.3f, diversity_boost=%.3f, dominant_tag=%s)",
+            len(candidate_pool),
+            enrichment_cutoff,
+            epsilon_baseline,
+            epsilon_rate,
+            diversity_pressure,
+            dominant_tag or "none",
+        )
 
         # Phase 1: Collect all tracks that need Gemini enrichment
         top_for_enrichment = candidate_pool[:ENRICH_TOP_N]
@@ -2314,10 +2389,7 @@ class LastFMAutoplay:
         scored_candidates: List[Dict[str, Any]] = []
         now_ts = time.time()
 
-        explore_state = self._get_exploration_state(guild_id)
-        epsilon_rate = float(explore_state.get("epsilon", EPSILON_BASE))
         if diversity_pressure > 0.0:
-            epsilon_rate = min(EPSILON_MAX, epsilon_rate + diversity_pressure)
             now_mark = self._now()
             last_notice = float(explore_state.get("last_diversity_notice", 0.0))
             if LOG_LEVEL >= 2 and (now_mark - last_notice) > 20.0:
@@ -2447,14 +2519,22 @@ class LastFMAutoplay:
                 }
             )
 
-        if LOG_LEVEL >= 2 and scored_candidates:
-            debug_preview = [
-                (c["artist"], c["track"], round(c["score"], 3))
-                for c in scored_candidates[:10]
-            ]
-            LOG.debug(f"Candidate scores preview: {debug_preview}")
-
         scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        if LOG_LEVEL >= 2 and scored_candidates:
+            preview_limit = min(10, len(scored_candidates))
+            top_preview = [
+                (c["artist"], c["track"], round(c["score"], 3))
+                for c in scored_candidates[:preview_limit]
+            ]
+            LOG.debug(
+                "[Ranking] Finding Top K candidates: target=%s (resolve_k=%s, epsilon=%.3f, diversity_boost=%.3f) | preview=%s",
+                min(limit, RESOLVE_TOP_K),
+                RESOLVE_TOP_K,
+                epsilon_rate,
+                diversity_pressure,
+                top_preview,
+            )
 
         resolved: List[Tuple[str, Any]] = []
         for candidate in scored_candidates:
