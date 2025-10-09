@@ -167,26 +167,26 @@ class ControlCommands(commands.Cog):
         await ctx.send(":wave: Disconnected from voice channel.")
 
     @commands.hybrid_command(
-        name="volume", aliases=["vol"], description="Set playback volume ."
+        name="volume", aliases=["vol"], description="Set playback volume (0-200)."
     )
-    async def volume(self, ctx: commands.Context, value: int):
+    async def volume(self, ctx: commands.Context, value: int = None):
         """Set volume with voting system. Range: 0-200"""
         player = self._get_player()
         if not player:
             await ctx.send(":x: Player backend not available.")
             return
-        if value is None:
-            await ctx.send(
-                f":speaker: Current volume is {ctx.guild.voice_client.volume}%"
-            )
-
-        if value < 0 or value > 200:
-            await ctx.send(":x: Volume must be between 0 and 200.")
-            return
 
         vc = ctx.guild.voice_client
         if not vc:
             await ctx.send(":x: Not connected to voice channel.")
+            return
+
+        if value is None:
+            await ctx.send(f":speaker: Current volume is {vc.volume}%")
+            return
+
+        if value < 0 or value > 200:
+            await ctx.send(":x: Volume must be between 0 and 200.")
             return
 
         if not ctx.author.voice or ctx.author.voice.channel.id != vc.channel.id:
