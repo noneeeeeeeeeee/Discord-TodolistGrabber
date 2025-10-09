@@ -49,7 +49,7 @@ Key signals used: Last.fm tags/similar tracks, cached metadata, skip/finish even
 - `artist_play_counts[guild_id]`: sliding counts over last `R=12` resolved tracks.
 - `grounding_counter_day`: persisted integer, reset daily.
 - Tunable params (starting values):
-  `M=60` (pool), `N=16` (enrich), `K=6` (resolve), `artist_repeat_limit=3`, `artist_cooldown_cycles=3`, `skip_threshold=0.8`, `finish_threshold=0.9`, `epsilon_explore=0.08`.
+  `M=60` (pool), `N=16` (enrich), `K=6` (resolve), `artist_repeat_limit=3`, `artist_cooldown_cycles=3`, `skip_threshold=0.8`, `finish_threshold=0.9`, `epsilon_base=0.08` _(auto-adjusted between 0.02–0.28 from skip/finish feedback)._
 
 ---
 
@@ -93,17 +93,18 @@ Sort by raw tag/artist overlap; pick **top N = 16**:
 
 Compute normalized components:
 
-- `content_sim` (tag/embedding) — weight **0.45**
-- `artist_affinity` — **0.18**
-- `session_coherence` (session top tags) — **0.12**
+- `content_sim` (tag/embedding) — weight **0.45** (scaled by recent tag feedback multipliers)
+- `artist_affinity` — **0.18** (scaled by session feedback + optional +0.10 additive for recent finishes)
+- `session_coherence` (session top tags) — **0.12** (tag multipliers applied)
 - `quality_score` — **0.15**
-- `novelty_bonus` (epsilon-driven) — **0.10**
+- `novelty_bonus` (epsilon-driven) — **0.10** (`ε` widens/narrows dynamically with skip vs. finish rate)
 
 Apply dynamic modifiers:
 
-- **Skip penalty**: if same track or artist skipped previously in session, multiply `final_score` by `0.25–0.6` (strong negative).
-- **Finish boost**: if similar tags finished recently (>= 90%), boost by `1.15–1.3` for a decaying window.
-- **Artist saturation penalty**: if an artist appears more than `artist_repeat_limit` times in last `R` tracks, apply a heavy penalty (e.g., -0.5) until cooldown.
+- **Immediate candidate multipliers**: 0.20 for hard skips (<20%), 0.50 for medium skips (20–80%), 0.85 for late skips (80–90%), ≥1.20 (scaled up to 1.35) for finishes (≥90%).
+- **Session feedback**: tag weights ×0.25/0.60/1.20 and artist affinity ×0.35/0.60/1.10 (+0.10 additive) for hard skip, medium skip, and finish respectively, decaying exponentially over the next 10–20 recommendations.
+- **Uploader preference**: canonical channels (Official Artist Channel, VEVO, Topics) and high-engagement uploads receive an extra resolver boost to avoid low-quality reuploads.
+- **Artist saturation penalty**: if an artist appears more than `artist_repeat_limit` times in last `R` tracks, subtract 0.5 and engage cooldown cycles.
 
 **Why:** skip/finish signals are powerful predictors of preference — use them as primary feedback. ([Soundcharts][2])
 
@@ -154,15 +155,27 @@ Actions (priority order):
 
 ### 9. Immediate feedback loop (skip / finish)
 
-On user action:
+On every playback outcome compute `progress_ratio = time_played / duration` and apply the exact policy below:
 
-- Compute `progress_ratio = time_played / duration`.
-- If `progress_ratio < 0.2`: hard skip → strong downweight tags for 24 hours.
-- If `0.2 <= progress_ratio < 0.8`: medium penalty.
-- If `progress_ratio >= 0.9`: finish → boost tags/artist affinity for short-lived window.
-- Record event for metrics and tuning.
+| Progress band | Outcome label | Immediate candidate multiplier       | Tag weight update                | Artist affinity update                            |
+| ------------- | ------------- | ------------------------------------ | -------------------------------- | ------------------------------------------------- |
+| `< 20%`       | Hard skip     | × **0.20** for upcoming enqueue      | ×0.25 for ~24 h (decay 0.92/rec) | ×0.35 for ~24 h (decay 0.90/rec)                  |
+| `20–80%`      | Medium skip   | × **0.50**                           | ×0.60 for ~12 h (decay 0.94/rec) | ×0.60 for ~12 h (decay 0.93/rec)                  |
+| `80–90%`      | Late skip     | × **0.85**                           | —                                | —                                                 |
+| `≥ 90%`       | Finish        | ≥ ×**1.20** (scaled to 1.35 at 100%) | ×1.20 for ~12 h (decay 0.94/rec) | ×1.10 multiplier **+0.10** additive bump (decays) |
 
-**Note:** Using 80% for skip decision and 90% for finish aligns with common industry heuristics. ([Soundcharts][2])
+- **Dynamic exploration**: `ε` increases by +0.018 per skip (bounded to 0.28) and shrinks by −0.012×progress per finish (bounded to 0.02), tightening or widening novelty based on satisfaction.
+- **Session personalization**: per-guild, in-memory preference vectors record tag/artist boosts (decay 0.96/day) and contribute ±0.6 multipliers while the current session leans toward those sounds.
+- **Metrics-first**: every feedback event is appended to `feedback_events` for offline tuning, grid-searching multipliers, and verifying engagement trends.
+
+**Why:** Early abandonment is a high-confidence negative, while deep completion is a strong positive — values mirror common streaming heuristics.
+
+### 10. Offline tuning checklist
+
+- Export `feedback_events` + recommendation snapshots to CSV for grid-search experiments on weights/decays.
+- Plot dynamic epsilon versus rolling skip rate to confirm responsiveness.
+- Experiment with opt-in, DJ-weighted tweaks (e.g., give the requesting DJ a small bias) while keeping the baseline preference vectors guild-wide.
+- Audit resolver engagement metrics (views/likes) to refine canonical channel boosts.
 
 ---
 
@@ -208,6 +221,6 @@ if LOG_LEVEL >= 1 and escape_hatch_triggered:
 - Session aggregates: `skip_rate`, `avg_listen_duration`, `escape_hatch_count`.
 - Operational: `grounding_calls_used_today`, `failed_resolves_count`.
 
-Use metrics to tune `artist_repeat_limit`, `skip penalties`, `epsilon_explore`, and grounding policies.
+Use metrics to tune `artist_repeat_limit`, `skip penalties`, `epsilon_base` ranges, and grounding policies.
 
 ---

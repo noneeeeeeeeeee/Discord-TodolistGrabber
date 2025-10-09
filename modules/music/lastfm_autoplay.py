@@ -16,32 +16,73 @@ from google.genai import types
 
 LOG = logging.getLogger(__name__)
 
+# _____     _       _____ _
+# |  _  |_ _| |_ ___|  _  | |___ _ _
+# |     | | |  _| . |   __| | .'| | |
+# |__|__|___|_| |___|__|  |_|__,|_  |
+#                              |___|
+# This module implements Last.fm-based autoplay recommendations with Gemini AI parsing.
 
-LOG_LEVEL = 2  # 0=ERROR, 1=INFO, 2=DEBUG (Higher number more verbose)
-SESSION_HISTORY_LIMIT = 50
+
+LOG_LEVEL = 2  # 0=ERROR, 1=INFO, 2=DEBUG, 3=All (Higher number more verbose)
+SESSION_HISTORY_LIMIT = 50  # How many recent tracks to remember in a single session (if you change this value, you may need to change the other numbers to fit with it)
 RECENT_TRACK_WINDOW_SECONDS = 90 * 60  # 90 minutes
 FAILED_TRACK_COOLDOWN_SECONDS = 30 * 60  # 30 minutes
 GROUNDING_DAILY_LIMIT = 500  # 500 requests per day
 CACHE_FLUSH_INTERVAL_SECONDS = 120  # Flush caches at most every 2 minutes
 METRICS_HISTORY_LIMIT = 200  # Retain recent recommendation metrics
 ESCAPE_REASON_HISTORY_LIMIT = 16
+DJ_LISTENER_BIAS = (
+    False  # If True, DJs have more influence on autoplay than listeners (1.25x weight)
+)
 
 # Recommendation tuning
-CACHE_MAX_AGE = 60 * 60 * 24 * 15  # 15 days TTL for Last.fm->YouTube cache
+CACHE_MAX_AGE = 60 * 60 * 24 * 15  # 15 days TTL for Last.fm->YouTube cache mappings
 METADATA_CACHE_MAX_AGE = 60 * 60 * 24 * 90  # 90 days TTL for metadata
 DURATION_TOLERANCE_SECONDS = 5  # +/- 5 seconds tolerance
 DURATION_TOLERANCE_PERCENT = 0.12  # +/- 12% duration tolerance
 CANDIDATE_POOL_TARGET = 60  # Aim for ~60 candidates before filtering
 ENRICH_TOP_N = 16  # How many top Last.fm tags to fetch and use for Gemini enrichment
 RESOLVE_TOP_K = 6  # How many top YouTube search results to consider for matching
-ARTIST_REPEAT_LIMIT = 3  # Max times the same artist can appear in session history
+ARTIST_REPEAT_LIMIT = 5  # Max times the same artist can appear in session history
 ARTIST_COOLDOWN_CYCLES = 3  # How many tracks before an artist can reappear
-SKIP_THRESHOLD = 0.8  # Similarity threshold to skip a candidate
-FINISH_THRESHOLD = 0.9  # Similarity threshold to finish a candidate
-EPSILON_EXPLORE = 0.08  # Exploration factor for candidate selection
+SKIP_EARLY_THRESHOLD = 0.2  # Listen progress considered an immediate skip
+SKIP_THRESHOLD = 0.8  # Progress threshold treated as a skip event
+FINISH_THRESHOLD = 0.9  # Progress threshold considered a full completion
+
+# Diversity Factor (higher = more diverse, lower = more similar). This is what recommends new tracks to you.
+EPSILON_BASE = 0.08  # Default exploration factor
+EPSILON_MIN = 0.02  # Minimum exploration factor
+EPSILON_MAX = 0.28  # Maximum exploration factor
+EPSILON_DELTA_SKIP = 0.018
+EPSILON_DELTA_FINISH = 0.012
+
+CANDIDATE_MULTIPLIERS = {
+    "hard_skip": 0.20,
+    "medium_skip": 0.50,
+    "late_skip": 0.85,
+    "finish": 1.20,
+}
+
+SESSION_TAG_MULTIPLIERS = {
+    "hard_skip": (0.25, 24 * 3600, 0.92),
+    "medium_skip": (0.60, 12 * 3600, 0.94),
+    "finish": (1.20, 12 * 3600, 0.94),
+}
+
+SESSION_ARTIST_MULTIPLIERS = {
+    "hard_skip": (0.35, 24 * 3600, 0.90, 0.0),
+    "medium_skip": (0.60, 12 * 3600, 0.93, 0.0),
+    "finish": (1.10, 12 * 3600, 0.94, 0.10),
+}
+
+GUILD_PREFERENCE_DECAY = 0.96  # decay per day for guild-level preferences
 
 # Gemini configuration
 GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_BATCH_MAX = 25
+GEMINI_BATCH_DELAY_SECONDS = 1
+GEMINI_BATCH_TIMEOUT_SECONDS = 15.0
 
 
 def _install_print_logger(logger: logging.Logger) -> None:
@@ -244,6 +285,16 @@ BAD_TITLE_KEYWORDS = (
     "Studio Vocals",
 )
 
+CANONICAL_CHANNEL_HINTS = (
+    "official artist channel",
+    "vevo",
+    "topic",
+    "official",
+    "records",
+    "music",
+    "label",
+)
+
 # Last.fm API Configuration
 LASTFM_API_BASE = "http://ws.audioscrobbler.com/2.0/"
 LASTFM_API_KEY_ENV = "LASTFM_API_KEY"
@@ -299,6 +350,15 @@ class LastFMAutoplay:
             "grounding_calls_today": 0,
         }
         self._gemini_retry_after = 0.0
+        self._gemini_batch_queue: List[Dict[str, Any]] = []
+        self._gemini_batch_lock = asyncio.Lock()
+        self._gemini_batch_task: Optional[asyncio.Task] = None
+        self._candidate_feedback: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        self._tag_feedback: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}
+        self._artist_feedback: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}
+        self._explore_state: Dict[int, Dict[str, Any]] = {}
+        self._guild_skip_stats: Dict[int, Dict[str, float]] = {}
+        self._guild_preferences: Dict[int, Dict[str, Any]] = {}
 
         # Initialize Last.fm API
         self._init_lastfm_client()
@@ -544,6 +604,375 @@ class LastFMAutoplay:
             "count", 0
         )
 
+    # --- Feedback helpers -------------------------------------------------
+
+    def _now(self) -> float:
+        return time.time()
+
+    def _get_exploration_state(self, guild_id: int) -> Dict[str, Any]:
+        state = self._explore_state.setdefault(
+            guild_id,
+            {
+                "epsilon": EPSILON_BASE,
+                "events": deque(maxlen=METRICS_HISTORY_LIMIT),
+                "last_updated": self._now(),
+            },
+        )
+        state["last_updated"] = self._now()
+        return state
+
+    def _get_exploration_rate(self, guild_id: int) -> float:
+        state = self._get_exploration_state(guild_id)
+        return float(state.get("epsilon", EPSILON_BASE))
+
+    def _adjust_exploration_rate(
+        self, guild_id: int, outcome: str, magnitude: float
+    ) -> None:
+        state = self._get_exploration_state(guild_id)
+        epsilon = float(state.get("epsilon", EPSILON_BASE))
+        if outcome in ("hard_skip", "medium_skip", "late_skip"):
+            epsilon = min(EPSILON_MAX, epsilon + EPSILON_DELTA_SKIP * magnitude)
+        elif outcome == "finish":
+            epsilon = max(EPSILON_MIN, epsilon - EPSILON_DELTA_FINISH * magnitude)
+        state["epsilon"] = round(epsilon, 5)
+        state["events"].append((self._now(), outcome, magnitude))
+
+    @staticmethod
+    def _decayed_multiplier(entry: Dict[str, Any], now: float) -> float:
+        multiplier = float(entry.get("multiplier", 1.0))
+        applied_at = float(entry.get("applied_at", now))
+        duration = float(entry.get("duration", 0.0))
+        decay_rate = float(entry.get("decay_rate", 1.0))
+        if multiplier == 1.0:
+            return 1.0
+        elapsed = max(0.0, now - applied_at)
+        if duration and elapsed >= duration:
+            return 1.0
+        # convert elapsed seconds into pseudo steps (~per recommendation)
+        steps = elapsed / 60.0
+        influence = multiplier - 1.0
+        decayed = 1.0 + influence * (decay_rate**steps)
+        return max(0.1, min(2.5, decayed))
+
+    def _register_candidate_feedback(
+        self, guild_id: int, track_key: str, multiplier: float, ttl: float = 3600.0
+    ) -> None:
+        bucket = self._candidate_feedback.setdefault(guild_id, {})
+        bucket[track_key] = {
+            "multiplier": float(multiplier),
+            "expires_at": self._now() + ttl,
+        }
+
+    def _get_candidate_feedback_multiplier(
+        self, guild_id: int, track_key: str
+    ) -> float:
+        bucket = self._candidate_feedback.get(guild_id)
+        if not bucket:
+            return 1.0
+        now = self._now()
+        entry = bucket.get(track_key)
+        if not entry:
+            return 1.0
+        if entry.get("expires_at", 0.0) < now:
+            bucket.pop(track_key, None)
+            return 1.0
+        return float(entry.get("multiplier", 1.0))
+
+    def _register_tag_feedback(
+        self,
+        guild_id: int,
+        tags: List[str],
+        multiplier: float,
+        duration: float,
+        decay: float,
+    ) -> None:
+        if not tags:
+            return
+        bucket = self._tag_feedback.setdefault(guild_id, {})
+        now = self._now()
+        for raw_tag in tags:
+            tag = self._normalize_tag(raw_tag)
+            entries = bucket.setdefault(tag, [])
+            entries.append(
+                {
+                    "multiplier": float(multiplier),
+                    "applied_at": now,
+                    "duration": duration,
+                    "decay_rate": decay,
+                }
+            )
+
+    def _get_tag_feedback_multiplier(self, guild_id: int, tags: List[str]) -> float:
+        if not tags:
+            return 1.0
+        bucket = self._tag_feedback.get(guild_id)
+        if not bucket:
+            return 1.0
+        now = self._now()
+        result = 1.0
+        for raw_tag in tags:
+            tag = self._normalize_tag(raw_tag)
+            entries = bucket.get(tag)
+            if not entries:
+                continue
+            keep: List[Dict[str, Any]] = []
+            tag_multiplier = 1.0
+            for entry in entries:
+                effective = self._decayed_multiplier(entry, now)
+                if (
+                    entry.get("duration")
+                    and (now - entry.get("applied_at", now)) >= entry["duration"]
+                ):
+                    continue
+                if abs(effective - 1.0) > 0.02:
+                    keep.append(entry)
+                tag_multiplier *= effective
+            if keep:
+                bucket[tag] = keep
+            else:
+                bucket.pop(tag, None)
+            result *= tag_multiplier
+        return max(0.1, min(4.0, result))
+
+    def _register_artist_feedback(
+        self,
+        guild_id: int,
+        artist_norm: str,
+        multiplier: float,
+        duration: float,
+        decay: float,
+        additive: float = 0.0,
+    ) -> None:
+        if not artist_norm:
+            return
+        bucket = self._artist_feedback.setdefault(guild_id, {})
+        entries = bucket.setdefault(artist_norm, [])
+        entries.append(
+            {
+                "multiplier": float(multiplier),
+                "applied_at": self._now(),
+                "duration": duration,
+                "decay_rate": decay,
+                "additive": float(additive),
+            }
+        )
+
+    def _get_artist_feedback_adjustments(
+        self, guild_id: int, artist_norm: str
+    ) -> Tuple[float, float]:
+        bucket = self._artist_feedback.get(guild_id)
+        if not bucket or not artist_norm:
+            return 1.0, 0.0
+        entries = bucket.get(artist_norm)
+        if not entries:
+            return 1.0, 0.0
+        now = self._now()
+        multiplier = 1.0
+        additive = 0.0
+        keep: List[Dict[str, Any]] = []
+        for entry in entries:
+            effective = self._decayed_multiplier(entry, now)
+            additive_component = float(entry.get("additive", 0.0))
+            elapsed = now - entry.get("applied_at", now)
+            if entry.get("duration") and elapsed >= entry["duration"]:
+                continue
+            if abs(effective - 1.0) > 0.02 or abs(additive_component) > 1e-3:
+                keep.append(entry)
+                multiplier *= effective
+                additive += additive_component * (
+                    entry.get("decay_rate", 1.0) ** (elapsed / 60.0)
+                )
+        if keep:
+            bucket[artist_norm] = keep
+        else:
+            bucket.pop(artist_norm, None)
+        return max(0.1, min(3.0, multiplier)), max(-0.5, min(0.5, additive))
+
+    def _decay_guild_preferences(self, prefs: Dict[str, Any]) -> None:
+        now = self._now()
+        last = float(prefs.get("last_updated", now))
+        if now <= last:
+            return
+        elapsed_days = (now - last) / 86400.0
+        decay_factor = GUILD_PREFERENCE_DECAY ** max(0.0, elapsed_days)
+        for key in ("tags", "artists"):
+            store = prefs.setdefault(key, {})
+            for item in list(store.keys()):
+                store[item] *= decay_factor
+                if abs(store[item]) < 0.05:
+                    store.pop(item, None)
+        prefs["last_updated"] = now
+
+    def _update_guild_preferences(
+        self,
+        guild_id: int,
+        tags: List[str],
+        artist_norm: str,
+        signal: float,
+        *,
+        primary_listener_bias: bool = DJ_LISTENER_BIAS,
+    ) -> None:
+        if not guild_id or not tags and not artist_norm:
+            return
+        prefs = self._guild_preferences.setdefault(
+            guild_id,
+            {"tags": {}, "artists": {}, "last_updated": self._now()},
+        )
+        self._decay_guild_preferences(prefs)
+        weight = 1.25 if primary_listener_bias else 1.0
+        adjusted_signal = signal * weight
+        for raw_tag in tags[:5]:
+            tag = self._normalize_tag(raw_tag)
+            prefs.setdefault("tags", {})[tag] = (
+                prefs["tags"].get(tag, 0.0) + adjusted_signal
+            )
+        if artist_norm:
+            prefs.setdefault("artists", {})[artist_norm] = (
+                prefs["artists"].get(artist_norm, 0.0) + adjusted_signal
+            )
+        prefs["last_updated"] = self._now()
+
+    def _get_guild_preference_multiplier(
+        self, guild_id: int, tags: List[str], artist_norm: str
+    ) -> float:
+        prefs = self._guild_preferences.get(guild_id)
+        if not prefs:
+            return 1.0
+        now = self._now()
+        total = 0.0
+        count = 0
+        self._decay_guild_preferences(prefs)
+        for raw_tag in tags[:5]:
+            tag = self._normalize_tag(raw_tag)
+            if tag in prefs.get("tags", {}):
+                total += prefs["tags"][tag]
+                count += 1
+        if artist_norm and artist_norm in prefs.get("artists", {}):
+            total += prefs["artists"][artist_norm]
+            count += 1
+        if count == 0:
+            return 1.0
+        avg = total / count
+        multiplier = 1.0 + max(-0.4, min(0.4, avg * 0.03))
+        return max(0.5, min(1.6, multiplier))
+
+    def _record_feedback_metric(
+        self,
+        guild_id: int,
+        track_key: str,
+        outcome: str,
+        progress_ratio: float,
+        user_id: Optional[int] = None,
+    ) -> None:
+        bucket = self._metrics_bucket(guild_id)
+        feedback_history: Deque[Dict[str, Any]] = bucket.setdefault(
+            "feedback_events", deque(maxlen=METRICS_HISTORY_LIMIT)
+        )
+        feedback_history.append(
+            {
+                "timestamp": self._now(),
+                "track_key": track_key,
+                "outcome": outcome,
+                "progress": progress_ratio,
+                "user_id": user_id,
+            }
+        )
+
+    async def record_playback_feedback(
+        self,
+        guild_id: int,
+        artist: str,
+        track: str,
+        progress_ratio: float,
+        *,
+        duration_ms: Optional[int] = None,
+        primary_listener_bias: bool = DJ_LISTENER_BIAS,
+    ) -> None:
+        if not guild_id or not artist or not track:
+            return
+
+        ratio = max(0.0, min(1.0, progress_ratio))
+        if ratio < SKIP_EARLY_THRESHOLD:
+            outcome = "hard_skip"
+        elif ratio < SKIP_THRESHOLD:
+            outcome = "medium_skip"
+        elif ratio < FINISH_THRESHOLD:
+            outcome = "late_skip"
+        else:
+            outcome = "finish"
+
+        track_key = self._make_track_key(artist, track)
+        artist_norm = self._normalize_artist_for_diversity(artist)
+
+        metadata: Optional[Dict[str, Any]] = None
+        async with self._metadata_lock:
+            metadata = self._metadata_cache.get(track_key)
+        if not metadata:
+            try:
+                metadata = await self._get_track_profile(
+                    artist, track, require_enrichment=False
+                )
+            except Exception as exc:
+                LOG.debug(
+                    f"⚠️ [Autoplay] Unable to refresh metadata for feedback ({artist} - {track}): {exc}"
+                )
+                metadata = None
+
+        tags: List[str] = []
+        if metadata:
+            raw_tags = metadata.get("tags", []) or []
+            tags = [
+                self._normalize_tag(str(tag))
+                for tag in raw_tags
+                if isinstance(tag, str)
+            ]
+
+        candidate_multiplier = CANDIDATE_MULTIPLIERS.get(outcome, 1.0)
+        if outcome == "finish":
+            extra = max(0.0, ratio - FINISH_THRESHOLD) / max(
+                0.001, 1.0 - FINISH_THRESHOLD
+            )
+            candidate_multiplier *= 1.0 + (extra * 0.25)
+
+        self._register_candidate_feedback(guild_id, track_key, candidate_multiplier)
+
+        if outcome in ("hard_skip", "medium_skip", "finish") and tags:
+            tag_multiplier, duration, decay = SESSION_TAG_MULTIPLIERS[outcome]
+            self._register_tag_feedback(guild_id, tags, tag_multiplier, duration, decay)
+
+        if outcome in ("hard_skip", "medium_skip", "finish"):
+            multiplier, duration, decay, additive = SESSION_ARTIST_MULTIPLIERS[outcome]
+            self._register_artist_feedback(
+                guild_id, artist_norm, multiplier, duration, decay, additive
+            )
+
+        signal_map = {
+            "hard_skip": -1.25,
+            "medium_skip": -0.9,
+            "late_skip": -0.4,
+            "finish": 1.0 + ratio * 0.5,
+        }
+        self._update_guild_preferences(
+            guild_id,
+            tags,
+            artist_norm,
+            signal_map.get(outcome, 0.0),
+            primary_listener_bias=primary_listener_bias,
+        )
+
+        stats = self._guild_skip_stats.setdefault(
+            guild_id, {"events": deque(maxlen=200)}
+        )
+        stats["events"].append((self._now(), outcome, ratio))
+        self._adjust_exploration_rate(guild_id, outcome, max(0.3, ratio))
+
+        self._record_feedback_metric(guild_id, track_key, outcome, ratio)
+
+        if LOG_LEVEL >= 2:
+            LOG.debug(
+                f"🎯 [Feedback] {outcome} → {artist} - {track} (ratio={ratio:.2f}, multiplier={candidate_multiplier:.2f})"
+            )
+
     def _enter_gemini_cooldown(
         self, retry_seconds: float, reason: str, key: Optional[str] = None
     ) -> None:
@@ -668,6 +1097,38 @@ class LastFMAutoplay:
                 return data
         return None
 
+    def _parse_gemini_json_any(self, response: Any) -> Optional[Any]:
+        """Extract the first valid JSON payload (dict or list) from a Gemini response."""
+
+        for candidate_text in self._collect_gemini_texts(response):
+            if not isinstance(candidate_text, str):
+                continue
+            cleaned = self._strip_code_fence(candidate_text)
+            if not cleaned:
+                continue
+            try:
+                return json.loads(cleaned)
+            except json.JSONDecodeError:
+                object_start = cleaned.find("{")
+                object_end = cleaned.rfind("}")
+                array_start = cleaned.find("[")
+                array_end = cleaned.rfind("]")
+                candidates: List[str] = []
+                if (
+                    object_start != -1
+                    and object_end != -1
+                    and object_end > object_start
+                ):
+                    candidates.append(cleaned[object_start : object_end + 1])
+                if array_start != -1 and array_end != -1 and array_end > array_start:
+                    candidates.append(cleaned[array_start : array_end + 1])
+                for snippet in candidates:
+                    try:
+                        return json.loads(snippet)
+                    except json.JSONDecodeError:
+                        continue
+        return None
+
     def _load_cache(self):
         """Load Last.fm->YouTube mapping cache from disk."""
         if not self._cache_file.exists():
@@ -757,36 +1218,18 @@ class LastFMAutoplay:
                                 tags.append(self._normalize_tag(tag_name))
         return tags
 
-    async def _classify_track_with_gemini(
+    async def _execute_gemini_prompt(
         self,
-        artist: str,
-        track: str,
-        existing_tags: List[str],
-        allow_grounding: bool = False,
-    ) -> Dict[str, Any]:
-        """Use Gemini with Google Search grounding to enrich track metadata."""
+        instructions: str,
+        prompt: str,
+        allow_grounding: bool,
+    ) -> Optional[Any]:
         if not self._ensure_gemini_ready():
-            LOG.debug(
-                "⚠️ [Gemini] No available API keys for metadata enrichment; skipping."
-            )
-            return {}
+            LOG.debug("⚠️ [Gemini] All API keys exhausted or on cooldown; skipping.")
+            return None
 
         if not self._gemini_available or not self._gemini_client:
-            return {}
-
-        instructions = (
-            "You are a music metadata enrichment assistant. Given an artist and track, "
-            "return concise JSON with keys: tags (list of canonical genres), moods "
-            "(list of 1-3 mood descriptors), and energy (one word describing energy level). "
-            "Normalize genres to standard Spotify-like labels. Use Google Search grounding "
-            "to verify ambiguous cases."
-        )
-        prompt = (
-            "Artist: {artist}\n"
-            "Track: {track}\n"
-            "Existing tags: {tags}\n"
-            "Respond with JSON only."
-        ).format(artist=artist, track=track, tags=existing_tags or "[]")
+            return None
 
         use_grounding = allow_grounding and self._can_use_grounded_call()
 
@@ -812,7 +1255,7 @@ class LastFMAutoplay:
                     contents=prompt,
                     config=config,
                 )
-            except Exception as exc:  # Rate limits or network errors
+            except Exception as exc:
                 message = str(exc)
                 error_state["message"] = message
                 error_state["rate_limited"] = self._is_rate_limited_message(message)
@@ -831,7 +1274,7 @@ class LastFMAutoplay:
                     error_state["retry"] = self._extract_retry_delay_seconds_from_text(
                         message
                     )
-                LOG.debug(f"⚠️ [Gemini] Metadata enrichment failed: {message}")
+                LOG.debug(f"⚠️ [Gemini] Request failed: {message}")
                 return None
 
         response = await asyncio.to_thread(_call_gemini)
@@ -847,7 +1290,7 @@ class LastFMAutoplay:
                 self._enter_gemini_cooldown(
                     retry_seconds, reason, key=self._active_gemini_key
                 )
-            return {}
+            return None
 
         response_error = getattr(response, "error", None)
         if not response_error and isinstance(response, dict):
@@ -869,20 +1312,284 @@ class LastFMAutoplay:
             self._enter_gemini_cooldown(
                 retry_seconds, reason, key=self._active_gemini_key
             )
-            return {}
+            return None
 
         if use_grounding:
             self._register_grounded_call()
 
-        structured = self._parse_gemini_json(response)
-        if structured:
-            return structured
+        return response
 
-        texts = self._collect_gemini_texts(response)
-        if texts:
-            preview = self._strip_code_fence(texts[0])[:200]
-            LOG.debug(f"⚠️ [Gemini] Failed to parse JSON response. Raw: {preview}")
-        return {}
+    async def _schedule_gemini_batch_flush(self) -> None:
+        try:
+            await asyncio.sleep(GEMINI_BATCH_DELAY_SECONDS)
+        except asyncio.CancelledError:
+            return
+        await self._flush_gemini_batch()
+
+    async def _flush_gemini_batch(self) -> None:
+        async with self._gemini_batch_lock:
+            batch = self._gemini_batch_queue
+            self._gemini_batch_queue = []
+            self._gemini_batch_task = None
+
+        if not batch:
+            return
+
+        if LOG_LEVEL >= 3:
+            keys_preview = [entry.get("key") for entry in batch]
+            LOG.debug(
+                f"🧠 [Gemini] Flushing batch of {len(batch)} request(s): {keys_preview}"
+            )
+
+        try:
+            result_map = await self._process_gemini_batch(batch)
+        except Exception as exc:
+            LOG.error(f"❌ [Gemini] Batch processing failure: {exc}")
+            result_map = {}
+
+        for entry in batch:
+            future: asyncio.Future = entry["future"]
+            track_key = entry["key"]
+            payload = result_map.get(track_key, {})
+            if not future.done():
+                future.set_result(payload)
+
+    async def _process_gemini_batch(
+        self, batch_entries: List[Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        if not batch_entries:
+            return {}
+
+        if (
+            not self._ensure_gemini_ready()
+            or not self._gemini_available
+            or not self._gemini_client
+        ):
+            return {entry["key"]: {} for entry in batch_entries}
+
+        allow_grounding = any(entry.get("allow_grounding") for entry in batch_entries)
+
+        tracks_payload = [
+            {
+                "id": entry["key"],
+                "artist": entry["artist"],
+                "track": entry["track"],
+                "existing_tags": entry.get("tags", []),
+            }
+            for entry in batch_entries
+        ]
+
+        instructions = (
+            "You are a music metadata enrichment assistant. Given a batch of tracks, "
+            "return JSON with a 'results' array. Each entry must include: id (copy "
+            "the provided id), tags (list of canonical genres), moods (1-3 mood descriptors), "
+            "and energy (single word). Normalize genres to common labels. Use existing tags "
+            "as hints when helpful."
+        )
+
+        prompt = (
+            "Input Tracks:\n"
+            f"{json.dumps({'tracks': tracks_payload}, ensure_ascii=False, indent=2)}\n"
+            "Respond with JSON only."
+        )
+
+        if LOG_LEVEL >= 3:
+            track_debug = [track.get("id") for track in tracks_payload]
+            LOG.debug(
+                f"🧠 [Gemini] Batch prompt built for tracks: {track_debug}",
+            )
+            LOG.debug(
+                f"🧠 [Gemini] Instructions:\n{instructions}",
+            )
+            LOG.debug(
+                f"🧠 [Gemini] Prompt body (truncated):\n{prompt[:1500]}",
+            )
+
+        response = await self._execute_gemini_prompt(
+            instructions, prompt, allow_grounding
+        )
+
+        if response is None:
+            return {entry["key"]: {} for entry in batch_entries}
+
+        if LOG_LEVEL >= 3:
+            raw_texts = self._collect_gemini_texts(response)
+            LOG.debug(
+                f"🧠 [Gemini] Raw response snippet(s): {[self._strip_code_fence(text)[:400] for text in raw_texts[:3]]}",
+            )
+
+        structured = self._parse_gemini_json(response)
+        parsed_payload: Any
+        if structured is not None:
+            parsed_payload = structured
+        else:
+            parsed_payload = self._parse_gemini_json_any(response)
+
+        if parsed_payload is None:
+            texts = self._collect_gemini_texts(response)
+            if texts:
+                preview = self._strip_code_fence(texts[0])[:200]
+                LOG.debug(
+                    f"⚠️ [Gemini] Failed to parse batch JSON response. Raw: {preview}"
+                )
+            return {entry["key"]: {} for entry in batch_entries}
+
+        records: List[Dict[str, Any]] = []
+        if isinstance(parsed_payload, dict):
+            candidate = parsed_payload.get("results")
+            if isinstance(candidate, list):
+                records = [record for record in candidate if isinstance(record, dict)]
+            elif isinstance(candidate, dict):
+                records = [
+                    value for value in candidate.values() if isinstance(value, dict)
+                ]
+            else:
+                records = [parsed_payload]
+        elif isinstance(parsed_payload, list):
+            records = [record for record in parsed_payload if isinstance(record, dict)]
+
+        result_map: Dict[str, Dict[str, Any]] = {}
+        unmatched_keys = [entry["key"] for entry in batch_entries]
+        fallback_records: List[Dict[str, Any]] = []
+
+        for record in records:
+            track_id = (
+                record.get("id")
+                or record.get("track_id")
+                or record.get("key")
+                or record.get("trackKey")
+            )
+            payload = {
+                "tags": record.get("tags") or [],
+                "moods": record.get("moods") or [],
+                "energy": record.get("energy"),
+            }
+            if track_id and track_id in unmatched_keys:
+                result_map[track_id] = payload
+                unmatched_keys.remove(track_id)
+            else:
+                fallback_records.append(payload)
+
+        for key, record in zip(unmatched_keys, fallback_records):
+            result_map[key] = record
+
+        for key in unmatched_keys[len(fallback_records) :]:
+            result_map.setdefault(key, {})
+
+        LOG.debug(
+            f"✅ [Gemini] Batch metadata response received for {len(batch_entries)} track(s)."
+        )
+
+        if LOG_LEVEL >= 3:
+            LOG.debug(f"🧠 [Gemini] Parsed metadata map: {result_map}")
+
+        return result_map
+
+    async def _enqueue_gemini_metadata_future(
+        self,
+        artist: str,
+        track: str,
+        existing_tags: List[str],
+        allow_grounding: bool,
+    ) -> asyncio.Future:
+        """Enqueue a Gemini metadata request and return the future (for batch accumulation)."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        entry = {
+            "artist": artist,
+            "track": track,
+            "tags": existing_tags,
+            "allow_grounding": allow_grounding,
+            "key": self._make_track_key(artist, track),
+            "future": future,
+        }
+
+        async with self._gemini_batch_lock:
+            self._gemini_batch_queue.append(entry)
+            should_flush_immediately = len(self._gemini_batch_queue) >= GEMINI_BATCH_MAX
+            if LOG_LEVEL >= 3:
+                LOG.debug(
+                    f"🧠 [Gemini] Enqueued metadata request for {entry['key']} | queue={len(self._gemini_batch_queue)}"
+                )
+            if should_flush_immediately:
+                if self._gemini_batch_task and not self._gemini_batch_task.done():
+                    self._gemini_batch_task.cancel()
+                self._gemini_batch_task = asyncio.create_task(
+                    self._flush_gemini_batch()
+                )
+            elif not self._gemini_batch_task or self._gemini_batch_task.done():
+                self._gemini_batch_task = asyncio.create_task(
+                    self._schedule_gemini_batch_flush()
+                )
+
+        return future
+
+    async def _enqueue_gemini_metadata_request(
+        self,
+        artist: str,
+        track: str,
+        existing_tags: List[str],
+        allow_grounding: bool,
+    ) -> Dict[str, Any]:
+        """Enqueue a Gemini metadata request and await the result (single track convenience)."""
+        future = await self._enqueue_gemini_metadata_future(
+            artist, track, existing_tags, allow_grounding
+        )
+        try:
+            return await asyncio.wait_for(future, timeout=GEMINI_BATCH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            if not future.done():
+                future.set_result({})
+            return {}
+
+    async def _classify_track_with_gemini(
+        self,
+        artist: str,
+        track: str,
+        existing_tags: List[str],
+        allow_grounding: bool = False,
+    ) -> Dict[str, Any]:
+        """Use Gemini with Google Search grounding to enrich track metadata."""
+        if not self._ensure_gemini_ready():
+            LOG.debug(
+                "⚠️ [Gemini] No available API keys for metadata enrichment; skipping."
+            )
+            return {}
+
+        if not self._gemini_available or not self._gemini_client:
+            return {}
+
+        enriched = await self._enqueue_gemini_metadata_request(
+            artist,
+            track,
+            existing_tags or [],
+            allow_grounding,
+        )
+
+        if not enriched:
+            return {}
+
+        tags = [
+            self._normalize_tag(tag)
+            for tag in enriched.get("tags", [])
+            if isinstance(tag, str) and tag.strip()
+        ]
+        moods = [
+            mood.strip()
+            for mood in enriched.get("moods", [])
+            if isinstance(mood, str) and mood.strip()
+        ][:5]
+        energy_value = enriched.get("energy")
+        if isinstance(energy_value, str):
+            energy_value = energy_value.strip()
+        else:
+            energy_value = None
+
+        return {
+            "tags": tags,
+            "moods": moods,
+            "energy": energy_value,
+        }
 
     async def _get_track_profile(
         self, artist: str, track: str, require_enrichment: bool = False
@@ -1351,16 +2058,236 @@ class LastFMAutoplay:
         session_tag_set = {tag for tag, _ in session_tag_counter.most_common(5)}
         metadata_map: Dict[str, Dict[str, Any]] = {}
 
+        # Phase 1: Collect all tracks that need Gemini enrichment
         top_for_enrichment = candidate_pool[:ENRICH_TOP_N]
+        tracks_needing_enrichment: List[Tuple[str, str, str, bool]] = (
+            []
+        )  # (track_key, artist, track, require_enrichment)
+
         for idx, candidate in enumerate(top_for_enrichment):
-            metadata_map[candidate["track_key"]] = await self._get_track_profile(
-                candidate["artist"],
-                candidate["track"],
-                require_enrichment=idx < 3,
+            track_key = candidate["track_key"]
+            artist = candidate["artist"]
+            track = candidate["track"]
+            require_enrichment = idx < 3
+
+            # Check cache first
+            async with self._metadata_lock:
+                cache_entry = self._metadata_cache.get(track_key, {})
+                if cache_entry and not self._should_refresh_metadata(cache_entry):
+                    metadata_map[track_key] = cache_entry
+                    continue
+
+            # Need enrichment - add to batch list
+            tracks_needing_enrichment.append(
+                (track_key, artist, track, require_enrichment)
             )
 
+        # Phase 2: Fetch ALL Last.fm tags in parallel (fast)
+        lastfm_fetch_tasks = {}
+        for track_key, artist, track, require_enrichment in tracks_needing_enrichment:
+            lastfm_fetch_tasks[track_key] = (
+                asyncio.create_task(self._fetch_track_tags_from_lastfm(artist, track)),
+                artist,
+                track,
+                require_enrichment,
+            )
+
+        # Await all Last.fm fetches together
+        lastfm_results: Dict[str, Tuple[List[str], str, str, bool]] = {}
+        for track_key, (
+            task,
+            artist,
+            track,
+            require_enrichment,
+        ) in lastfm_fetch_tasks.items():
+            try:
+                tags = await task
+                lastfm_results[track_key] = (tags, artist, track, require_enrichment)
+            except Exception as e:
+                LOG.warning(f"⚠️ [Last.fm] Failed to fetch tags for {track_key}: {e}")
+                lastfm_results[track_key] = ([], artist, track, require_enrichment)
+
+        # Phase 3: Enqueue all Gemini requests at once (batch accumulation)
+        enrichment_futures: Dict[str, Tuple[asyncio.Future, List[str], str, str]] = {}
+        enqueue_tasks: List[Tuple[str, str, str, List[str], bool]] = []
+        enqueued_track_keys = set()
+
+        cache_updates: List[Tuple[str, Dict[str, Any]]] = []
+        for track_key, (
+            tags,
+            artist,
+            track,
+            require_enrichment,
+        ) in lastfm_results.items():
+            base_metadata: Dict[str, Any] = {
+                "artist": artist,
+                "track": track,
+                "tags": tags,
+                "moods": [],
+                "energy": None,
+                "sources": ["lastfm"] if tags else [],
+                "timestamp": time.time(),
+            }
+            metadata_map[track_key] = base_metadata
+            cache_updates.append((track_key, base_metadata))
+
+            need_gemini = require_enrichment or len(tags) < 3
+            if need_gemini:
+                enqueue_tasks.append(
+                    (track_key, artist, track, tags, require_enrichment)
+                )
+                enqueued_track_keys.add(track_key)
+
+        if cache_updates:
+            async with self._metadata_lock:
+                now = time.time()
+                for track_key, metadata in cache_updates:
+                    metadata["timestamp"] = now
+                    self._metadata_cache[track_key] = metadata
+                self._maybe_flush_metadata_cache()
+
+        # Phase 3b: ensure remaining candidates have baseline metadata without blocking batches
+        additional_candidates: List[Tuple[str, str, str]] = []
+        for candidate in candidate_pool:
+            track_key = candidate["track_key"]
+            if track_key in metadata_map:
+                continue
+
+            async with self._metadata_lock:
+                cache_entry = self._metadata_cache.get(track_key, {})
+                if cache_entry and not self._should_refresh_metadata(cache_entry):
+                    metadata_map[track_key] = cache_entry
+                    continue
+
+            additional_candidates.append(
+                (track_key, candidate["artist"], candidate["track"])
+            )
+
+        if additional_candidates:
+            fetch_tasks: Dict[str, Tuple[asyncio.Task, str, str]] = {}
+            for track_key, artist, track in additional_candidates:
+                fetch_tasks[track_key] = (
+                    asyncio.create_task(
+                        self._fetch_track_tags_from_lastfm(artist, track)
+                    ),
+                    artist,
+                    track,
+                )
+
+            supplemental_cache_updates: List[Tuple[str, Dict[str, Any]]] = []
+            for track_key, (task, artist, track) in fetch_tasks.items():
+                try:
+                    tags = await task
+                except Exception as e:
+                    LOG.warning(
+                        f"⚠️ [Last.fm] Failed to fetch tags for {track_key} (secondary batch): {e}"
+                    )
+                    tags = []
+
+                base_metadata = {
+                    "artist": artist,
+                    "track": track,
+                    "tags": tags,
+                    "moods": [],
+                    "energy": None,
+                    "sources": ["lastfm"] if tags else [],
+                    "timestamp": time.time(),
+                }
+                metadata_map[track_key] = base_metadata
+                supplemental_cache_updates.append((track_key, base_metadata))
+
+                need_gemini = len(tags) < 3
+                if need_gemini and track_key not in enqueued_track_keys:
+                    enqueue_tasks.append((track_key, artist, track, tags, False))
+                    enqueued_track_keys.add(track_key)
+
+            if supplemental_cache_updates:
+                async with self._metadata_lock:
+                    now = time.time()
+                    for track_key, metadata in supplemental_cache_updates:
+                        metadata["timestamp"] = now
+                        self._metadata_cache[track_key] = metadata
+                    self._maybe_flush_metadata_cache()
+
+        # Now enqueue all at once using gather to minimize delays
+        if enqueue_tasks:
+            futures_list = await asyncio.gather(
+                *[
+                    self._enqueue_gemini_metadata_future(
+                        artist, track, tags or [], allow_grounding=require_enrichment
+                    )
+                    for track_key, artist, track, tags, require_enrichment in enqueue_tasks
+                ]
+            )
+
+            for idx, (track_key, artist, track, tags, _) in enumerate(enqueue_tasks):
+                enrichment_futures[track_key] = (futures_list[idx], tags, artist, track)
+
+        # Phase 4: Wait for batch to accumulate and flush
+        if enrichment_futures:
+            await asyncio.sleep(GEMINI_BATCH_DELAY_SECONDS + 0.1)
+
+            # Now await all futures (batch should have flushed by now)
+            for track_key, (future, tags, artist, track) in enrichment_futures.items():
+                try:
+                    enriched = await asyncio.wait_for(
+                        future, timeout=GEMINI_BATCH_TIMEOUT_SECONDS
+                    )
+
+                    # Build metadata from Last.fm + Gemini
+                    metadata: Dict[str, Any] = {
+                        "artist": artist,
+                        "track": track,
+                        "tags": tags,
+                        "moods": [],
+                        "energy": None,
+                        "sources": ["lastfm"] if tags else [],
+                        "timestamp": time.time(),
+                    }
+
+                    if enriched:
+                        gemini_tags = [
+                            self._normalize_tag(tag)
+                            for tag in enriched.get("tags", [])
+                            if isinstance(tag, str)
+                        ]
+                        merged_tags = (
+                            list(dict.fromkeys(tags + gemini_tags))
+                            if tags
+                            else gemini_tags
+                        )
+                        if merged_tags:
+                            metadata["tags"] = merged_tags
+                        metadata["moods"] = [
+                            mood.strip()
+                            for mood in enriched.get("moods", [])
+                            if isinstance(mood, str)
+                        ][:5]
+                        energy = enriched.get("energy")
+                        if isinstance(energy, str):
+                            metadata["energy"] = energy.strip()
+                        metadata.setdefault("sources", []).append("gemini")
+
+                    # Cache and store
+                    async with self._metadata_lock:
+                        metadata["timestamp"] = time.time()
+                        self._metadata_cache[track_key] = metadata
+                    metadata_map[track_key] = metadata
+
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        f"⚠️ [Gemini] Metadata enrichment timed out for {track_key}"
+                    )
+                except Exception as e:
+                    LOG.warning(
+                        f"⚠️ [Gemini] Metadata enrichment failed for {track_key}: {e}"
+                    )
+
+        # Phase 5: Score all candidates using enriched metadata
         scored_candidates: List[Dict[str, Any]] = []
         now_ts = time.time()
+
+        epsilon_rate = self._get_exploration_rate(guild_id)
 
         for candidate in candidate_pool:
             artist = candidate["artist"]
@@ -1374,32 +2301,50 @@ class LastFMAutoplay:
             track_key = candidate["track_key"]
             metadata = metadata_map.get(track_key)
             if metadata is None:
-                metadata = await self._get_track_profile(artist, track)
+                # Get from cache only (no new Gemini enrichment)
+                metadata = await self._get_track_profile(
+                    artist, track, require_enrichment=False
+                )
                 metadata_map[track_key] = metadata
 
             candidate_tags = metadata.get("tags", [])
             quality_score = candidate.get("quality_score", 0.5)
+
+            artist_norm = self._normalize_artist_for_diversity(artist)
+            artist_count = session_counts.get(artist_norm, 0)
+            base_artist_affinity = self._clamp01(
+                1.0 - (artist_count / max(ARTIST_REPEAT_LIMIT, 1))
+            )
+
+            tag_feedback_multiplier = self._get_tag_feedback_multiplier(
+                guild_id, candidate_tags
+            )
 
             seed_overlap = 0.0
             if seed_tags and candidate_tags:
                 seed_overlap = len(set(seed_tags) & set(candidate_tags)) / max(
                     len(seed_tags), 1
                 )
+                seed_overlap = self._clamp01(seed_overlap * tag_feedback_multiplier)
 
             session_overlap = 0.0
             if session_tag_set and candidate_tags:
                 session_overlap = len(set(candidate_tags) & session_tag_set) / max(
                     len(session_tag_set), 1
                 )
+                session_overlap = self._clamp01(
+                    session_overlap * tag_feedback_multiplier
+                )
 
-            artist_norm = self._normalize_artist_for_diversity(artist)
-            artist_count = session_counts.get(artist_norm, 0)
+            artist_multiplier, artist_additive = self._get_artist_feedback_adjustments(
+                guild_id, artist_norm
+            )
             artist_affinity = self._clamp01(
-                1.0 - (artist_count / max(ARTIST_REPEAT_LIMIT, 1))
+                base_artist_affinity * artist_multiplier + artist_additive
             )
             novelty = self._clamp01(
                 (1.0 - max(seed_overlap, session_overlap))
-                + self._rng.uniform(0.0, EPSILON_EXPLORE)
+                + self._rng.uniform(0.0, epsilon_rate)
             )
             content_sim = seed_overlap
             session_coherence = session_overlap
@@ -1411,6 +2356,15 @@ class LastFMAutoplay:
                 + quality_score * 0.15
                 + novelty * 0.10
             )
+
+            candidate_multiplier = self._get_candidate_feedback_multiplier(
+                guild_id, track_key
+            )
+            guild_pref_multiplier = self._get_guild_preference_multiplier(
+                guild_id, candidate_tags, artist_norm
+            )
+
+            base_score *= candidate_multiplier * guild_pref_multiplier
 
             cooldown_remaining = self._artist_cooldowns.setdefault(guild_id, {}).get(
                 artist_norm, 0
@@ -1917,7 +2871,7 @@ Respond with ONLY the JSON object, no other text."""
         if not isinstance(tracks, list):
             return results
 
-        for track in tracks[: limit * 2]:  # grab a few extra before filtering
+        for track in tracks[: limit * 2]:
             if not isinstance(track, dict):
                 continue
             name = track.get("name")
@@ -2091,7 +3045,6 @@ Respond with ONLY the JSON object, no other text."""
                     best_match = track_obj
 
             if best_match and best_score > 0.3:  # Minimum match threshold
-                # Cache this mapping
                 self._cache[cache_key] = (query, time.time())
                 self._maybe_flush_mapping_cache()
 
@@ -2150,6 +3103,24 @@ Respond with ONLY the JSON object, no other text."""
             score += 0.05
         if bad_keywords > 0:
             score -= 0.4
+
+        info = getattr(track_obj, "info", {}) or {}
+        author = str(info.get("author") or getattr(track_obj, "author", ""))
+        author_lower = author.lower()
+        if author_lower:
+            if any(hint in author_lower for hint in CANONICAL_CHANNEL_HINTS):
+                score += 0.07
+            if " - topic" in author_lower:
+                score += 0.04
+
+        view_count = info.get("viewCount") or info.get("views")
+        if isinstance(view_count, (int, float)):
+            normalized = min(max(view_count, 0) / 2_500_000.0, 1.0)
+            score += 0.05 * normalized
+
+        like_ratio = info.get("likeRatio")
+        if isinstance(like_ratio, (int, float)):
+            score += 0.03 * max(0.0, min(1.0, like_ratio))
 
         return max(0.0, min(1.0, score))
 

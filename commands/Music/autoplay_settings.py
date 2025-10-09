@@ -12,7 +12,7 @@ def _is_owner(user_id: int) -> bool:
         return False
 
 
-class LastFMAdmin(commands.Cog):
+class AutoPlaySettings(commands.Cog):
     """Admin commands for Last.fm AutoPlay management."""
 
     def __init__(self, bot):
@@ -140,4 +140,4 @@ class LastFMAdmin(commands.Cog):
 
 
 async def setup(bot):
-    await bot.add_cog(LastFMAdmin(bot))
+    await bot.add_cog(AutoPlaySettings(bot))
