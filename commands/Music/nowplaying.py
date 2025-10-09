@@ -315,6 +315,7 @@ class SeekModal(discord.ui.Modal, title="Seek Position"):
 
             # Seek to position
             await vc.seek(position_ms)
+            self.player.note_seek(self.ctx.guild.id, position_ms)
             await interaction.response.send_message(
                 f"⏩ **{interaction.user.display_name}** seeked to {time_str}"
             )
@@ -373,7 +374,9 @@ class SeekView(View):
                 return
 
             try:
-                await vc.seek(position_seconds * 1000)  # Convert to milliseconds
+                position_ms = position_seconds * 1000
+                await vc.seek(position_ms)  # Convert to milliseconds
+                self.player.note_seek(self.ctx.guild.id, position_ms)
                 mins, secs = divmod(position_seconds, 60)
                 username = interaction.user.display_name
                 message = f"⏩ **{username}** seeked to {mins:02d}:{secs:02d}"
@@ -648,6 +651,9 @@ class PlayerControlView(View):
         if is_dj:
             # Actually stop the track
             try:
+                await self.player.note_skip(
+                    vc, self.guild_id, interaction.user.id, primary_listener_bias=True
+                )
                 await vc.stop()
                 await interaction.response.send_message(
                     f"⏭️ **{interaction.user.display_name}** skipped the track"
@@ -662,6 +668,12 @@ class PlayerControlView(View):
             )
             if vote_result["passed"]:
                 try:
+                    await self.player.note_skip(
+                        vc,
+                        self.guild_id,
+                        interaction.user.id,
+                        primary_listener_bias=False,
+                    )
                     await vc.stop()
                     await interaction.response.send_message(
                         f"⏭️ **{interaction.user.display_name}** skipped the track ({vote_result['votes']}/{vote_result['needed']} votes)"
@@ -994,6 +1006,7 @@ class NowPlayingCommands(commands.Cog):
 
             if is_dj:
                 await vc.seek(position_ms)
+                player.note_seek(ctx.guild.id, position_ms)
                 await ctx.send(f"⏩ **{ctx.author.display_name}** seeked to {time}")
             else:
                 # For non-DJs, require vote
@@ -1002,6 +1015,7 @@ class NowPlayingCommands(commands.Cog):
                 )
                 if vote_result["passed"]:
                     await vc.seek(position_ms)
+                    player.note_seek(ctx.guild.id, position_ms)
                     await ctx.send(
                         f"⏩ **{ctx.author.display_name}** seeked to {time} ({vote_result['votes']}/{vote_result['needed']} votes)"
                     )

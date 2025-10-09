@@ -59,7 +59,10 @@ class SkipCommands(commands.Cog):
 
             vc = ctx.guild.voice_client
             if vc and is_voice_playing(vc):
-                vc.stop()
+                await player.note_skip(
+                    vc, ctx.guild.id, ctx.author.id, primary_listener_bias=True
+                )
+                await vc.stop()
 
             await ctx.send(f"Skipped to position {index}.")
             return
@@ -68,6 +71,9 @@ class SkipCommands(commands.Cog):
         if self._is_dj(ctx):
             vc = ctx.guild.voice_client
             if vc and is_voice_playing(vc):
+                await player.note_skip(
+                    vc, ctx.guild.id, ctx.author.id, primary_listener_bias=True
+                )
                 await vc.stop()
                 await ctx.send("Skipped by DJ.")
                 return
@@ -89,7 +95,10 @@ class SkipCommands(commands.Cog):
         if cur >= needed:
             vc = ctx.guild.voice_client
             if vc and is_voice_playing(vc):
-                vc.stop()
+                await player.note_skip(
+                    vc, ctx.guild.id, ctx.author.id, primary_listener_bias=False
+                )
+                await vc.stop()
             player.voteskip[ctx.guild.id].clear()
             await ctx.send(
                 embed=discord.Embed(

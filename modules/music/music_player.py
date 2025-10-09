@@ -5,6 +5,7 @@ import math
 import logging
 import json
 import random
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
@@ -190,6 +191,8 @@ class MusicPlayer(commands.Cog):
         self._autoplay_session_started: Dict[int, bool] = (
             {}
         )  # Track first autoplay per session
+        self._playback_state: Dict[int, Dict[str, Any]] = {}
+        self._pending_feedback: Dict[int, Dict[str, Any]] = {}
 
         # Initialize Last.fm autoplay
         LOG.info("[AutoPlay] Attempting to initialize Last.fm module...")
@@ -968,6 +971,9 @@ class MusicPlayer(commands.Cog):
 
         setattr(player, "_last_track", track)
         self._playing_flags[player.guild.id] = True
+        self._initialize_playback_state(
+            player.guild.id, track, self._current_entries.get(player.guild.id)
+        )
         await self._announce_now_playing(player, track)
 
     @commands.Cog.listener()
@@ -1009,6 +1015,21 @@ class MusicPlayer(commands.Cog):
 
         if not isinstance(player, pomice.Player):
             return
+
+        reason = ""
+        if isinstance(event, pomice.TrackEndEvent):
+            reason = getattr(event, "reason", "") or ""
+        else:
+            reason = kwargs.get("reason", "") or ""
+
+        pending_feedback = self._pending_feedback.pop(player.guild.id, None)
+        await self._record_playback_feedback_for_current(
+            player,
+            player.guild.id,
+            pending=pending_feedback,
+            reason=reason,
+        )
+        self._playback_state.pop(player.guild.id, None)
 
         gid = player.guild.id
         self._playing_flags[gid] = False
@@ -1061,6 +1082,24 @@ class MusicPlayer(commands.Cog):
 
         if not isinstance(player, pomice.Player):
             return
+
+        pending_feedback = self._pending_feedback.pop(player.guild.id, None)
+        await self._record_playback_feedback_for_current(
+            player,
+            player.guild.id,
+            pending=pending_feedback,
+            reason="EXCEPTION",
+        )
+        state = self._playback_state.get(player.guild.id)
+        if state is None:
+            self._playback_state[player.guild.id] = {
+                "length_ms": None,
+                "last_known_position_ms": 0,
+                "position_timestamp": time.time(),
+                "recorded": True,
+            }
+        else:
+            state["recorded"] = True
 
         await self._handle_track_exception(player, track, exc_payload)
 
@@ -1238,6 +1277,7 @@ class MusicPlayer(commands.Cog):
             entry.setdefault("title", getattr(track, "title", "Unknown"))
             entry.setdefault("author", getattr(track, "author", None))
             entry.setdefault("requester", None)
+            entry.setdefault("length", getattr(track, "length", None))
             entry["uri"] = getattr(track, "uri", None)
             entry["identifier"] = getattr(track, "identifier", None)
             entry["track"] = track
@@ -1250,6 +1290,170 @@ class MusicPlayer(commands.Cog):
             LOG.warning("Failed to start track: %s", e)
             self._playing_flags[player.guild.id] = False
             await self._advance_or_idle(player)
+
+    def _initialize_playback_state(
+        self,
+        guild_id: int,
+        track: Optional[pomice.Track],
+        entry: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        data = entry or self._current_entries.get(guild_id, {}) or {}
+        length = data.get("length")
+        if length is None and track is not None:
+            length = getattr(track, "length", None) or getattr(track, "duration", None)
+        length_ms: Optional[int]
+        try:
+            length_ms = int(length) if length is not None else None
+        except (TypeError, ValueError):
+            length_ms = None
+
+        self._playback_state[guild_id] = {
+            "length_ms": length_ms,
+            "last_known_position_ms": 0,
+            "position_timestamp": time.time(),
+        }
+        self._pending_feedback.pop(guild_id, None)
+
+    def _refresh_player_position(self, player: pomice.Player, guild_id: int) -> None:
+        state = self._playback_state.get(guild_id)
+        if not state:
+            return
+        try:
+            pos = getattr(player, "position", None)
+            if callable(pos):
+                pos = pos()
+            if inspect.isawaitable(pos):
+                return
+            if isinstance(pos, (int, float)):
+                state["last_known_position_ms"] = max(0, int(pos))
+                state["position_timestamp"] = time.time()
+        except Exception:
+            pass
+
+    def _estimate_progress_ratio(
+        self, player: pomice.Player, guild_id: int
+    ) -> Optional[float]:
+        state = self._playback_state.get(guild_id)
+        if state is None:
+            entry = self._current_entries.get(guild_id, {})
+            track = entry.get("track") if isinstance(entry, dict) else None
+            self._initialize_playback_state(guild_id, track, entry)
+            state = self._playback_state.get(guild_id)
+        if not state:
+            return None
+
+        self._refresh_player_position(player, guild_id)
+
+        length_ms = state.get("length_ms")
+        if not length_ms or length_ms <= 0:
+            return None
+
+        position_ms = max(0.0, float(state.get("last_known_position_ms", 0)))
+        timestamp = state.get("position_timestamp")
+        if timestamp is not None:
+            elapsed_ms = max(0.0, (time.time() - timestamp) * 1000.0)
+            position_ms = min(position_ms + elapsed_ms, float(length_ms))
+            state["last_known_position_ms"] = int(position_ms)
+            state["position_timestamp"] = time.time()
+
+        ratio = position_ms / float(length_ms)
+        return max(0.0, min(1.0, ratio))
+
+    def note_seek(self, guild_id: int, position_ms: int) -> None:
+        state = self._playback_state.get(guild_id)
+        if state is None:
+            entry = self._current_entries.get(guild_id, {})
+            track = entry.get("track") if isinstance(entry, dict) else None
+            self._initialize_playback_state(guild_id, track, entry)
+            state = self._playback_state.get(guild_id)
+        if state is None:
+            return
+        try:
+            state["last_known_position_ms"] = max(0, int(position_ms))
+        except (TypeError, ValueError):
+            state["last_known_position_ms"] = 0
+        state["position_timestamp"] = time.time()
+
+    async def note_skip(
+        self,
+        pomice_player: Optional[pomice.Player],
+        guild_id: int,
+        user_id: Optional[int] = None,
+        *,
+        primary_listener_bias: bool = False,
+    ) -> None:
+        if not isinstance(pomice_player, pomice.Player):
+            return
+        ratio = self._estimate_progress_ratio(pomice_player, guild_id)
+        if ratio is None:
+            ratio = 0.0
+        self._pending_feedback[guild_id] = {
+            "ratio": max(0.0, min(1.0, float(ratio))),
+            "user_id": user_id,
+            "primary_listener_bias": primary_listener_bias,
+            "timestamp": time.time(),
+        }
+
+    async def _record_playback_feedback_for_current(
+        self,
+        player: pomice.Player,
+        guild_id: int,
+        *,
+        pending: Optional[Dict[str, Any]] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if not self._lastfm_autoplay or not self._lastfm_autoplay.is_available():
+            return
+
+        entry = self._current_entries.get(guild_id) or {}
+        track = entry.get("track") if isinstance(entry, dict) else None
+        artist = entry.get("author") or getattr(track, "author", None)
+        title = entry.get("title") or getattr(track, "title", None)
+
+        if not artist or not title:
+            return
+
+        ratio = None
+        if pending:
+            ratio = pending.get("ratio")
+        if ratio is None:
+            state = self._playback_state.get(guild_id)
+            if state and state.get("recorded"):
+                return
+            ratio = self._estimate_progress_ratio(player, guild_id)
+            state = self._playback_state.get(guild_id)
+        if ratio is None:
+            return
+
+        if reason and reason.upper() == "FINISHED":
+            ratio = 1.0
+
+        ratio = max(0.0, min(1.0, float(ratio)))
+        primary_bias = bool(pending.get("primary_listener_bias")) if pending else False
+
+        duration_ms = None
+        state = self._playback_state.get(guild_id)
+        if state:
+            duration_ms = state.get("length_ms")
+
+        try:
+            await self._lastfm_autoplay.record_playback_feedback(
+                guild_id,
+                artist,
+                title,
+                ratio,
+                duration_ms=duration_ms,
+                primary_listener_bias=primary_bias,
+            )
+            if state is not None:
+                state["recorded"] = True
+        except Exception:
+            LOG.debug(
+                "Failed to record playback feedback for %s - %s",
+                artist,
+                title,
+                exc_info=True,
+            )
 
     async def _advance_or_idle(self, player: pomice.Player):
         if not player.queue.is_empty:

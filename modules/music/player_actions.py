@@ -155,6 +155,7 @@ async def handle_skip_action(
 
     if is_dj:
         try:
+            await player.note_skip(vc, guild.id, user.id, primary_listener_bias=True)
             await vc.stop()
             return {
                 "success": True,
@@ -174,6 +175,9 @@ async def handle_skip_action(
 
         if vote_result["passed"]:
             try:
+                await player.note_skip(
+                    vc, guild.id, user.id, primary_listener_bias=False
+                )
                 await vc.stop()
                 return {
                     "success": True,
@@ -338,6 +342,7 @@ async def handle_seek_action(
     if is_dj:
         try:
             await vc.seek(position_ms)
+            player.note_seek(guild.id, position_ms)
             return {
                 "success": True,
                 "message": f"⏩ **{user.display_name}** seeked to {time_str}",
@@ -357,6 +362,7 @@ async def handle_seek_action(
         if vote_result["passed"]:
             try:
                 await vc.seek(position_ms)
+                player.note_seek(guild.id, position_ms)
                 return {
                     "success": True,
                     "message": f"⏩ **{user.display_name}** seeked to {time_str} ({vote_result['votes']}/{vote_result['needed']} votes)",
