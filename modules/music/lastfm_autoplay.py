@@ -56,6 +56,12 @@ EPSILON_MIN = 0.02  # Minimum exploration factor
 EPSILON_MAX = 0.28  # Maximum exploration factor
 EPSILON_DELTA_SKIP = 0.018
 EPSILON_DELTA_FINISH = 0.012
+EPSILON_DIVERSITY_BOOST_MAX = 0.12
+
+GENRE_DIVERSITY_WINDOW = 12
+GENRE_DOMINANCE_MIN_COUNT = 4
+GENRE_DOMINANCE_THRESHOLD = 0.55
+GENRE_HISTORY_LIMIT = 60
 
 CANDIDATE_MULTIPLIERS = {
     "hard_skip": 0.20,
@@ -616,6 +622,7 @@ class LastFMAutoplay:
                 "epsilon": EPSILON_BASE,
                 "events": deque(maxlen=METRICS_HISTORY_LIMIT),
                 "last_updated": self._now(),
+                "last_diversity_notice": 0.0,
             },
         )
         state["last_updated"] = self._now()
@@ -2056,6 +2063,26 @@ class LastFMAutoplay:
             Counter(session_tags_raw) if session_tags_raw else Counter()
         )
         session_tag_set = {tag for tag, _ in session_tag_counter.most_common(5)}
+        recent_tags = (
+            session_tags_raw[-GENRE_DIVERSITY_WINDOW:] if session_tags_raw else []
+        )
+        dominant_tag: Optional[str] = None
+        dominant_ratio = 0.0
+        dominant_count = 0
+        diversity_pressure = 0.0
+        if recent_tags:
+            recent_counter = Counter(recent_tags)
+            dominant_tag, dominant_count = recent_counter.most_common(1)[0]
+            dominant_ratio = dominant_count / max(len(recent_tags), 1)
+            if (
+                dominant_count >= GENRE_DOMINANCE_MIN_COUNT
+                and dominant_ratio >= GENRE_DOMINANCE_THRESHOLD
+            ):
+                diversity_pressure = min(
+                    EPSILON_DIVERSITY_BOOST_MAX,
+                    (dominant_ratio - GENRE_DOMINANCE_THRESHOLD) * 0.6
+                    + 0.02 * (dominant_count / max(len(recent_tags), 1)),
+                )
         metadata_map: Dict[str, Dict[str, Any]] = {}
 
         # Phase 1: Collect all tracks that need Gemini enrichment
@@ -2287,7 +2314,28 @@ class LastFMAutoplay:
         scored_candidates: List[Dict[str, Any]] = []
         now_ts = time.time()
 
-        epsilon_rate = self._get_exploration_rate(guild_id)
+        explore_state = self._get_exploration_state(guild_id)
+        epsilon_rate = float(explore_state.get("epsilon", EPSILON_BASE))
+        if diversity_pressure > 0.0:
+            epsilon_rate = min(EPSILON_MAX, epsilon_rate + diversity_pressure)
+            now_mark = self._now()
+            last_notice = float(explore_state.get("last_diversity_notice", 0.0))
+            if LOG_LEVEL >= 2 and (now_mark - last_notice) > 20.0:
+                LOG.debug(
+                    "[Diversity] Dominant tag '%s' seen %d/%d recent autoplay picks (ratio=%.2f). Boosting exploration by %.3f.",
+                    dominant_tag,
+                    dominant_count,
+                    len(recent_tags),
+                    dominant_ratio,
+                    diversity_pressure,
+                )
+                explore_state["last_diversity_notice"] = now_mark
+            else:
+                explore_state["last_diversity_notice"] = max(
+                    explore_state.get("last_diversity_notice", 0.0), now_mark
+                )
+            if dominant_tag:
+                explore_state["last_dominant_tag"] = dominant_tag
 
         for candidate in candidate_pool:
             artist = candidate["artist"]
@@ -2342,10 +2390,13 @@ class LastFMAutoplay:
             artist_affinity = self._clamp01(
                 base_artist_affinity * artist_multiplier + artist_additive
             )
-            novelty = self._clamp01(
-                (1.0 - max(seed_overlap, session_overlap))
-                + self._rng.uniform(0.0, epsilon_rate)
-            )
+            novelty_base = 1.0 - max(seed_overlap, session_overlap)
+            if diversity_pressure > 0.0 and dominant_tag:
+                if dominant_tag in candidate_tags:
+                    novelty_base -= diversity_pressure * 0.6
+                else:
+                    novelty_base += diversity_pressure * 0.85
+            novelty = self._clamp01(novelty_base + self._rng.uniform(0.0, epsilon_rate))
             content_sim = seed_overlap
             session_coherence = session_overlap
 
@@ -2356,6 +2407,12 @@ class LastFMAutoplay:
                 + quality_score * 0.15
                 + novelty * 0.10
             )
+
+            if diversity_pressure > 0.0 and dominant_tag:
+                if dominant_tag in candidate_tags:
+                    base_score -= diversity_pressure * 0.35
+                else:
+                    base_score += diversity_pressure * 0.25
 
             candidate_multiplier = self._get_candidate_feedback_multiplier(
                 guild_id, track_key
@@ -2437,8 +2494,8 @@ class LastFMAutoplay:
                 if tags:
                     genre_track = self._genre_history.setdefault(guild_id, [])
                     genre_track.append(tags[0])
-                    if len(genre_track) > 60:
-                        del genre_track[:-60]
+                    if len(genre_track) > GENRE_HISTORY_LIMIT:
+                        del genre_track[:-GENRE_HISTORY_LIMIT]
             else:
                 self._mark_resolve_failure(
                     guild_id, candidate["artist"], candidate["track"]

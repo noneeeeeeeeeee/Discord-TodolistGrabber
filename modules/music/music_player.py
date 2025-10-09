@@ -1022,6 +1022,12 @@ class MusicPlayer(commands.Cog):
         else:
             reason = kwargs.get("reason", "") or ""
 
+        LOG.debug(
+            "[Feedback] Track end event received (guild=%s, reason=%s)",
+            getattr(player.guild, "id", None),
+            reason,
+        )
+
         pending_feedback = self._pending_feedback.pop(player.guild.id, None)
         await self._record_playback_feedback_for_current(
             player,
@@ -1082,6 +1088,11 @@ class MusicPlayer(commands.Cog):
 
         if not isinstance(player, pomice.Player):
             return
+
+        LOG.debug(
+            "[Feedback] Track exception event received (guild=%s)",
+            getattr(player.guild, "id", None),
+        )
 
         pending_feedback = self._pending_feedback.pop(player.guild.id, None)
         await self._record_playback_feedback_for_current(
@@ -1331,7 +1342,7 @@ class MusicPlayer(commands.Cog):
             pass
 
     def _estimate_progress_ratio(
-        self, player: pomice.Player, guild_id: int
+        self, player: Optional[Any], guild_id: int
     ) -> Optional[float]:
         state = self._playback_state.get(guild_id)
         if state is None:
@@ -1342,7 +1353,8 @@ class MusicPlayer(commands.Cog):
         if not state:
             return None
 
-        self._refresh_player_position(player, guild_id)
+        if isinstance(player, pomice.Player):
+            self._refresh_player_position(player, guild_id)
 
         length_ms = state.get("length_ms")
         if not length_ms or length_ms <= 0:
@@ -1382,9 +1394,26 @@ class MusicPlayer(commands.Cog):
         *,
         primary_listener_bias: bool = False,
     ) -> None:
-        if not isinstance(pomice_player, pomice.Player):
-            return
-        ratio = self._estimate_progress_ratio(pomice_player, guild_id)
+        actual_player: Optional[pomice.Player] = None
+        if isinstance(pomice_player, pomice.Player):
+            actual_player = pomice_player
+        elif pomice_player is not None:
+            fallback_player = getattr(pomice_player, "player", None)
+            if isinstance(fallback_player, pomice.Player):
+                actual_player = fallback_player
+            else:
+                LOG.debug(
+                    "[Feedback] note_skip received non-pomice player type %s for guild %s",
+                    type(pomice_player).__name__,
+                    guild_id,
+                )
+        else:
+            LOG.debug(
+                "[Feedback] note_skip invoked without player reference for guild %s",
+                guild_id,
+            )
+
+        ratio = self._estimate_progress_ratio(actual_player, guild_id)
         if ratio is None:
             ratio = 0.0
         self._pending_feedback[guild_id] = {
@@ -1393,6 +1422,13 @@ class MusicPlayer(commands.Cog):
             "primary_listener_bias": primary_listener_bias,
             "timestamp": time.time(),
         }
+        LOG.debug(
+            "[Feedback] Stored pending skip feedback (guild=%s, ratio=%.3f, user=%s, bias=%s)",
+            guild_id,
+            ratio,
+            user_id,
+            primary_listener_bias,
+        )
 
     async def _record_playback_feedback_for_current(
         self,
@@ -1413,6 +1449,15 @@ class MusicPlayer(commands.Cog):
         if not artist or not title:
             return
 
+        LOG.debug(
+            "[Feedback] Preparing feedback record (guild=%s, artist=%s, title=%s, reason=%s, pending=%s)",
+            guild_id,
+            artist,
+            title,
+            reason,
+            bool(pending),
+        )
+
         ratio = None
         if pending:
             ratio = pending.get("ratio")
@@ -1423,6 +1468,10 @@ class MusicPlayer(commands.Cog):
             ratio = self._estimate_progress_ratio(player, guild_id)
             state = self._playback_state.get(guild_id)
         if ratio is None:
+            LOG.debug(
+                "[Feedback] Skipping feedback record due to missing ratio (guild=%s)",
+                guild_id,
+            )
             return
 
         if reason and reason.upper() == "FINISHED":
@@ -1447,6 +1496,13 @@ class MusicPlayer(commands.Cog):
             )
             if state is not None:
                 state["recorded"] = True
+            LOG.debug(
+                "[Feedback] Recorded playback feedback (guild=%s, ratio=%.3f, bias=%s, reason=%s)",
+                guild_id,
+                ratio,
+                primary_bias,
+                reason,
+            )
         except Exception:
             LOG.debug(
                 "Failed to record playback feedback for %s - %s",
