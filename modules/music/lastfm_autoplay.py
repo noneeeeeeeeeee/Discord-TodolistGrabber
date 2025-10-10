@@ -5,6 +5,7 @@ import logging
 import json
 import random
 import re
+import math
 from collections import Counter, deque
 from datetime import datetime
 from typing import Deque, Dict, Any, List, Optional, Tuple
@@ -24,7 +25,7 @@ LOG = logging.getLogger(__name__)
 # This module implements Last.fm-based autoplay recommendations with Gemini AI parsing.
 
 
-LOG_LEVEL = 1  # 0=ERROR, 1=INFO, 2=DEBUG, 3=All (Higher number more verbose)
+LOG_LEVEL = 2  # 0=ERROR, 1=INFO, 2=DEBUG, 3=All (Higher number more verbose)
 SESSION_HISTORY_LIMIT = 50  # How many recent tracks to remember in a single session (if you change this value, you may need to change the other numbers to fit with it)
 RECENT_TRACK_WINDOW_SECONDS = 90 * 60  # 90 minutes
 FAILED_TRACK_COOLDOWN_SECONDS = 30 * 60  # 30 minutes
@@ -41,7 +42,7 @@ CACHE_MAX_AGE = 60 * 60 * 24 * 15  # 15 days TTL for Last.fm->YouTube cache mapp
 METADATA_CACHE_MAX_AGE = 60 * 60 * 24 * 90  # 90 days TTL for metadata
 DURATION_TOLERANCE_SECONDS = 5  # +/- 5 seconds tolerance
 DURATION_TOLERANCE_PERCENT = 0.12  # +/- 12% duration tolerance
-CANDIDATE_POOL_TARGET = 60  # Aim for ~60 candidates before filtering
+CANDIDATE_POOL_TARGET = 35  # Aim for ~35 candidates before filtering
 ENRICH_TOP_N = 16  # How many top Last.fm tags to fetch and use for Gemini enrichment
 RESOLVE_TOP_K = 6  # How many top YouTube search results to consider for matching
 ARTIST_REPEAT_LIMIT = 5  # Max times the same artist can appear in session history
@@ -50,18 +51,75 @@ SKIP_EARLY_THRESHOLD = 0.2  # Listen progress considered an immediate skip
 SKIP_THRESHOLD = 0.8  # Progress threshold treated as a skip event
 FINISH_THRESHOLD = 0.9  # Progress threshold considered a full completion
 
-# Diversity Factor (higher = more diverse, lower = more similar). This is what recommends new tracks to you.
-EPSILON_BASE = 0.08  # Default exploration factor
-EPSILON_MIN = 0.02  # Minimum exploration factor
-EPSILON_MAX = 0.28  # Maximum exploration factor
-EPSILON_DELTA_SKIP = 0.018
-EPSILON_DELTA_FINISH = 0.012
-EPSILON_DIVERSITY_BOOST_MAX = 0.12
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIVERSITY & EXPLORATION SYSTEMS
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multiple complementary systems control recommendation diversity. Each serves
+# a distinct purpose and operates on different timescales:
 
-GENRE_DIVERSITY_WINDOW = 12
-GENRE_DOMINANCE_MIN_COUNT = 4
-GENRE_DOMINANCE_THRESHOLD = 0.55
-GENRE_HISTORY_LIMIT = 60
+# ───────────────────────────────────────────────────────────────────────────────
+# 1. EPSILON (Adaptive Real-Time Exploration)
+# ───────────────────────────────────────────────────────────────────────────────
+# Purpose: Fast-reacting exploration rate that adapts to user feedback signals
+# Mechanism: Increases on skips (user wants something different), decreases on
+#            finishes (user is satisfied). Acts as random noise in scoring.
+# Scope: Per-guild, updates every track based on listen progress
+# Timescale: Immediate (adjusts within 1-2 tracks)
+EPSILON_BASE = 0.08  # Default exploration factor (8% random variance in scoring)
+EPSILON_MIN = 0.02  # Floor to maintain minimum discovery even when satisfied
+EPSILON_MAX = 0.28  # Ceiling to prevent chaos even when frustrated
+EPSILON_DELTA_SKIP = 0.02  # Increment per skip (accelerates exploration)
+EPSILON_DELTA_FINISH = 0.012  # Decrement per finish (rewards good picks)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 2. PROGRESSIVE DIVERSITY INJECTION (Spotify-Style Session Arc)
+# ───────────────────────────────────────────────────────────────────────────────
+# Purpose: Gradually introduce variety over session lifetime to prevent monotony
+# Mechanism: Multiplies epsilon by increasing factor as autoplay count grows
+# Scope: Per-guild session (resets when autoplay restarts)
+# Timescale: Medium (ramps over 10-18 tracks)
+# Note: Independent from epsilon adjustments—multiplies final epsilon_rate
+DIVERSITY_INJECT_START_TRACK = 10  # Keep first N tracks highly similar to seed
+DIVERSITY_INJECT_RAMP_TRACKS = 8  # Fully ramp exploration over next N tracks
+DIVERSITY_INJECT_MAX_MULTIPLIER = 2.5  # Peak multiplier (e.g., 0.08 → 0.20 epsilon)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 3. GENRE DOMINANCE PRESSURE (Anti-Repetition Safeguard)
+# ───────────────────────────────────────────────────────────────────────────────
+# Purpose: Emergency diversity boost when single genre dominates recent history
+# Mechanism: Adds fixed pressure when one genre exceeds threshold in rolling window
+# Scope: Per-guild, examines last N autoplay picks
+# Timescale: Short-term reactive (evaluates every recommendation)
+# Note: Adds to epsilon (not multiplies), capped at EPSILON_DIVERSITY_BOOST_MAX
+GENRE_DIVERSITY_WINDOW = 12  # Rolling window size for dominance detection
+GENRE_DOMINANCE_MIN_COUNT = (
+    4  # Minimum occurrences to trigger (prevents false positives)
+)
+GENRE_DOMINANCE_THRESHOLD = 0.55  # Ratio threshold (55% of window)
+EPSILON_DIVERSITY_BOOST_MAX = 0.12  # Max additive boost from genre pressure + sentiment
+GENRE_HISTORY_LIMIT = 60  # Total genre history retained (for decay/analysis)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 4. SESSION GENRE SENTIMENT (User Preference Learning)
+# ───────────────────────────────────────────────────────────────────────────────
+# Purpose: Track which genres user likes/dislikes within current session
+# Mechanism: Accumulates pos/neg signals per genre, decays over time, feeds into
+#            scoring multipliers and can add to diversity_pressure if strongly negative
+# Scope: Per-guild session with time-based decay
+# Timescale: Long-term accumulative (45min half-life)
+# Note: Shares EPSILON_DIVERSITY_BOOST_MAX cap with genre dominance pressure
+SESSION_GENRE_SENTIMENT_HALFLIFE = 45 * 60  # Decay rate (seconds)
+SESSION_GENRE_SENTIMENT_MIN = 0.02  # Prune threshold for memory efficiency
+SESSION_GENRE_SENTIMENT_MAX_BONUS = 0.55  # Max scoring multiplier for liked genres
+SESSION_GENRE_SENTIMENT_MAX_PENALTY = 0.65  # Max scoring penalty for disliked genres
+SESSION_GENRE_SENTIMENT_PENALTY_THRESHOLD = (
+    -0.35
+)  # Sentiment threshold to add diversity pressure
+SESSION_GENRE_SKIP_ESCALATION_THRESHOLD = (
+    3  # Consecutive skips trigger harsh escape penalty
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 CANDIDATE_MULTIPLIERS = {
     "hard_skip": 0.20,
@@ -154,8 +212,6 @@ GOOD_TITLE_KEYWORDS = (
     "official lyric",
     "official",
     # quality markers / release signals
-    "studio",
-    "studio version",
     "album version",
     "single version",
     "original",
@@ -253,6 +309,7 @@ BAD_TITLE_KEYWORDS = (
     "concert",
     "performance",
     "tour",
+    "interview,"
     # long-play / loop / compilation
     "hour",
     "hours",
@@ -268,6 +325,7 @@ BAD_TITLE_KEYWORDS = (
     "visualizer",  # sometimes official but often not; treat lower priority
     "reupload",
     "fanmade",
+    "version",
     # languages / non-english karaoke markers
     "伴唱",  # chinese karaoke
     "カラオケ",  # japanese karaoke
@@ -310,6 +368,13 @@ BAD_TITLE_KEYWORDS = (
     "hz",
     # Studio Remixes (First-party remix not suggested)
     "Studio Vocals",
+    # Tutorial Videos
+    "how to",
+    "tutorial",
+    "lesson",
+    "practice",
+    "learn",
+    "teach",
 )
 
 CANONICAL_CHANNEL_HINTS = (
@@ -386,6 +451,7 @@ class LastFMAutoplay:
         self._explore_state: Dict[int, Dict[str, Any]] = {}
         self._guild_skip_stats: Dict[int, Dict[str, float]] = {}
         self._guild_preferences: Dict[int, Dict[str, Any]] = {}
+        self._session_genre_sentiment: Dict[int, Dict[str, Any]] = {}
 
         # Initialize Last.fm API
         self._init_lastfm_client()
@@ -644,6 +710,8 @@ class LastFMAutoplay:
                 "events": deque(maxlen=METRICS_HISTORY_LIMIT),
                 "last_updated": self._now(),
                 "last_diversity_notice": 0.0,
+                "autoplay_count": 0,
+                "consecutive_genre_skips": {},
             },
         )
         state["last_updated"] = self._now()
@@ -652,6 +720,33 @@ class LastFMAutoplay:
     def _get_exploration_rate(self, guild_id: int) -> float:
         state = self._get_exploration_state(guild_id)
         return float(state.get("epsilon", EPSILON_BASE))
+
+    def _compute_progressive_diversity_factor(self, guild_id: int) -> float:
+        """Compute progressive diversity multiplier based on session autoplay count."""
+        state = self._get_exploration_state(guild_id)
+        count = int(state.get("autoplay_count", 0))
+        if count < DIVERSITY_INJECT_START_TRACK:
+            return 1.0
+        overage = count - DIVERSITY_INJECT_START_TRACK
+        ramp_progress = min(1.0, overage / max(1.0, DIVERSITY_INJECT_RAMP_TRACKS))
+        multiplier = 1.0 + ramp_progress * (DIVERSITY_INJECT_MAX_MULTIPLIER - 1.0)
+        return multiplier
+
+    def _increment_autoplay_count(self, guild_id: int) -> None:
+        state = self._get_exploration_state(guild_id)
+        state["autoplay_count"] = int(state.get("autoplay_count", 0)) + 1
+
+    def _note_genre_skip(self, guild_id: int, genre: str) -> int:
+        """Track consecutive skips of same genre; return count."""
+        state = self._get_exploration_state(guild_id)
+        skip_map: Dict[str, int] = state.setdefault("consecutive_genre_skips", {})
+        skip_map[genre] = skip_map.get(genre, 0) + 1
+        return skip_map[genre]
+
+    def _reset_genre_skip_count(self, guild_id: int, genre: str) -> None:
+        state = self._get_exploration_state(guild_id)
+        skip_map: Dict[str, int] = state.get("consecutive_genre_skips", {})
+        skip_map.pop(genre, None)
 
     def _adjust_exploration_rate(
         self, guild_id: int, outcome: str, magnitude: float
@@ -894,6 +989,137 @@ class LastFMAutoplay:
         multiplier = 1.0 + max(-0.4, min(0.4, avg * 0.03))
         return max(0.5, min(1.6, multiplier))
 
+    @staticmethod
+    def _session_profile_decay(delta_seconds: float) -> float:
+        if delta_seconds <= 0.0:
+            return 1.0
+        exponent = -math.log(2.0) * (delta_seconds / SESSION_GENRE_SENTIMENT_HALFLIFE)
+        return math.exp(exponent)
+
+    def _decay_session_genre_sentiment(
+        self, guild_id: int, now: Optional[float] = None
+    ) -> None:
+        profile = self._session_genre_sentiment.get(guild_id)
+        if not profile:
+            return
+        tags_map: Dict[str, Dict[str, float]] = profile.get("tags", {})
+        if not tags_map:
+            return
+        now = now or self._now()
+        last_decay = float(profile.get("last_decay", profile.get("updated", now)))
+        elapsed = now - last_decay
+        if elapsed < 15.0:
+            return
+        decay_factor = self._session_profile_decay(elapsed)
+        if decay_factor >= 0.999:
+            profile["last_decay"] = now
+            return
+        to_remove: List[str] = []
+        for tag, entry in tags_map.items():
+            entry["pos"] = float(entry.get("pos", 0.0)) * decay_factor
+            entry["neg"] = float(entry.get("neg", 0.0)) * decay_factor
+            if (
+                entry["pos"] < SESSION_GENRE_SENTIMENT_MIN
+                and entry["neg"] < SESSION_GENRE_SENTIMENT_MIN
+            ):
+                to_remove.append(tag)
+        for tag in to_remove:
+            tags_map.pop(tag, None)
+        profile["last_decay"] = now
+
+    def _update_session_genre_sentiment(
+        self,
+        guild_id: int,
+        tags: List[str],
+        outcome: str,
+        ratio: float,
+        primary_listener_bias: bool,
+    ) -> None:
+        if not tags:
+            return
+        now = self._now()
+        profile = self._session_genre_sentiment.setdefault(
+            guild_id, {"tags": {}, "updated": now, "last_decay": now}
+        )
+        self._decay_session_genre_sentiment(guild_id, now)
+        tags_map: Dict[str, Dict[str, float]] = profile.setdefault("tags", {})
+        bias_multiplier = 1.2 if primary_listener_bias else 1.0
+
+        outcome_weights = {
+            "hard_skip": (0.0, 1.35),
+            "medium_skip": (0.0, 1.0),
+            "late_skip": (0.0, 0.55),
+            "finish": (1.0 + ratio * 0.6, 0.0),
+        }
+        pos_delta, neg_delta = outcome_weights.get(outcome, (0.0, 0.0))
+        if outcome == "finish" and ratio > 0.99:
+            pos_delta *= 1.15
+        pos_delta *= bias_multiplier
+        neg_delta *= bias_multiplier * (1.0 + max(0.0, 0.6 - ratio))
+
+        for raw_tag in tags[:5]:
+            tag = self._normalize_tag(raw_tag)
+            entry = tags_map.setdefault(tag, {"pos": 0.0, "neg": 0.0})
+            entry["pos"] = float(entry.get("pos", 0.0)) + pos_delta
+            entry["neg"] = float(entry.get("neg", 0.0)) + neg_delta
+        profile["updated"] = now
+
+    def _get_session_genre_multiplier(self, guild_id: int, tags: List[str]) -> float:
+        if not tags:
+            return 1.0
+        profile = self._session_genre_sentiment.get(guild_id)
+        if not profile:
+            return 1.0
+        self._decay_session_genre_sentiment(guild_id)
+        tags_map: Dict[str, Dict[str, float]] = profile.get("tags", {})
+        if not tags_map:
+            return 1.0
+        total_sentiment = 0.0
+        considered = 0
+        for raw_tag in tags[:5]:
+            tag = self._normalize_tag(raw_tag)
+            entry = tags_map.get(tag)
+            if not entry:
+                continue
+            pos = float(entry.get("pos", 0.0))
+            neg = float(entry.get("neg", 0.0))
+            total = pos + neg
+            if total <= 0.0:
+                continue
+            sentiment = (pos - neg) / total
+            total_sentiment += sentiment
+            considered += 1
+        if considered == 0:
+            return 1.0
+        avg_sentiment = total_sentiment / considered
+        multiplier = 1.0 + max(
+            -SESSION_GENRE_SENTIMENT_MAX_PENALTY,
+            min(SESSION_GENRE_SENTIMENT_MAX_BONUS, avg_sentiment * 0.5),
+        )
+        return max(0.25, min(1.7, multiplier))
+
+    def _get_session_disliked_tag(self, guild_id: int) -> Tuple[Optional[str], float]:
+        profile = self._session_genre_sentiment.get(guild_id)
+        if not profile:
+            return None, 0.0
+        self._decay_session_genre_sentiment(guild_id)
+        tags_map: Dict[str, Dict[str, float]] = profile.get("tags", {})
+        if not tags_map:
+            return None, 0.0
+        worst_tag = None
+        worst_sentiment = 0.0
+        for tag, entry in tags_map.items():
+            pos = float(entry.get("pos", 0.0))
+            neg = float(entry.get("neg", 0.0))
+            total = pos + neg
+            if total <= 0.0:
+                continue
+            sentiment = (pos - neg) / total
+            if sentiment < worst_sentiment:
+                worst_sentiment = sentiment
+                worst_tag = tag
+        return worst_tag, worst_sentiment
+
     def _record_feedback_metric(
         self,
         guild_id: int,
@@ -964,6 +1190,23 @@ class LastFMAutoplay:
                 for tag in raw_tags
                 if isinstance(tag, str)
             ]
+
+        self._update_session_genre_sentiment(
+            guild_id, tags, outcome, ratio, primary_listener_bias
+        )
+
+        if outcome in ("hard_skip", "medium_skip") and tags:
+            primary_genre = tags[0]
+            skip_count = self._note_genre_skip(guild_id, primary_genre)
+            if LOG_LEVEL >= 2 and skip_count >= 2:
+                LOG.debug(
+                    "[Feedback] Consecutive skip #%s for genre '%s' (guild=%s)",
+                    skip_count,
+                    primary_genre,
+                    guild_id,
+                )
+        elif outcome == "finish" and tags:
+            self._reset_genre_skip_count(guild_id, tags[0])
 
         candidate_multiplier = CANDIDATE_MULTIPLIERS.get(outcome, 1.0)
         if outcome == "finish":
@@ -2141,7 +2384,18 @@ class LastFMAutoplay:
                     (dominant_ratio - GENRE_DOMINANCE_THRESHOLD) * 0.6
                     + 0.02 * (dominant_count / max(len(recent_tags), 1)),
                 )
-        metadata_map: Dict[str, Dict[str, Any]] = {}
+        disliked_tag: Optional[str] = None
+        disliked_sentiment = 0.0
+        disliked_tag, disliked_sentiment = self._get_session_disliked_tag(guild_id)
+        if (
+            disliked_tag
+            and disliked_sentiment <= SESSION_GENRE_SENTIMENT_PENALTY_THRESHOLD
+        ):
+            additional = max(0.0, abs(disliked_sentiment) * 0.35 + 0.04)
+            remaining = max(0.0, EPSILON_DIVERSITY_BOOST_MAX - diversity_pressure)
+            diversity_increment = min(additional, remaining)
+            if diversity_increment > 0:
+                diversity_pressure += diversity_increment
 
         explore_state = self._get_exploration_state(guild_id)
         epsilon_baseline = float(explore_state.get("epsilon", EPSILON_BASE))
@@ -2149,16 +2403,59 @@ class LastFMAutoplay:
         if diversity_pressure > 0.0:
             epsilon_rate = min(EPSILON_MAX, epsilon_rate + diversity_pressure)
 
+        diversity_factor = self._compute_progressive_diversity_factor(guild_id)
+        epsilon_rate *= diversity_factor
+
+        state = self._get_exploration_state(guild_id)
+        skip_map: Dict[str, int] = state.get("consecutive_genre_skips", {})
+        escape_trigger_genre: Optional[str] = None
+        for genre, count in skip_map.items():
+            if count >= SESSION_GENRE_SKIP_ESCALATION_THRESHOLD:
+                escape_trigger_genre = genre
+                break
+
+        if disliked_tag:
+            explore_state["last_disliked_tag"] = disliked_tag
+            explore_state["last_disliked_strength"] = disliked_sentiment
+
+        metadata_map: Dict[str, Dict[str, Any]] = {}
+        cached_hit_count = 0
+        cache_snapshot: Dict[str, Dict[str, Any]] = {}
+        async with self._metadata_lock:
+            if self._metadata_cache:
+                cache_snapshot = self._metadata_cache.copy()
+        if cache_snapshot:
+            for candidate in candidate_pool:
+                track_key = candidate["track_key"]
+                entry = cache_snapshot.get(track_key)
+                if entry and not self._should_refresh_metadata(entry):
+                    metadata_map[track_key] = entry
+                    cached_hit_count += 1
+
+        if LOG_LEVEL >= 2 and cached_hit_count:
+            LOG.debug(
+                "[Metadata] Reused %s cached profiles prior to enrichment (pool=%s)",
+                cached_hit_count,
+                len(candidate_pool),
+            )
+
         enrichment_cutoff = min(len(candidate_pool), ENRICH_TOP_N)
-        LOG.debug(
-            "[Ranking] Reducing candidate size: start=%s → enrichment_top=%s (epsilon=%.3f → %.3f, diversity_boost=%.3f, dominant_tag=%s)",
-            len(candidate_pool),
-            enrichment_cutoff,
-            epsilon_baseline,
-            epsilon_rate,
-            diversity_pressure,
-            dominant_tag or "none",
-        )
+        if LOG_LEVEL >= 2:
+            autoplay_count = int(explore_state.get("autoplay_count", 0))
+            LOG.debug(
+                "[Ranking] Reducing candidate size: start=%s → enrichment_top=%s (epsilon=%.3f → %.3f, diversity_boost=%.3f, diversity_factor=%.2f, autoplay_count=%s, dominant_tag=%s, disliked_tag=%s/%.2f, escape_trigger=%s)",
+                len(candidate_pool),
+                enrichment_cutoff,
+                epsilon_baseline,
+                epsilon_rate,
+                diversity_pressure,
+                diversity_factor,
+                autoplay_count,
+                dominant_tag or "none",
+                disliked_tag or "none",
+                disliked_sentiment,
+                escape_trigger_genre or "none",
+            )
 
         # Phase 1: Collect all tracks that need Gemini enrichment
         top_for_enrichment = candidate_pool[:ENRICH_TOP_N]
@@ -2172,12 +2469,19 @@ class LastFMAutoplay:
             track = candidate["track"]
             require_enrichment = idx < 3
 
-            # Check cache first
-            async with self._metadata_lock:
-                cache_entry = self._metadata_cache.get(track_key, {})
-                if cache_entry and not self._should_refresh_metadata(cache_entry):
-                    metadata_map[track_key] = cache_entry
-                    continue
+            if track_key in metadata_map:
+                continue
+
+            # Check cache (fall back to disk snapshot if needed)
+            cache_entry: Optional[Dict[str, Any]] = None
+            if cache_snapshot:
+                cache_entry = cache_snapshot.get(track_key)
+            if cache_entry is None:
+                async with self._metadata_lock:
+                    cache_entry = self._metadata_cache.get(track_key)
+            if cache_entry and not self._should_refresh_metadata(cache_entry):
+                metadata_map[track_key] = cache_entry
+                continue
 
             # Need enrichment - add to batch list
             tracks_needing_enrichment.append(
@@ -2255,11 +2559,15 @@ class LastFMAutoplay:
             if track_key in metadata_map:
                 continue
 
-            async with self._metadata_lock:
-                cache_entry = self._metadata_cache.get(track_key, {})
-                if cache_entry and not self._should_refresh_metadata(cache_entry):
-                    metadata_map[track_key] = cache_entry
-                    continue
+            cache_entry: Optional[Dict[str, Any]] = None
+            if cache_snapshot:
+                cache_entry = cache_snapshot.get(track_key)
+            if cache_entry is None:
+                async with self._metadata_lock:
+                    cache_entry = self._metadata_cache.get(track_key)
+            if cache_entry and not self._should_refresh_metadata(cache_entry):
+                metadata_map[track_key] = cache_entry
+                continue
 
             additional_candidates.append(
                 (track_key, candidate["artist"], candidate["track"])
@@ -2486,14 +2794,37 @@ class LastFMAutoplay:
                 else:
                     base_score += diversity_pressure * 0.25
 
+            if escape_trigger_genre and escape_trigger_genre in candidate_tags:
+                base_score -= 0.75
+                if LOG_LEVEL >= 2:
+                    LOG.debug(
+                        "[Ranking] Escape penalty applied to %s - %s (genre=%s, consecutive_skips≥%s)",
+                        artist,
+                        track,
+                        escape_trigger_genre,
+                        SESSION_GENRE_SKIP_ESCALATION_THRESHOLD,
+                    )
+
+            if (
+                disliked_tag
+                and disliked_sentiment <= SESSION_GENRE_SENTIMENT_PENALTY_THRESHOLD
+                and disliked_tag in candidate_tags
+            ):
+                base_score -= abs(disliked_sentiment) * 0.35
+
             candidate_multiplier = self._get_candidate_feedback_multiplier(
                 guild_id, track_key
             )
             guild_pref_multiplier = self._get_guild_preference_multiplier(
                 guild_id, candidate_tags, artist_norm
             )
+            session_genre_multiplier = self._get_session_genre_multiplier(
+                guild_id, candidate_tags
+            )
 
-            base_score *= candidate_multiplier * guild_pref_multiplier
+            base_score *= (
+                candidate_multiplier * guild_pref_multiplier * session_genre_multiplier
+            )
 
             cooldown_remaining = self._artist_cooldowns.setdefault(guild_id, {}).get(
                 artist_norm, 0
@@ -2576,10 +2907,19 @@ class LastFMAutoplay:
                     genre_track.append(tags[0])
                     if len(genre_track) > GENRE_HISTORY_LIMIT:
                         del genre_track[:-GENRE_HISTORY_LIMIT]
+
+                self._increment_autoplay_count(guild_id)
             else:
                 self._mark_resolve_failure(
                     guild_id, candidate["artist"], candidate["track"]
                 )
+                if LOG_LEVEL >= 1:
+                    LOG.warning(
+                        "⚠️ [AutoPlay] Failed to resolve candidate '%s - %s' to playable track (guild=%s, reason=youtube_search_empty)",
+                        candidate["artist"],
+                        candidate["track"],
+                        guild_id,
+                    )
 
         if resolved:
             self._maybe_flush_mapping_cache(force=True)
@@ -3167,6 +3507,13 @@ Respond with ONLY the JSON object, no other text."""
             results = await node.get_tracks(f"ytsearch:{query}")
 
             if not results:
+                if LOG_LEVEL >= 1:
+                    LOG.warning(
+                        "⚠️ [YouTube] No search results for query '%s' (artist=%s, track=%s)",
+                        query,
+                        artist,
+                        track,
+                    )
                 return None
 
             # Filter and find best match
@@ -3187,6 +3534,13 @@ Respond with ONLY the JSON object, no other text."""
 
                 return best_match
 
+            if LOG_LEVEL >= 1:
+                LOG.warning(
+                    "⚠️ [YouTube] No acceptable match for '%s - %s' (best_score=%.2f, threshold=0.3)",
+                    artist,
+                    track,
+                    best_score,
+                )
             return None
 
         except Exception as e:
