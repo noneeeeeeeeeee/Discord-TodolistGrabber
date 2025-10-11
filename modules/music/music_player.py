@@ -1660,13 +1660,8 @@ class MusicPlayer(commands.Cog):
 
                 traceback.print_exc()
         else:
-            LOG.warning(f"[AutoPlay] Last.fm not available, will use YouTube fallback")
-
-        # Fallback to YouTube-based recommendations if Last.fm failed
-        if not lastfm_success:
-            LOG.info(f"[AutoPlay] Falling back to YouTube recommendations...")
-            lastfm_success = await self._youtube_autoplay_fallback(
-                player, current_entry, guild_id
+            LOG.warning(
+                f"[AutoPlay] Last.fm not available, disabling autoplay. Check your .env settings or dependencies. Make sure you've installed the requirements.txt"
             )
 
         return lastfm_success
