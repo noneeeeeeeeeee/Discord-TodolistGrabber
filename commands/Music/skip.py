@@ -31,7 +31,7 @@ class SkipCommands(commands.Cog):
     async def skip(self, ctx: commands.Context, index: int = None):
         player = self.bot.get_cog("MusicPlayer")
         if not player:
-            await ctx.send("Player backend missing.")
+            await ctx.send(":x: Player backend missing.")
             return
 
         is_valid, error_msg = player.check_user_in_bot_vc(ctx.author, ctx.guild)
@@ -64,7 +64,7 @@ class SkipCommands(commands.Cog):
                 )
                 await vc.stop()
 
-            await ctx.send(f"Skipped to position {index}.")
+            await ctx.send(f":fast_forward: Skipped to position {index}.")
             return
 
         # Regular skip (no index)
@@ -75,12 +75,14 @@ class SkipCommands(commands.Cog):
                     vc, ctx.guild.id, ctx.author.id, primary_listener_bias=True
                 )
                 await vc.stop()
-                await ctx.send("Skipped by DJ.")
+                await ctx.send(
+                    f":fast_forward: **{ctx.author.display_name}** skipped the track"
+                )
                 return
             q = player.queues.get(ctx.guild.id)
             if q:
                 q.popleft()
-                await ctx.send("Removed next queued track.")
+                await ctx.send(":boom: Removed next queued track.")
                 return
             await ctx.send("Nothing to skip.")
             return
@@ -125,18 +127,18 @@ class SkipCommands(commands.Cog):
             await ctx.send(
                 embed=discord.Embed(
                     title="Skip Vote",
-                    description="Threshold reached – skipping now!",
+                    description=f":white_check_mark: **Threshold reached** – {ctx.author.display_name} skipped the track!",
                     color=discord.Color.green(),
                 )
             )
         else:
-            status = f"{cur}/{needed} votes. {remaining} more required to skip."
             await ctx.send(
+                f"**{ctx.author.display_name}** wants to skip the current track",
                 embed=discord.Embed(
                     title="Skip Vote",
-                    description=status,
+                    description=f"**Votes:** {cur}/{needed}\n**Remaining:** {remaining} more vote(s) needed",
                     color=discord.Color.orange(),
-                )
+                ),
             )
 
 

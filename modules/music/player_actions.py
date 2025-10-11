@@ -75,17 +75,36 @@ async def handle_pause_action(
             guild.id, user.id, "pause", vc.channel
         )
 
+        if vote_result.get("already_voted"):
+            return {
+                "success": False,
+                "message": "You already voted to pause.",
+                "ephemeral": True,
+            }
+
         if vote_result["passed"]:
             await vc.set_pause(True)
+            remaining = 0
             return {
                 "success": True,
-                "message": f"⏸️ **{user.display_name}** paused the player ({vote_result['votes']}/{vote_result['needed']} votes)",
+                "message": "",  # Will be replaced with embed
+                "embed": discord.Embed(
+                    title="Pause Vote",
+                    description=f":white_check_mark: **Threshold reached** – {user.display_name} paused the player!",
+                    color=discord.Color.green(),
+                ),
                 "ephemeral": False,
             }
         else:
+            remaining = vote_result["needed"] - vote_result["votes"]
             return {
                 "success": False,
-                "message": f"🗳️ **{user.display_name}** voted to pause ({vote_result['votes']}/{vote_result['needed']} needed)",
+                "message": f"**{user.display_name}** wants to pause the player",
+                "embed": discord.Embed(
+                    title="Pause Vote",
+                    description=f"**Votes:** {vote_result['votes']}/{vote_result['needed']}\n**Remaining:** {remaining} more vote(s) needed",
+                    color=discord.Color.orange(),
+                ),
                 "ephemeral": True,
             }
 
@@ -120,17 +139,35 @@ async def handle_resume_action(
             guild.id, user.id, "resume", vc.channel
         )
 
+        if vote_result.get("already_voted"):
+            return {
+                "success": False,
+                "message": "You already voted to resume.",
+                "ephemeral": True,
+            }
+
         if vote_result["passed"]:
             await vc.set_pause(False)
             return {
                 "success": True,
-                "message": f"▶️ **{user.display_name}** resumed the player ({vote_result['votes']}/{vote_result['needed']} votes)",
+                "message": "",  # Will be replaced with embed
+                "embed": discord.Embed(
+                    title="Resume Vote",
+                    description=f":white_check_mark: **Threshold reached** – {user.display_name} resumed the player!",
+                    color=discord.Color.green(),
+                ),
                 "ephemeral": False,
             }
         else:
+            remaining = vote_result["needed"] - vote_result["votes"]
             return {
                 "success": False,
-                "message": f"🗳️ **{user.display_name}** voted to resume ({vote_result['votes']}/{vote_result['needed']} needed)",
+                "message": f"**{user.display_name}** wants to resume the player",
+                "embed": discord.Embed(
+                    title="Resume Vote",
+                    description=f"**Votes:** {vote_result['votes']}/{vote_result['needed']}\n**Remaining:** {remaining} more vote(s) needed",
+                    color=discord.Color.orange(),
+                ),
                 "ephemeral": True,
             }
 
@@ -159,7 +196,7 @@ async def handle_skip_action(
             await vc.stop()
             return {
                 "success": True,
-                "message": f"⏭️ **{user.display_name}** skipped the track",
+                "message": f":fast_forward: **{user.display_name}** skipped the track",
                 "ephemeral": False,
             }
         except Exception as e:
@@ -181,7 +218,7 @@ async def handle_skip_action(
                 await vc.stop()
                 return {
                     "success": True,
-                    "message": f"⏭️ **{user.display_name}** skipped the track ({vote_result['votes']}/{vote_result['needed']} votes)",
+                    "message": f":fast_forward: **{user.display_name}** skipped the track ({vote_result['votes']}/{vote_result['needed']} votes)",
                     "ephemeral": False,
                 }
             except Exception as e:
@@ -233,17 +270,35 @@ async def handle_repeat_action(
             guild.id, user.id, f"repeat_{mode}", None
         )
 
+        if vote_result.get("already_voted"):
+            return {
+                "success": False,
+                "message": f"You already voted to set repeat to {mode_text}.",
+                "ephemeral": True,
+            }
+
         if vote_result["passed"]:
             player.repeat_mode[guild.id] = mode
             return {
                 "success": True,
-                "message": f"🔁 **{user.display_name}** set repeat to **{mode_text}** ({vote_result['votes']}/{vote_result['needed']} votes)",
+                "message": "",  # Will be replaced with embed
+                "embed": discord.Embed(
+                    title="Repeat Vote",
+                    description=f":white_check_mark: **Threshold reached** – {user.display_name} set repeat to **{mode_text}**!",
+                    color=discord.Color.green(),
+                ),
                 "ephemeral": False,
             }
         else:
+            remaining = vote_result["needed"] - vote_result["votes"]
             return {
                 "success": False,
-                "message": f"🗳️ **{user.display_name}** voted to change repeat ({vote_result['votes']}/{vote_result['needed']} needed)",
+                "message": f"**{user.display_name}** wants to set repeat to **{mode_text}**",
+                "embed": discord.Embed(
+                    title="Repeat Vote",
+                    description=f"**Votes:** {vote_result['votes']}/{vote_result['needed']}\n**Remaining:** {remaining} more vote(s) needed",
+                    color=discord.Color.orange(),
+                ),
                 "ephemeral": True,
             }
 

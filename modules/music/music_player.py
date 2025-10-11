@@ -193,11 +193,12 @@ class MusicPlayer(commands.Cog):
         self._session_autoplay_disabled = defaultdict(bool)
         self._command_channels: Dict[int, discord.abc.Messageable] = {}
         self._last_successful_autoplay_track: Dict[int, Dict[str, Any]] = {}
-        self._autoplay_session_started: Dict[int, bool] = (
-            {}
-        )  # Track first autoplay per session
+        self._autoplay_session_started: Dict[int, bool] = {}
         self._playback_state: Dict[int, Dict[str, Any]] = {}
         self._pending_feedback: Dict[int, Dict[str, Any]] = {}
+
+        # Vote tracking with metadata
+        self._active_votes: Dict[str, Dict[str, Any]] = {}
 
         # Initialize Last.fm autoplay
         LOG.info("[AutoPlay] Attempting to initialize Last.fm module...")
@@ -2539,7 +2540,7 @@ lavalink:
         voice_channel: Optional[discord.VoiceChannel] = None,
     ) -> dict:
         """
-        Handle voting for music actions.
+        Handle voting for music actions with timeout and track change detection.
 
         Args:
             guild_id: Guild ID
@@ -2552,16 +2553,76 @@ lavalink:
                 - passed: bool - Whether vote threshold reached
                 - votes: int - Current vote count
                 - needed: int - Votes needed to pass
+                - already_voted: bool - Whether user already voted
         """
+        import time
+
+        # Get vote timeout from config
+        cfg = __import__("modules.setconfig", fromlist=["json_get"]).json_get(guild_id)
+        vote_timeout = cfg.get("Music", {}).get("VoteTimeout", 120)
+
         # Create vote key for this action
         vote_key = f"{guild_id}_{action}"
 
-        if not hasattr(self, "_active_votes"):
-            self._active_votes = defaultdict(set)
+        # skip/repeat actions expire on track change, others use timeout
+        track_bound_actions = ["skip", "repeat_off", "repeat_track"]
+        action_type = (
+            "track_bound"
+            if any(a in action for a in track_bound_actions)
+            else "timeout"
+        )
 
-        # Add user's vote
-        self._active_votes[vote_key].add(user_id)
-        current_votes = len(self._active_votes[vote_key])
+        # Get current track ID for track-bound votes
+        current_track_id = None
+        if action_type == "track_bound":
+            current_entry = self._current_entries.get(guild_id)
+            if current_entry:
+                current_track_id = current_entry.get("uri", "") or current_entry.get(
+                    "title", ""
+                )
+
+        # Initialize or get vote data
+        if vote_key not in self._active_votes:
+            self._active_votes[vote_key] = {
+                "voters": set(),
+                "track_id": current_track_id,
+                "timestamp": time.time(),
+                "action_type": action_type,
+            }
+
+        vote_data = self._active_votes[vote_key]
+
+        # Check if vote expired (timeout-based actions only)
+        if action_type == "timeout":
+            if time.time() - vote_data["timestamp"] > vote_timeout:
+                # Vote expired, reset
+                self._active_votes[vote_key] = {
+                    "voters": set(),
+                    "track_id": current_track_id,
+                    "timestamp": time.time(),
+                    "action_type": action_type,
+                }
+                vote_data = self._active_votes[vote_key]
+
+        # Check if track changed (track-bound actions only)
+        if action_type == "track_bound" and vote_data["track_id"] != current_track_id:
+            # Track changed, vote is invalid, reset
+            self._active_votes[vote_key] = {
+                "voters": set(),
+                "track_id": current_track_id,
+                "timestamp": time.time(),
+                "action_type": action_type,
+            }
+            vote_data = self._active_votes[vote_key]
+
+        # Check if user already voted
+        already_voted = user_id in vote_data["voters"]
+
+        if not already_voted:
+            # Add user's vote
+            vote_data["voters"].add(user_id)
+
+        current_votes = len(vote_data["voters"])
 
         # Calculate needed votes
         needed_votes = 1
@@ -2584,7 +2645,12 @@ lavalink:
         if passed:
             self._active_votes.pop(vote_key, None)
 
-        return {"passed": passed, "votes": current_votes, "needed": needed_votes}
+        return {
+            "passed": passed,
+            "votes": current_votes,
+            "needed": needed_votes,
+            "already_voted": already_voted,
+        }
 
     def clear_votes_for_guild(self, guild_id: int) -> None:
         """Clear all active votes for a guild."""

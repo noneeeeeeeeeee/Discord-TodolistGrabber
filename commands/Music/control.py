@@ -53,7 +53,10 @@ class ControlCommands(commands.Cog):
         result = await handle_pause_action(
             player, ctx.guild, ctx.author, vc, ctx.channel
         )
-        await ctx.send(result["message"])
+        if result.get("embed"):
+            await ctx.send(result.get("message", ""), embed=result["embed"])
+        else:
+            await ctx.send(result["message"])
 
     @commands.hybrid_command(
         name="resume", description="Resume playback (requires voting or DJ)."
@@ -94,7 +97,10 @@ class ControlCommands(commands.Cog):
         result = await handle_resume_action(
             player, ctx.guild, ctx.author, vc, ctx.channel
         )
-        await ctx.send(result["message"])
+        if result.get("embed"):
+            await ctx.send(result.get("message", ""), embed=result["embed"])
+        else:
+            await ctx.send(result["message"])
 
     @commands.hybrid_command(
         name="disconnect",
@@ -289,7 +295,10 @@ class ControlCommands(commands.Cog):
 
         # Handle repeat action using unified function
         result = await handle_repeat_action(player, ctx.guild, ctx.author, mode)
-        await ctx.send(result["message"])
+        if result.get("embed"):
+            await ctx.send(result.get("message", ""), embed=result["embed"])
+        else:
+            await ctx.send(result["message"])
 
     @commands.hybrid_command(
         name="autoplay",

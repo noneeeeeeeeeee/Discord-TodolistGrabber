@@ -656,7 +656,8 @@ class PlayerControlView(View):
                 )
                 await vc.stop()
                 await interaction.response.send_message(
-                    f"⏭️ **{interaction.user.display_name}** skipped the track"
+                    f":fast_forward: **{interaction.user.display_name}** skipped the track",
+                    ephemeral=True,  # Make it ephemeral to avoid double announcements
                 )
             except Exception as e:
                 await interaction.response.send_message(
@@ -666,6 +667,14 @@ class PlayerControlView(View):
             vote_result = await self.player.handle_vote_action(
                 self.guild_id, interaction.user.id, "skip", vc.channel
             )
+
+            if vote_result.get("already_voted"):
+                await interaction.response.send_message(
+                    "You already voted to skip this track.",
+                    ephemeral=True,
+                )
+                return
+
             if vote_result["passed"]:
                 try:
                     await self.player.note_skip(
@@ -676,16 +685,25 @@ class PlayerControlView(View):
                     )
                     await vc.stop()
                     await interaction.response.send_message(
-                        f"⏭️ **{interaction.user.display_name}** skipped the track ({vote_result['votes']}/{vote_result['needed']} votes)"
+                        embed=discord.Embed(
+                            title="Skip Vote",
+                            description=f":white_check_mark: **Threshold reached** – {interaction.user.display_name} skipped the track!",
+                            color=discord.Color.green(),
+                        )
                     )
                 except Exception as e:
                     await interaction.response.send_message(
                         f"❌ Failed to skip: {e}", ephemeral=True
                     )
             else:
+                remaining = vote_result["needed"] - vote_result["votes"]
                 await interaction.response.send_message(
-                    f"🗳️ **{interaction.user.display_name}** voted to skip ({vote_result['votes']}/{vote_result['needed']} needed)",
-                    ephemeral=True,
+                    f"**{interaction.user.display_name}** wants to skip the current track",
+                    embed=discord.Embed(
+                        title="Skip Vote",
+                        description=f"**Votes:** {vote_result['votes']}/{vote_result['needed']}\n**Remaining:** {remaining} more vote(s) needed",
+                        color=discord.Color.orange(),
+                    ),
                 )
 
     @discord.ui.button(

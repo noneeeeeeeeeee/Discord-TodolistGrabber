@@ -171,6 +171,14 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "access": 3,
             "description": "Percentage of voice channel members required to vote skip (0.1 = 10%, 1.0 = 100%).",
         },
+        "VoteTimeout": {
+            "type": "int",
+            "default": 120,
+            "min": 30,
+            "max": 600,
+            "access": 0,
+            "description": "Timeout in seconds for non-skip votes (pause, resume, autoplay). Skip/repeat votes last until track changes.",
+        },
         "AutoPlay": {
             "type": "bool",
             "default": False,
