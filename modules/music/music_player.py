@@ -108,6 +108,11 @@ SPONSORBLOCK_ALLOWED = {
 
 NON_SONG_SEGMENTS = {"intro", "outro", "preview", "filler", "music_offtopic"}
 
+# Feedback thresholds
+FINISH_THRESHOLD = (
+    0.9  # Progress ratio considered a full completion (same as lastfm_autoplay)
+)
+
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
 
 DEFAULT_AUTOPLAY_MAX_RESULTS = 25
@@ -1028,7 +1033,18 @@ class MusicPlayer(commands.Cog):
             reason,
         )
 
+        # Debug: Log track end details
+        gid = player.guild.id
+        queue_size = len(player.queue._queue) if hasattr(player.queue, "_queue") else 0
+        print(
+            f"[TRACK_END] Guild {gid}, reason='{reason}' (type={type(reason).__name__}, repr={repr(reason)}), queue_size={queue_size}, repeat_mode={self.repeat_mode.get(gid, 'off')}"
+        )
+
         pending_feedback = self._pending_feedback.pop(player.guild.id, None)
+        print(
+            f"[TRACK_END] Guild {gid}: pending_feedback exists = {pending_feedback is not None}, value = {pending_feedback}"
+        )
+
         await self._record_playback_feedback_for_current(
             player,
             player.guild.id,
@@ -1278,11 +1294,22 @@ class MusicPlayer(commands.Cog):
             return result
 
     async def _play_next(self, player: pomice.Player):
+        print(
+            f"[PLAY_NEXT] Called for guild {player.guild.id}, queue_empty={player.queue.is_empty}"
+        )
+
         if player.queue.is_empty:
+            print(
+                f"[PLAY_NEXT] Queue is empty for guild {player.guild.id}, scheduling idle disconnect"
+            )
             await self._schedule_idle_disconnect(player)
             return
         try:
             track: pomice.Track = player.queue.get()
+            print(
+                f"[PLAY_NEXT] Got track from queue: {getattr(track, 'title', 'Unknown')}"
+            )
+
             meta = self.queues[player.guild.id]
             entry = meta.popleft() if meta else {}
             entry.setdefault("title", getattr(track, "title", "Unknown"))
@@ -1295,9 +1322,14 @@ class MusicPlayer(commands.Cog):
             self._current_entries[player.guild.id] = entry
             self.voteskip[player.guild.id].clear()
             self._playing_flags[player.guild.id] = True
+
+            print(f"[PLAY_NEXT] Starting playback: {entry['title']}")
             await player.play(track)
             await self._cancel_idle(player.guild.id)
         except Exception as e:
+            print(
+                f"[PLAY_NEXT] ERROR: Failed to start track for guild {player.guild.id}: {e}"
+            )
             LOG.warning("Failed to start track: %s", e)
             self._playing_flags[player.guild.id] = False
             await self._advance_or_idle(player)
@@ -1345,30 +1377,47 @@ class MusicPlayer(commands.Cog):
         self, player: Optional[Any], guild_id: int
     ) -> Optional[float]:
         state = self._playback_state.get(guild_id)
+        print(f"[ESTIMATE_RATIO] Guild {guild_id}: state exists = {state is not None}")
+
         if state is None:
             entry = self._current_entries.get(guild_id, {})
             track = entry.get("track") if isinstance(entry, dict) else None
             self._initialize_playback_state(guild_id, track, entry)
             state = self._playback_state.get(guild_id)
+            print(f"[ESTIMATE_RATIO] Guild {guild_id}: Initialized state = {state}")
         if not state:
+            print(f"[ESTIMATE_RATIO] Guild {guild_id}: No state, returning None")
             return None
 
         if isinstance(player, pomice.Player):
             self._refresh_player_position(player, guild_id)
 
         length_ms = state.get("length_ms")
+        print(f"[ESTIMATE_RATIO] Guild {guild_id}: length_ms = {length_ms}")
+
         if not length_ms or length_ms <= 0:
+            print(
+                f"[ESTIMATE_RATIO] Guild {guild_id}: Invalid length_ms, returning None"
+            )
             return None
 
         position_ms = max(0.0, float(state.get("last_known_position_ms", 0)))
         timestamp = state.get("position_timestamp")
+        print(
+            f"[ESTIMATE_RATIO] Guild {guild_id}: position_ms = {position_ms}, timestamp = {timestamp}"
+        )
+
         if timestamp is not None:
             elapsed_ms = max(0.0, (time.time() - timestamp) * 1000.0)
             position_ms = min(position_ms + elapsed_ms, float(length_ms))
             state["last_known_position_ms"] = int(position_ms)
             state["position_timestamp"] = time.time()
+            print(
+                f"[ESTIMATE_RATIO] Guild {guild_id}: After elapsed calc - position_ms = {position_ms}, elapsed_ms = {elapsed_ms}"
+            )
 
         ratio = position_ms / float(length_ms)
+        print(f"[ESTIMATE_RATIO] Guild {guild_id}: FINAL ratio = {ratio}")
         return max(0.0, min(1.0, ratio))
 
     def note_seek(self, guild_id: int, position_ms: int) -> None:
@@ -1461,11 +1510,14 @@ class MusicPlayer(commands.Cog):
         ratio = None
         if pending:
             ratio = pending.get("ratio")
+            print(f"[FEEDBACK_DEBUG] Guild {guild_id}: Got ratio from pending: {ratio}")
         if ratio is None:
             state = self._playback_state.get(guild_id)
             if state and state.get("recorded"):
+                print(f"[FEEDBACK_DEBUG] Guild {guild_id}: Already recorded, skipping")
                 return
             ratio = self._estimate_progress_ratio(player, guild_id)
+            print(f"[FEEDBACK_DEBUG] Guild {guild_id}: Estimated ratio: {ratio}")
             state = self._playback_state.get(guild_id)
         if ratio is None:
             LOG.debug(
@@ -1474,10 +1526,40 @@ class MusicPlayer(commands.Cog):
             )
             return
 
-        if reason and reason.upper() == "FINISHED":
+        print(
+            f"[FEEDBACK_DEBUG] Guild {guild_id}: BEFORE reason check - reason='{reason}', ratio={ratio}, pending={pending is not None}"
+        )
+
+        # Check if track finished naturally (Lavalink sends "finished" in lowercase)
+        # However, some Pomice/Lavalink versions send empty string for all end events
+        if reason and reason.lower() in ("finished", "finish"):
+            print(
+                f"[FEEDBACK_DEBUG] Guild {guild_id}: Reason is '{reason}', setting ratio to 1.0"
+            )
             ratio = 1.0
+        elif not reason or reason.strip() == "":
+            # Empty reason - need to infer from context
+            # If no pending feedback, ALWAYS assume natural finish (autoplay doesn't skip without user action)
+            if pending:
+                print(
+                    f"[FEEDBACK_DEBUG] Guild {guild_id}: Empty reason WITH pending feedback (manual skip), keeping ratio={ratio:.3f}"
+                )
+            else:
+                # No pending feedback = no manual skip = natural finish
+                # Position tracking often fails (ratio=0.0), so we can't rely on it
+                print(
+                    f"[FEEDBACK_DEBUG] Guild {guild_id}: Empty reason, NO pending feedback (natural finish), setting ratio to 1.0 (was {ratio:.3f})"
+                )
+                ratio = 1.0
+        else:
+            print(
+                f"[FEEDBACK_DEBUG] Guild {guild_id}: Reason is '{reason}', NOT a finish reason"
+            )
 
         ratio = max(0.0, min(1.0, float(ratio)))
+        print(
+            f"[FEEDBACK_DEBUG] Guild {guild_id}: AFTER reason check - final ratio={ratio}"
+        )
         primary_bias = bool(pending.get("primary_listener_bias")) if pending else False
 
         duration_ms = None
@@ -1512,9 +1594,16 @@ class MusicPlayer(commands.Cog):
             )
 
     async def _advance_or_idle(self, player: pomice.Player):
-        if not player.queue.is_empty:
+        queue_empty = player.queue.is_empty
+        print(f"[ADVANCE_OR_IDLE] Guild {player.guild.id}, queue_empty={queue_empty}")
+
+        if not queue_empty:
+            print(f"[ADVANCE_OR_IDLE] Calling _play_next for guild {player.guild.id}")
             await self._play_next(player)
         else:
+            print(
+                f"[ADVANCE_OR_IDLE] Queue empty, attempting autoplay for guild {player.guild.id}"
+            )
             autoplayed = await self._maybe_autoplay(player)
             if not autoplayed:
                 await self._schedule_idle_disconnect(player)

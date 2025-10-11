@@ -94,12 +94,34 @@ class SkipCommands(commands.Cog):
         remaining = max(0, needed - cur)
         if cur >= needed:
             vc = ctx.guild.voice_client
+            player.voteskip[ctx.guild.id].clear()
+
+            # Log queue state before skip
+            pomice_player = vc if isinstance(vc, __import__("pomice").Player) else None
+            queue_size = 0
+            if pomice_player and hasattr(pomice_player, "queue"):
+                queue_size = (
+                    len(pomice_player.queue._queue)
+                    if hasattr(pomice_player.queue, "_queue")
+                    else 0
+                )
+
+            print(
+                f"[VOTESKIP] Vote passed for guild {ctx.guild.id}. Queue size: {queue_size}"
+            )
+
             if vc and is_voice_playing(vc):
                 await player.note_skip(
                     vc, ctx.guild.id, ctx.author.id, primary_listener_bias=False
                 )
+                print(f"[VOTESKIP] Calling vc.stop() for guild {ctx.guild.id}")
                 await vc.stop()
-            player.voteskip[ctx.guild.id].clear()
+                print(f"[VOTESKIP] vc.stop() completed for guild {ctx.guild.id}")
+            else:
+                print(
+                    f"[VOTESKIP] WARNING: vc is None or not playing (guild={ctx.guild.id}, vc={vc}, playing={is_voice_playing(vc) if vc else False})"
+                )
+
             await ctx.send(
                 embed=discord.Embed(
                     title="Skip Vote",

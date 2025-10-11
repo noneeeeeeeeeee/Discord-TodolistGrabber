@@ -294,13 +294,14 @@ class ControlCommands(commands.Cog):
     @commands.hybrid_command(
         name="autoplay",
         aliases=["ap"],
-        description="Enable or disable AutoPlay (requires voting or DJ).",
+        description="Enable, disable, or view status of AutoPlay.",
     )
-    @discord.app_commands.describe(state="Enable or disable AutoPlay")
+    @discord.app_commands.describe(state="Enable, disable, or view status of AutoPlay")
     @discord.app_commands.choices(
         state=[
             discord.app_commands.Choice(name="Enable", value="enable"),
             discord.app_commands.Choice(name="Disable", value="disable"),
+            discord.app_commands.Choice(name="Status", value="status"),
         ]
     )
     async def autoplay(
@@ -308,7 +309,7 @@ class ControlCommands(commands.Cog):
         ctx: commands.Context,
         state: str = None,
     ):
-        """Toggle AutoPlay with voting system."""
+        """Toggle AutoPlay or view status."""
         player = self._get_player()
         if not player:
             await ctx.send(":x: Player backend not available.")
@@ -321,9 +322,14 @@ class ControlCommands(commands.Cog):
             await ctx.send(f"🎲 AutoPlay is currently **{state_text}**")
             return
 
-        # Validate state
+        # Handle status command
+        if state == "status":
+            await self._show_autoplay_status(ctx, player)
+            return
+
+        # Validate state for enable/disable
         if state not in ["enable", "disable"]:
-            await ctx.send(":x: State must be: `enable` or `disable`")
+            await ctx.send(":x: State must be: `enable`, `disable`, or `status`")
             return
 
         vc = ctx.guild.voice_client
@@ -366,6 +372,178 @@ class ControlCommands(commands.Cog):
                     f"🗳️ Vote registered. Need {vote_result['needed']} votes to {state_text} autoplay. "
                     f"({vote_result['votes']}/{vote_result['needed']})"
                 )
+
+    async def _show_autoplay_status(self, ctx: commands.Context, player):
+        """Display detailed autoplay recommendation system status."""
+        # Get LastFM autoplay instance
+        lastfm_autoplay = getattr(player, "_lastfm_autoplay", None)
+        if not lastfm_autoplay or not lastfm_autoplay.is_available():
+            await ctx.send(":x: AutoPlay system not available.")
+            return
+
+        guild_id = ctx.guild.id
+
+        # Check if autoplay is enabled
+        autoplay_enabled = player.is_session_autoplay_enabled(guild_id)
+
+        # Get exploration state
+        explore_state = lastfm_autoplay._get_exploration_state(guild_id)
+        epsilon = float(explore_state.get("epsilon", 0.08))
+        autoplay_count = int(explore_state.get("autoplay_count", 0))
+        consecutive_skips = explore_state.get("consecutive_genre_skips", {})
+
+        # Get progressive diversity factor
+        diversity_factor = lastfm_autoplay._compute_progressive_diversity_factor(
+            guild_id
+        )
+
+        # Get genre sentiment data
+        sentiment_profile = lastfm_autoplay._session_genre_sentiment.get(guild_id)
+        liked_genres = []
+        disliked_genres = []
+
+        if sentiment_profile:
+            lastfm_autoplay._decay_session_genre_sentiment(guild_id)
+            tags_map = sentiment_profile.get("tags", {})
+
+            for tag, entry in tags_map.items():
+                pos = float(entry.get("pos", 0.0))
+                neg = float(entry.get("neg", 0.0))
+                total = pos + neg
+                if total <= 0.0:
+                    continue
+                sentiment = (pos - neg) / total
+
+                if sentiment > 0.2:
+                    liked_genres.append((tag, sentiment))
+                elif sentiment < -0.2:
+                    disliked_genres.append((tag, sentiment))
+
+        # Sort by sentiment strength
+        liked_genres.sort(key=lambda x: x[1], reverse=True)
+        disliked_genres.sort(key=lambda x: x[1])
+
+        # Get genre history for recent trends
+        genre_history = lastfm_autoplay._genre_history.get(guild_id, [])
+        recent_genres = (
+            genre_history[-12:] if len(genre_history) >= 12 else genre_history
+        )
+
+        # Calculate genre dominance
+        dominant_genre = None
+        dominant_ratio = 0.0
+        if recent_genres:
+            from collections import Counter
+
+            genre_counts = Counter(recent_genres)
+            most_common = genre_counts.most_common(1)[0]
+            dominant_genre = most_common[0]
+            dominant_ratio = most_common[1] / len(recent_genres)
+
+        # Get disliked tag info
+        disliked_tag, disliked_sentiment = lastfm_autoplay._get_session_disliked_tag(
+            guild_id
+        )
+
+        # Build embed
+        embed = discord.Embed(
+            title="🎲 AutoPlay Status",
+            description=f"**Status:** {'✅ Enabled' if autoplay_enabled else '❌ Disabled'}",
+            color=(
+                discord.Color.blue() if autoplay_enabled else discord.Color.grayed_out()
+            ),
+        )
+
+        # Diversity metrics
+        effective_epsilon = epsilon * diversity_factor
+        diversity_info = f"**Base Epsilon:** `{epsilon:.3f}`\n"
+        diversity_info += f"**Progressive Multiplier:** `{diversity_factor:.2f}x`\n"
+        diversity_info += f"**Effective Diversity:** `{effective_epsilon:.3f}`\n"
+        diversity_info += f"**Autoplay Count:** `{autoplay_count}` tracks"
+
+        if autoplay_count < 10:
+            diversity_info += " (similarity phase)"
+        elif autoplay_count < 18:
+            diversity_info += " (ramping diversity)"
+        else:
+            diversity_info += " (full diversity)"
+
+        embed.add_field(name="📊 Diversity Factor", value=diversity_info, inline=False)
+
+        # Liked genres
+        if liked_genres:
+            liked_text = "\n".join(
+                [
+                    f"• **{tag}** ({sentiment:+.2f})"
+                    for tag, sentiment in liked_genres[:5]
+                ]
+            )
+        else:
+            liked_text = "*No preference data yet*"
+        embed.add_field(name="💚 Preferred Genres", value=liked_text, inline=True)
+
+        # Disliked genres
+        if disliked_genres:
+            disliked_text = "\n".join(
+                [
+                    f"• **{tag}** ({sentiment:+.2f})"
+                    for tag, sentiment in disliked_genres[:5]
+                ]
+            )
+        else:
+            disliked_text = "*No dislikes detected*"
+        embed.add_field(name="💔 Disliked Genres", value=disliked_text, inline=True)
+
+        # Consecutive skip tracking
+        if consecutive_skips:
+            skip_text = "\n".join(
+                [
+                    f"• **{genre}**: `{count}` consecutive skips"
+                    for genre, count in sorted(
+                        consecutive_skips.items(), key=lambda x: x[1], reverse=True
+                    )[:3]
+                ]
+            )
+            embed.add_field(name="⏭️ Skip Patterns", value=skip_text, inline=False)
+
+        # Next candidate pool requirements
+        requirements = "**Next Recommendation Strategy:**\n"
+
+        if effective_epsilon < 0.10:
+            requirements += "🎯 **High Similarity** - Sticking close to current vibe\n"
+        elif effective_epsilon < 0.20:
+            requirements += (
+                "🔀 **Balanced Mix** - Similar tracks with occasional variety\n"
+            )
+        else:
+            requirements += "🌈 **High Diversity** - Exploring new territory\n"
+
+        if dominant_genre and dominant_ratio > 0.55:
+            requirements += f"⚠️ **Genre Dominance Alert:** *{dominant_genre}* ({dominant_ratio:.0%})\n"
+            requirements += "→ Boosting diversity to break repetition\n"
+
+        if disliked_tag and disliked_sentiment < -0.35:
+            requirements += f"🚫 **Avoiding:** *{disliked_tag}* (sentiment: {disliked_sentiment:.2f})\n"
+
+        if consecutive_skips:
+            escape_genres = [g for g, c in consecutive_skips.items() if c >= 4]
+            if escape_genres:
+                requirements += f"🔴 **Escape Mode:** Heavily penalizing {', '.join(escape_genres)}\n"
+
+        if liked_genres:
+            top_liked = ", ".join([tag for tag, _ in liked_genres[:3]])
+            requirements += f"✨ **Boosting:** {top_liked}\n"
+
+        embed.add_field(
+            name="🎯 Recommendation Profile", value=requirements, inline=False
+        )
+
+        # Footer
+        embed.set_footer(
+            text=f"Session data decays over 45 minutes • {len(genre_history)} tracks in history"
+        )
+
+        await ctx.send(embed=embed)
 
 
 async def setup(bot):
