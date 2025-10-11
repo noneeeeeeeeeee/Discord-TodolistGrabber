@@ -301,6 +301,9 @@ BAD_TITLE_KEYWORDS = (
     "fan mix",
     "audio",
     "covered by",
+    "extended version",
+    "extended",
+    "version",
     # performance / live
     "live",
     "live at",
