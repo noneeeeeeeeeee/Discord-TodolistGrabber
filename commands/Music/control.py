@@ -507,7 +507,7 @@ class ControlCommands(commands.Cog):
             embed.add_field(name="⏭️ Skip Patterns", value=skip_text, inline=False)
 
         # Next candidate pool requirements
-        requirements = "**Next Recommendation Strategy:**\n"
+        requirements = "**:sparkles: Next Recommendation Strategy:**\n"
 
         if effective_epsilon < 0.10:
             requirements += "🎯 **High Similarity** - Sticking close to current vibe\n"
@@ -532,7 +532,7 @@ class ControlCommands(commands.Cog):
 
         if liked_genres:
             top_liked = ", ".join([tag for tag, _ in liked_genres[:3]])
-            requirements += f"✨ **Boosting:** {top_liked}\n"
+            requirements += f":chart_with_upwards_trend: **Boosting:** {top_liked}\n"
 
         embed.add_field(
             name="🎯 Recommendation Profile", value=requirements, inline=False
