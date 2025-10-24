@@ -28,7 +28,7 @@ from modules.music.lavalink.manager import (
 
 # Import Last.fm autoplay
 try:
-    from modules.music.autoplayengine_v1 import get_lastfm_autoplay
+    from modules.music.Autoplay_Engine.v1.autoplayengine_v1 import get_lastfm_autoplay
 
     LASTFM_AUTOPLAY_AVAILABLE = True
 except ImportError:
