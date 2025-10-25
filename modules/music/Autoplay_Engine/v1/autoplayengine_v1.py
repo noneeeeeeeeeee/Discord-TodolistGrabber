@@ -23,7 +23,7 @@ LOG = logging.getLogger(__name__)
 # |__|__|___|_| |___|__|  |_|__,|_  |
 #                              |___|
 # This module implements Last.fm-based autoplay recommendations with Gemini AI parsing.
-
+# This module has been deprecated. Use it for reference only. It will be removed once 2 versions behind (v3 comes out).
 
 LOG_LEVEL = 1  # 0=ERROR, 1=INFO, 2=DEBUG, 3=All (Higher number more verbose)
 SESSION_HISTORY_LIMIT = 50  # How many recent tracks to remember in a single session (if you change this value, you may need to change the other numbers to fit with it)
@@ -406,7 +406,8 @@ class LastFMAutoplay:
         self.api_key: Optional[str] = None
         self._cache_dir = Path("cache/music")
         self._cache_dir.mkdir(parents=True, exist_ok=True)
-        self._cache_file = self._cache_dir / "lastfm_mappings.json"
+        # V1 uses separate cache file to avoid conflicts with V2
+        self._cache_file = self._cache_dir / "lastfm_mappings_v1.json"
         self._cache: Dict[str, Tuple[str, float]] = {}
         self._recent_autoplayed: Dict[int, List[Dict[str, Any]]] = (
             {}
@@ -418,7 +419,8 @@ class LastFMAutoplay:
             {}
         )  # Guild -> List of recent genres (for diversity)
         self._metadata_cache: Dict[str, Dict[str, Any]] = {}
-        self._metadata_cache_file = self._cache_dir / "track_metadata.json"
+        # V1 uses separate metadata cache to avoid conflicts with V2
+        self._metadata_cache_file = self._cache_dir / "track_metadata_v1.json"
         self._metadata_lock = asyncio.Lock()
         self._initialized = False
         self._gemini_client: Optional[genai.Client] = None

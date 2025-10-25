@@ -8,7 +8,7 @@ from discord.ext import commands
 from discord.ui import View, Button, Select
 import asyncio
 import logging
-from typing import Optional
+from typing import Dict, Optional
 import pomice
 
 LOG = logging.getLogger(__name__)
@@ -541,6 +541,13 @@ class PlayerControlView(View):
         self.is_announcement = (
             is_announcement  # True for announcement player, False for !np
         )
+        self._feedback_votes: Dict[int, str] = {}
+        self._active_track_key: Optional[str] = self._current_track_key()
+        
+        # Add feedback buttons if V2+ autoplay is enabled
+        if player.supports_feedback_buttons():
+            self.add_item(self.more_like_this_button_item())
+            self.add_item(self.less_like_this_button_item())
 
     async def on_timeout(self):
         """Disable all buttons when view times out."""
@@ -785,6 +792,235 @@ class PlayerControlView(View):
             )
         else:
             await interaction.response.send_message("🗑️ Player closed", ephemeral=True)
+
+    def more_like_this_button_item(self):
+        """Factory method for More Like This button (V2+)"""
+        button = Button(
+            emoji="👍",
+            style=discord.ButtonStyle.success,
+            custom_id="player:more_like_this",
+            label="More Like This",
+            row=2  # Second row
+        )
+        button.callback = self.more_like_this_callback
+        return button
+
+    def less_like_this_button_item(self):
+        """Factory method for Less Like This button (V2+)"""
+        button = Button(
+            emoji="👎",
+            style=discord.ButtonStyle.danger,
+            custom_id="player:less_like_this",
+            label="Less Like This",
+            row=2  # Second row
+        )
+        button.callback = self.less_like_this_callback
+        return button
+
+    async def more_like_this_callback(self, interaction: discord.Interaction):
+        """Handle More Like This feedback (V2+)"""
+        self._refresh_feedback_state()
+        member = self._resolve_member(interaction)
+        if not member:
+            await interaction.response.send_message(
+                "❌ Unable to resolve your member record.", ephemeral=True
+            )
+            return
+
+        previous_vote = self._feedback_votes.get(member.id)
+        if previous_vote == "more":
+            await interaction.response.send_message(
+                "✅ You already told me you like this track.", ephemeral=True
+            )
+            return
+        if previous_vote == "less":
+            await interaction.response.send_message(
+                "❌ You already marked this track as less preferred. Each listener can only vote once per track.",
+                ephemeral=True,
+            )
+            return
+
+        # Check if user is in voice channel
+        voice_state = getattr(member, "voice", None)
+        channel = getattr(voice_state, "channel", None)
+        if not voice_state or not channel:
+            await interaction.response.send_message(
+                "❌ You must be in a voice channel!", ephemeral=True
+            )
+            return
+
+        guild = member.guild
+        vc = guild.voice_client if guild else None
+        vc_channel = getattr(vc, "channel", None)
+        if not vc or not vc_channel:
+            await interaction.response.send_message("❌ Not connected", ephemeral=True)
+            return
+
+        # Check if user is in same channel as bot
+        if channel.id != vc_channel.id:
+            await interaction.response.send_message(
+                "❌ You must be in the same voice channel as the bot!", ephemeral=True
+            )
+            return
+
+        # Get current track info
+        current_entry = getattr(self.player, "_current_entries", {}).get(self.guild_id, {})
+        if not current_entry:
+            await interaction.response.send_message(
+                "❌ No track information available for feedback.", ephemeral=True
+            )
+            return
+        track_title = current_entry.get("title", "Unknown")
+
+        # Record positive feedback to V2 engine
+        try:
+            if (
+                hasattr(self.player, '_lastfm_autoplay')
+                and self.player._lastfm_autoplay
+                and self.player._lastfm_autoplay.is_available()
+            ):
+                await self.player._lastfm_autoplay.record_playback_feedback(
+                    guild_id=self.guild_id,
+                    artist=current_entry.get("author", "Unknown"),
+                    title=track_title,
+                    progress_ratio=1.0,  # Full listen implied
+                    feedback_type="more_like_this",
+                    user_id=member.id
+                )
+                self._feedback_votes[member.id] = "more"
+                await interaction.response.send_message(
+                    f"👍 **{member.display_name}** likes **{track_title}**",
+                    ephemeral=False
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Feedback system not available", ephemeral=True
+                )
+        except Exception as e:
+            LOG.error(f"Failed to record positive feedback: {e}")
+            await interaction.response.send_message(
+                "❌ Failed to record feedback", ephemeral=True
+            )
+
+    async def less_like_this_callback(self, interaction: discord.Interaction):
+        """Handle Less Like This feedback (V2+)"""
+        self._refresh_feedback_state()
+        member = self._resolve_member(interaction)
+        if not member:
+            await interaction.response.send_message(
+                "❌ Unable to resolve your member record.", ephemeral=True
+            )
+            return
+
+        previous_vote = self._feedback_votes.get(member.id)
+        if previous_vote == "less":
+            await interaction.response.send_message(
+                "✅ You already marked this track as less preferred.", ephemeral=True
+            )
+            return
+        if previous_vote == "more":
+            await interaction.response.send_message(
+                "❌ You already reacted with More Like This. Each listener only gets one choice per track.",
+                ephemeral=True,
+            )
+            return
+
+        # Check if user is in voice channel
+        voice_state = getattr(member, "voice", None)
+        channel = getattr(voice_state, "channel", None)
+        if not voice_state or not channel:
+            await interaction.response.send_message(
+                "❌ You must be in a voice channel!", ephemeral=True
+            )
+            return
+
+        guild = member.guild
+        vc = guild.voice_client if guild else None
+        vc_channel = getattr(vc, "channel", None)
+        if not vc or not vc_channel:
+            await interaction.response.send_message("❌ Not connected", ephemeral=True)
+            return
+
+        # Check if user is in same channel as bot
+        if channel.id != vc_channel.id:
+            await interaction.response.send_message(
+                "❌ You must be in the same voice channel as the bot!", ephemeral=True
+            )
+            return
+
+        # Get current track info
+        current_entry = getattr(self.player, "_current_entries", {}).get(self.guild_id, {})
+        if not current_entry:
+            await interaction.response.send_message(
+                "❌ No track information available for feedback.", ephemeral=True
+            )
+            return
+        track_title = current_entry.get("title", "Unknown")
+        
+        # Record negative feedback to V2 engine
+        try:
+            if (
+                hasattr(self.player, '_lastfm_autoplay')
+                and self.player._lastfm_autoplay
+                and self.player._lastfm_autoplay.is_available()
+            ):
+                await self.player._lastfm_autoplay.record_playback_feedback(
+                    guild_id=self.guild_id,
+                    artist=current_entry.get("author", "Unknown"),
+                    title=track_title,
+                    progress_ratio=0.2,  # Early skip implied
+                    feedback_type="less_like_this",
+                    user_id=member.id
+                )
+                self._feedback_votes[member.id] = "less"
+                await interaction.response.send_message(
+                    f"👎 **{member.display_name}** dislikes **{track_title}**",
+                    ephemeral=False
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Feedback system not available", ephemeral=True
+                )
+        except Exception as e:
+            LOG.error(f"Failed to record negative feedback: {e}")
+            await interaction.response.send_message(
+                "❌ Failed to record feedback", ephemeral=True
+            )
+
+    def _resolve_member(self, interaction: discord.Interaction) -> Optional[discord.Member]:
+        """Resolve the interaction user to a guild member when possible."""
+        user = interaction.user
+        if isinstance(user, discord.Member):
+            return user
+        guild = interaction.guild
+        if guild:
+            return guild.get_member(user.id)
+        return None
+
+    def _current_track_key(self) -> Optional[str]:
+        entry = self.player._current_entries.get(self.guild_id, {}) if hasattr(self.player, "_current_entries") else {}
+        identifier = entry.get("identifier")
+        if identifier:
+            return f"id::{str(identifier).lower()}"
+        uri = entry.get("uri")
+        if uri:
+            return f"uri::{str(uri).lower()}"
+        title = str(entry.get("title") or "").strip().lower()
+        author = str(entry.get("author") or "").strip().lower()
+        if title or author:
+            return f"meta::{author}::{title}"
+        track = entry.get("track")
+        track_id = getattr(track, "identifier", None) if track else None
+        if track_id:
+            return f"track::{str(track_id).lower()}"
+        return None
+
+    def _refresh_feedback_state(self) -> Optional[str]:
+        current_key = self._current_track_key()
+        if current_key != self._active_track_key:
+            self._active_track_key = current_key
+            self._feedback_votes.clear()
+        return current_key
 
 
 class NowPlayingCommands(commands.Cog):

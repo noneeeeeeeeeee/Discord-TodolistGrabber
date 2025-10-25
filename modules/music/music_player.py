@@ -28,12 +28,13 @@ from modules.music.lavalink.manager import (
 
 # Import Last.fm autoplay
 try:
-    from modules.music.Autoplay_Engine.v1.autoplayengine_v1 import get_lastfm_autoplay
+    from modules.music.Autoplay_Engine.config import get_autoplay_engine, get_autoplay_config
 
     LASTFM_AUTOPLAY_AVAILABLE = True
 except ImportError:
     LASTFM_AUTOPLAY_AVAILABLE = False
-    get_lastfm_autoplay = None
+    get_autoplay_engine = None
+    get_autoplay_config = None
 
 # -- Pomice compatibility shims -------------------------------------------------
 try:  # pragma: no cover - defensive
@@ -203,11 +204,14 @@ class MusicPlayer(commands.Cog):
         # Initialize Last.fm autoplay
         LOG.info("[AutoPlay] Attempting to initialize Last.fm module...")
         self._lastfm_autoplay = None
-        if LASTFM_AUTOPLAY_AVAILABLE and get_lastfm_autoplay:
+        self._autoplay_config = None
+        if LASTFM_AUTOPLAY_AVAILABLE and get_autoplay_engine:
             try:
-                self._lastfm_autoplay = get_lastfm_autoplay(bot)
+                self._autoplay_config = get_autoplay_config()
+                self._lastfm_autoplay = get_autoplay_engine(bot)
                 if self._lastfm_autoplay and self._lastfm_autoplay.is_available():
-                    LOG.info("[AutoPlay] ✅ Last.fm autoplay is READY and AVAILABLE!")
+                    version = self._autoplay_config.get_autoplay_version()
+                    LOG.info(f"[AutoPlay] ✅ Last.fm autoplay {version.upper()} is READY and AVAILABLE!")
                 else:
                     LOG.warning(
                         "[AutoPlay] Last.fm module loaded but API key not configured"
@@ -224,6 +228,14 @@ class MusicPlayer(commands.Cog):
 
         self._disconnect_messages = self._load_disconnect_messages()
         self._bootstrap_node.start()
+
+    def supports_feedback_buttons(self) -> bool:
+        """Check if current autoplay version supports More/Less Like This buttons"""
+        if not self._autoplay_config:
+            return False
+        if not self._autoplay_config.supports_feedback_buttons():
+            return False
+        return bool(self._lastfm_autoplay and self._lastfm_autoplay.is_available())
 
     def is_session_autoplay_enabled(self, guild_id: int) -> bool:
         return not self._session_autoplay_disabled.get(guild_id, False)

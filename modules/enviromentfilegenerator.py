@@ -21,7 +21,7 @@ def check_and_load_env_file():
             "# Provide one or more API keys as a JSON array (first entry is primary).\n"
             'GeminiApiKeys=["YOUR_PRIMARY_GEMINI_API_KEY", "YOUR_SECONDARY_GEMINI_API_KEY"]\n'
             "\n"
-            "# Lavalink Audio Server Settings\n"
+            "# Lavalink Audio Server Settings (For Advanced Users, Else Keep default)\n"
             "LAVALINK_HOST=127.0.0.1\n"
             "LAVALINK_PORT=2333\n"
             "LAVALINK_PASSWORD=youshallnotpass\n"
