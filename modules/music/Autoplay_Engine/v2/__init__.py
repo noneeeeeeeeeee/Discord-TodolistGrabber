@@ -316,7 +316,22 @@ class LastFMAutoplayV2:
                     candidate.title,
                 )
         
-        # Re-sort after applying penalties
+        # Apply artist diversity scoring to prevent repetitive artist recommendations
+        for candidate in scored:
+            diversity_score = tracker.compute_artist_diversity_score(candidate.artist)
+            if diversity_score < 0.95:  # Only log if there's a meaningful penalty
+                original_score = candidate.score
+                candidate.score *= diversity_score
+                if self._verbose >= 1:
+                    LOG.info(
+                        "🎨 [Diversity] Artist '%s' penalty %.2f (score %.3f → %.3f) - recently played",
+                        candidate.artist,
+                        diversity_score,
+                        original_score,
+                        candidate.score,
+                    )
+        
+        # Re-sort after applying all penalties
         scored.sort(key=lambda c: c.score, reverse=True)
 
         if self._engine._verbose and scored:

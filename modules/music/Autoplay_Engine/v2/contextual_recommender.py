@@ -8,6 +8,8 @@ from .collaborative_matrix import CollaborativeMatrix
 LOG = logging.getLogger(__name__)
 
 _DEFAULT_COLLAB_WEIGHT = 0.3
+# Collaborative filtering disabled by default until ML training is complete
+_COLLABORATIVE_FILTERING_ENABLED = False  # Set to True in future when ready
 
 
 @dataclass
@@ -52,6 +54,9 @@ class ContextualRecommender:
         self._collab_weight_overrides[key] = max(0.0, min(1.0, weight))
 
     def is_collaborative_enabled(self, guild_id: int | str) -> bool:
+        """Check if collaborative filtering is enabled (globally disabled until ML ready)."""
+        if not _COLLABORATIVE_FILTERING_ENABLED:
+            return False  # Global disable until future ML training
         key = self._guild_key(guild_id)
         return self._collab_toggles.get(key, True)
 
