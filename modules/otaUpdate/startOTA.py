@@ -62,25 +62,50 @@ WHITELISTED_FILES_KEY = "WHITELISTED_FILES_FOLDERS"
 
 # Version helpers to compare stable/prerelease correctly
 def _parse_version(ver: str):
+    """
+    Parse semantic version strings with support for:
+    - X.Y.Z (stable)
+    - X.Y.Z-PreN, X.Y.Z-BetaN, X.Y.Z-AlphaN (prereleases)
+    - X.Y.Z-Release (legacy, treated as stable)
+
+    Returns: (major, minor, patch, prerelease_priority, prerelease_num)
+    - prerelease_priority: 0=stable, 1=alpha, 2=beta, 3=pre/rc (lower is earlier)
+    - Stable versions have priority 4 (highest)
+    """
     if not ver:
-        return (0, 0, 0, 1, 0)
+        return (0, 0, 0, 0, 0)
     ver = ver.strip()
     import re
 
-    m = re.match(r"^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([A-Za-z]+)?(\d+)?)?\s*$", ver)
+    # Match: X.Y.Z or X.Y or X, with optional -Suffix or -SuffixN
+    m = re.match(r"^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([A-Za-z]+)(\d+)?)?\s*$", ver)
     if not m:
+        # Fallback: extract all digits
         nums = [int(x) for x in re.findall(r"\d+", ver)]
         major = nums[0] if len(nums) > 0 else 0
         minor = nums[1] if len(nums) > 1 else 0
         patch = nums[2] if len(nums) > 2 else 0
-        return (major, minor, patch, 1, 0)
+        return (major, minor, patch, 4, 0)  # treat as stable
+
     major = int(m.group(1) or 0)
     minor = int(m.group(2) or 0)
     patch = int(m.group(3) or 0)
-    pre_label = (m.group(4) or "").lower()
-    pre_num = int(m.group(5) or 0)
-    is_prerelease = 1 if pre_label else 0
-    return (major, minor, patch, is_prerelease, pre_num)
+    pre_label = (m.group(4) or "").lower() if m.group(4) else None
+    pre_num = int(m.group(5) or 0) if m.group(5) else 0
+
+    # Determine prerelease priority
+    if not pre_label or pre_label == "release":
+        # Stable release (no suffix or -Release suffix)
+        return (major, minor, patch, 4, 0)
+    elif pre_label in ("alpha", "a"):
+        return (major, minor, patch, 1, pre_num)
+    elif pre_label in ("beta", "b"):
+        return (major, minor, patch, 2, pre_num)
+    elif pre_label in ("pre", "rc", "preview"):
+        return (major, minor, patch, 3, pre_num)
+    else:
+        # Unknown suffix, treat as pre
+        return (major, minor, patch, 3, pre_num)
 
 
 def _cmp_versions(a: str, b: str) -> int:
@@ -545,12 +570,40 @@ def stop_lavalink_process():
             return
 
         print_progress(
-            "Process",
-            "Stopping Lavalink...",
+            "Process", f"Stopping Lavalink (PIDs: {', '.join(map(str, pids))})..."
         )
         for pid in pids:
             subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"], check=False)
-        print_progress("Process", "Lavalink stopped successfully.")
+
+        # Wait for processes to actually exit
+        max_wait = 15  # seconds
+        for attempt in range(max_wait):
+            time.sleep(1)
+            # Re-check if Lavalink is still running
+            check_result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_command],
+                capture_output=True,
+                text=True,
+            )
+            remaining_pids = set()
+            if check_result.returncode == 0:
+                for token in check_result.stdout.replace("\r", " ").split():
+                    if token.isdigit():
+                        remaining_pids.add(int(token))
+
+            if not remaining_pids:
+                print_progress("Process", "Lavalink stopped successfully.")
+                return
+
+            if attempt == max_wait - 1:
+                log_error(
+                    "Process",
+                    f"Timed out waiting for Lavalink to exit. Remaining PIDs: {remaining_pids}",
+                )
+                print_progress(
+                    "Process",
+                    f"Warning: Lavalink may still be running (PIDs: {remaining_pids}). Proceeding anyway...",
+                )
     except Exception as e:
         log_error("Process", "Failed to stop Lavalink process.", e)
         print_progress(
@@ -672,12 +725,9 @@ def perform_ota_update():
             time.sleep(10)
             sys.exit(0)
 
-        # Stop the bot
+        # Stop the bot and Lavalink
         stop_bot_process()
         stop_lavalink_process()
-
-        # Update Dependencies
-        update_dependencies()
 
         # Fetch the update file
         if result == "continue" or not result:
@@ -730,6 +780,9 @@ def perform_ota_update():
         print_progress("Post-Cleanup", "Removing temporary files...")
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
         print_progress("Post-Cleanup", "Temporary files removed.")
+
+        # Update Dependencies (AFTER files are updated)
+        update_dependencies()
 
         # Start the bot
         time.sleep(1)

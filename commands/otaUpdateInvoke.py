@@ -14,15 +14,17 @@ class Update(commands.Cog):
     @staticmethod
     def _parse_version(ver: str):
         """
-        Parse versions like:
-          - 2.4.2        -> (2,4,2, 0, 0)        stable
-          - 3.0          -> (3,0,0, 0, 0)        stable
-          - 3.0-Pre2     -> (3,0,0, 1, 2)        prerelease
-          - 3.1-pre1     -> (3,1,0, 1, 1)
-        Higher tuple wins; stable (flag=0) > prerelease (flag=1) for same base.
+        Parse semantic version strings with support for:
+        - X.Y.Z (stable)
+        - X.Y.Z-PreN, X.Y.Z-BetaN, X.Y.Z-AlphaN (prereleases)
+        - X.Y.Z-Release (legacy, treated as stable)
+
+        Returns: (major, minor, patch, prerelease_priority, prerelease_num)
+        - prerelease_priority: 0=stable, 1=alpha, 2=beta, 3=pre/rc (lower is earlier)
+        - Stable versions have priority 4 (highest)
         """
         if not ver:
-            return (0, 0, 0, 1, 0)
+            return (0, 0, 0, 0, 0)
         ver = ver.strip()
         # Split prerelease suffix if present
         m = re.match(
@@ -34,15 +36,27 @@ class Update(commands.Cog):
             major = nums[0] if len(nums) > 0 else 0
             minor = nums[1] if len(nums) > 1 else 0
             patch = nums[2] if len(nums) > 2 else 0
-            return (major, minor, patch, 1, 0)
+            return (major, minor, patch, 4, 0)  # treat as stable
+
         major = int(m.group(1) or 0)
         minor = int(m.group(2) or 0)
         patch = int(m.group(3) or 0)
-        pre_label = (m.group(4) or "").lower()
-        pre_num = int(m.group(5) or 0)
-        # treat any suffix as prerelease (pre, beta, alpha, rc, etc.)
-        is_prerelease = 1 if pre_label else 0
-        return (major, minor, patch, is_prerelease, pre_num)
+        pre_label = (m.group(4) or "").lower() if m.group(4) else None
+        pre_num = int(m.group(5) or 0) if m.group(5) else 0
+
+        # Determine prerelease priority
+        if not pre_label or pre_label == "release":
+            # Stable release (no suffix or -Release suffix)
+            return (major, minor, patch, 4, 0)
+        elif pre_label in ("alpha", "a"):
+            return (major, minor, patch, 1, pre_num)
+        elif pre_label in ("beta", "b"):
+            return (major, minor, patch, 2, pre_num)
+        elif pre_label in ("pre", "rc", "preview"):
+            return (major, minor, patch, 3, pre_num)
+        else:
+            # Unknown suffix, treat as pre
+            return (major, minor, patch, 3, pre_num)
 
     @staticmethod
     def _cmp_versions(a: str, b: str) -> int:
@@ -298,8 +312,8 @@ class Update(commands.Cog):
 
             # Determine what type of version we're currently on
             current_parsed = Update._parse_version(current_version)
-            is_on_prerelease = current_parsed[3] == 1  # prerelease flag
-            is_on_stable = not is_on_prerelease
+            is_on_prerelease = current_parsed[3] < 4  # priority < 4 means prerelease
+            is_on_stable = current_parsed[3] == 4
 
             # Check if current matches stable or prerelease
             on_latest_stable = (
@@ -314,6 +328,11 @@ class Update(commands.Cog):
                 stable_version and cmp(current_version, stable_version) < 0
             )
             prerelease_candidate = bool(
+                prerelease_version and cmp(current_version, prerelease_version) < 0
+            )
+
+            # Check if prerelease makes sense to offer (user not on newer stable than latest prerelease)
+            prerelease_makes_sense = bool(
                 prerelease_version and cmp(current_version, prerelease_version) < 0
             )
 
@@ -465,12 +484,13 @@ class Update(commands.Cog):
                         )
 
                     # Offer options to reinstall or switch to prerelease
+                    # Only show prerelease switch if it makes sense (prerelease is newer than current)
                     view = self.ChooseActionView(
                         ctx.author.id,
                         enable_stable=False,
                         enable_prerelease=False,
                         enable_reinstall=True,
-                        enable_switch=prerelease_version is not None,
+                        enable_switch=prerelease_makes_sense,
                         switch_label="Switch to Prerelease",
                     )
                     view.message = await ctx.send(embed=embed, view=view)
@@ -515,7 +535,8 @@ class Update(commands.Cog):
                         enable_stable=True,
                         enable_prerelease=False,
                         enable_reinstall=True,
-                        enable_switch=prerelease_version and not on_latest_prerelease,
+                        enable_switch=prerelease_makes_sense
+                        and not on_latest_prerelease,
                         switch_label=(
                             "Switch to Prerelease" if prerelease_version else "Switch"
                         ),
@@ -560,7 +581,7 @@ class Update(commands.Cog):
                         enable_stable=False,
                         enable_prerelease=False,
                         enable_reinstall=True,
-                        enable_switch=prerelease_version is not None,
+                        enable_switch=prerelease_makes_sense,
                         switch_label="Switch to Prerelease",
                     )
                     view.message = await ctx.send(embed=embed, view=view)
@@ -586,17 +607,43 @@ class Update(commands.Cog):
             print(f"Error in checkupdates: {e}")
 
     def _start_ota(self, flag: str):
-        """Helper to start OTA update process."""
-        subprocess.Popen(
-            [
-                "python",
-                "modules/otaUpdate/startOTA.py",
-                "worker",
-                flag,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        """Helper to start OTA update process as a detached worker."""
+        import sys
+        import os
+
+        # Get the full path to the startOTA.py script
+        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ota_script = os.path.join(script_dir, "modules", "otaUpdate", "startOTA.py")
+
+        # Use the same Python executable that's running the bot
+        python_exe = sys.executable or "python"
+
+        if os.name == "nt":
+            # Windows: Open in new CMD window (same as original startOTA.py behavior)
+            # This allows the user to see the update progress
+            cmd = ["start", "cmd", "/c", python_exe, ota_script, "worker", flag]
+            try:
+                subprocess.Popen(
+                    cmd,
+                    cwd=script_dir,
+                    shell=True,
+                )
+            except Exception as e:
+                print(f"Error starting OTA worker: {e}")
+        else:
+            # Unix-like: Start detached process
+            cmd = [python_exe, ota_script, "worker", flag]
+            try:
+                subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    cwd=script_dir,
+                )
+            except Exception as e:
+                print(f"Error starting OTA worker: {e}")
 
 
 async def setup(bot):

@@ -15,80 +15,164 @@ DURATION_TOLERANCE_MIN_MS = 30000  # 30 seconds minimum tolerance
 
 # High-quality channel indicators (boost priority)
 GOOD_CHANNEL_HINTS = [
-    "vevo", "official artist channel", "topic", "records", "music", "label",
+    "vevo",
+    "official artist channel",
+    "topic",
+    "records",
+    "music",
+    "label",
 ]
 
 # Official title markers (boost priority)
 GOOD_TITLE_KEYWORDS = [
-    "official audio", "official video", "official mv", "official music video",
-    "official visualizer", "official lyric video", "official",
-    "album version", "single version",
+    "official audio",
+    "official video",
+    "official mv",
+    "official music video",
+    "official visualizer",
+    "official lyric video",
+    "official",
+    "album version",
+    "single version",
 ]
 
 # Spam keywords that indicate non-music content or low-quality uploads
+# Note: These are checked UNLESS the video is from a verified/official channel
 BAD_TITLE_KEYWORDS = [
     # Pitch/speed manipulations
-    "nightcore", "night core", "slowed", "slowed + reverb", "slowed+reverb",
-    "sped up", "speed up", "speedup", "pitch",
-    
+    "nightcore",
+    "night core",
+    "slowed",
+    "slowed + reverb",
+    "slowed+reverb",
+    "sped up",
+    "speed up",
+    "speedup",
+    "pitch shifted",
     # Audio effects
-    "8d", "8d audio", "3d audio", "binaural", "spatial audio", "ambisonic",
-    "sound spatial", "stereo widened",
-    
-    # Fan uploads / non-canonical
-    "cover", "karaoke", "karaoke version", "karaoke instrumental",
-    "instrumental", "backing track", "minus one", "tutorial", "lesson", "practice",
-    
-    # Remix / edits / unofficial versions
-    "remix", "remixed", "edit", "rework", "bootleg", "mashup", "reimagined",
-    "redux", "acapella", "a cappella", "midi", "black midi", "audio spectrum",
-    "remake", "music project", "fan edit", "fanmix", "fan mix", "covered by",
-    "extended version", "extended",
-    
+    "8d",
+    "8d audio",
+    "3d audio",
+    "binaural",
+    "spatial audio",
+    "ambisonic",
+    "sound spatial",
+    "stereo widened",
+    # Fan uploads / non-canonical (but allow instrumental if official)
+    "cover",
+    "karaoke",
+    "karaoke version",
+    "karaoke instrumental",
+    "backing track",
+    "minus one",
+    "tutorial",
+    "lesson",
+    "practice",
+    # Remix / edits / unofficial versions (but be lenient with official remixes)
+    "bootleg",
+    "reimagined",
+    "redux",
+    "acapella",
+    "a cappella",
+    "midi",
+    "black midi",
+    "audio spectrum",
+    "remake",
+    "music project",
+    "fan edit",
+    "fanmix",
+    "fan mix",
+    "covered by",
     # Performance / live (usually not studio quality)
-    "live", "live at", "live from", "session", "concert", "performance", "tour",
-    
+    "live",
+    "live at",
+    "live from",
+    "session",
+    "concert",
+    "performance",
+    "tour",
     # Long-play / loop / compilation
-    "hour", "hours", "loop", "mix", "mixes", "dj set", "set",
-    
-    # Low-quality / user-added modifiers
-    "lyric", "lyrics", "lyric video", "visualizer", "reupload", "fanmade",
-    
+    "hour",
+    "hours",
+    "loop",
+    "dj set",
+    # Low-quality / user-added modifiers (but allow "lyric video" if official)
+    "reupload",
+    "fanmade",
+    "fan made",
     # Non-English karaoke markers
-    "伴唱", "カラオケ", "노래방",
-    
+    "伴唱",
+    "カラオケ",
+    "노래방",
     # Teaser / promo content
-    "teaser", "trailer", "preview", "snippet", "sample", "promo", "promotional",
-    "promotion", "promos",
-    
+    "teaser",
+    "trailer",
+    "preview",
+    "snippet",
+    "sample",
+    "promo",
+    "promotional",
+    "promotion",
+    "promos",
     # Music mix / compilations
-    "music mix", "top hits", "best of", "amazing", "greatest", "hits",
-    "collection", "compilation", "playlist",
-    
+    "music mix",
+    "top hits",
+    "best of",
+    "amazing",
+    "greatest",
+    "hits",
+    "collection",
+    "compilation",
+    "playlist",
     # Subscriber specials & spam entries
-    "subscriber special", "subscriber special mix", "subscriber special edition",
-    "plz", "hz",
-    
+    "subscriber special",
+    "subscriber special mix",
+    "subscriber special edition",
+    "plz",
+    "hz",
     # Tutorial / educational content
-    "how to", "tutorial", "lesson", "practice", "learn", "teach",
-    
+    "how to",
+    "tutorial",
+    "lesson",
+    "practice",
+    "learn",
+    "teach",
     # Reactions / commentary
-    "reaction", "review", "critique", "commentary", "analysis",
-    
+    "reaction",
+    "review",
+    "critique",
+    "commentary",
+    "analysis",
     # Gaming / unrelated content
-    "unboxing", "gameplay", "walkthrough",
-    
+    "unboxing",
+    "gameplay",
+    "walkthrough",
     # Announcement / milestone content
-    "milestone", "announcement",
-    
-    # Year tags (often indicate compilation)
-    "2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023", "2024", "2025",
-    
-    # Studio remixes
-    "studio vocals",
-    
+    "milestone",
+    "announcement",
     # Sound test / unofficial versions
-    "sound test", "(sound test)",
+    "sound test",
+    "(sound test)",
+]
+
+# Keywords that are OK when from official/verified channels
+ALLOWED_IF_OFFICIAL = [
+    "instrumental",
+    "extended",
+    "extended version",
+    "remix",
+    "remixed",
+    "lyric",
+    "lyrics",
+    "lyric video",
+    "visualizer",
+    "official visualizer",
+    "edit",
+    "rework",
+    "mashup",
+    "mix",
+    "mixes",
+    "set",
 ]
 
 
@@ -210,7 +294,9 @@ class TrackResolver:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    async def _create_track_obj_from_mapping(self, mapping: MappingEntry) -> Optional[Any]:
+    async def _create_track_obj_from_mapping(
+        self, mapping: MappingEntry
+    ) -> Optional[Any]:
         node = await self._get_node()
         if not node:
             return None
@@ -227,7 +313,11 @@ class TrackResolver:
                     if track_obj:
                         return track_obj
                 except Exception as exc:
-                    LOG.debug("Pomice build_track failed for identifier %s: %s", identifier, exc)
+                    LOG.debug(
+                        "Pomice build_track failed for identifier %s: %s",
+                        identifier,
+                        exc,
+                    )
 
         query = mapping.url or mapping.youtube_id
         if not query:
@@ -241,7 +331,9 @@ class TrackResolver:
 
         if not tracks and mapping.youtube_id:
             try:
-                tracks = await node.get_tracks(f"https://www.youtube.com/watch?v={mapping.youtube_id}")
+                tracks = await node.get_tracks(
+                    f"https://www.youtube.com/watch?v={mapping.youtube_id}"
+                )
             except Exception:
                 tracks = []
 
@@ -278,66 +370,52 @@ class TrackResolver:
 
         best_track: Optional[Any] = None
         best_score = float("-inf")
+        fallback_track: Optional[Any] = None  # Track filtered candidates as fallback
+        fallback_score = float("-inf")
         duration_target = expected_duration_ms or 0
         normalized_artist = artist.casefold()
         normalized_title = title.casefold()
-        
+
         # Duration tolerance: ±20% or ±30 seconds (whichever is larger)
-        duration_tolerance_ms = max(duration_target * 0.20, 30000) if duration_target else 0
+        duration_tolerance_ms = (
+            max(duration_target * 0.20, 30000) if duration_target else 0
+        )
 
         for index, candidate in enumerate(results):
             metadata = self._extract_track_metadata(candidate)
-            
+
             # SPAM FILTERING
-            candidate_title_raw = getattr(candidate, "title", None) or metadata.get("title") or ""
-            
-            # Filter 1: Comprehensive spam title check (hashtags + keywords)
-            if self._is_spam_title(candidate_title_raw):
-                continue
-            
-            # Filter 2: Very short videos (likely shorts, not music)
-            duration_val = metadata.get("duration_ms") or 0
-            if duration_val and duration_val < 45000:  # < 45 seconds
-                LOG.debug(
-                    "🚫 [SHORT VIDEO] Rejected '%s' - too short (duration=%dms, likely YouTube Short)",
-                    candidate_title_raw[:60],
-                    duration_val,
-                )
-                continue
-            
-            # Filter 3: Duration tolerance check (reject if outside tolerance)
-            if duration_target and duration_val and duration_tolerance_ms:
-                delta = abs(duration_target - int(duration_val))
-                if delta > duration_tolerance_ms:
-                    LOG.debug(
-                        "🚫 [DURATION FILTER] Rejected '%s' - duration mismatch (expected=%dms, got=%dms, delta=%dms, tolerance=%dms)",
-                        candidate_title_raw[:60],
-                        duration_target,
-                        duration_val,
-                        delta,
-                        int(duration_tolerance_ms)
-                    )
-                    continue
-            
-            # SCORING
+            candidate_title_raw = (
+                getattr(candidate, "title", None) or metadata.get("title") or ""
+            )
+            is_verified = metadata.get("verified", False)
+            channel_name = metadata.get("channel_name", "")
+
+            # Calculate score first (before filtering) for potential fallback
             score = 0.0
 
             # Verified badge = huge boost
-            if metadata["verified"]:
+            if is_verified:
                 score += 4.0
 
-            channel = (metadata.get("channel_name") or "").casefold()
-            
-            # Channel name matches artist = official/authentic
+            channel = (channel_name or "").casefold()
+
+            # Channel name EXACTLY matches artist (or very close) = extremely likely official
             if channel and normalized_artist in channel:
-                score += 2.0
-            
+                # Check if it's an exact match or just artist name in channel
+                channel_normalized = re.sub(r"[^a-z0-9]", "", channel)
+                artist_normalized = re.sub(r"[^a-z0-9]", "", normalized_artist)
+                if channel_normalized == artist_normalized:
+                    score += 3.0  # Exact match - very strong signal
+                else:
+                    score += 2.0  # Artist name in channel
+
             # Channel has official markers (VEVO, Topic, Records, etc.)
             for hint in GOOD_CHANNEL_HINTS:
                 if hint in channel:
                     score += 1.5
                     break
-            
+
             # Title has official markers
             candidate_title = candidate_title_raw.casefold()
             for good_keyword in GOOD_TITLE_KEYWORDS:
@@ -346,8 +424,14 @@ class TrackResolver:
                     break
 
             # Title matches = relevance boost
-            if candidate_title and normalized_title and normalized_title in candidate_title:
+            if (
+                candidate_title
+                and normalized_title
+                and normalized_title in candidate_title
+            ):
                 score += 1.0
+
+            duration_val = metadata.get("duration_ms") or 0
 
             # Duration similarity bonus (within tolerance)
             if duration_target and duration_val:
@@ -357,15 +441,108 @@ class TrackResolver:
             # Search rank penalty (lower index = higher rank)
             score -= index * 0.15
 
+            # ENGAGEMENT METRICS BOOST (for fallback quality assessment)
+            view_count = metadata.get("view_count", 0)
+            subscriber_count = metadata.get("subscriber_count", 0)
+            like_count = metadata.get("like_count", 0)
+            comment_count = metadata.get("comment_count", 0)
+
+            # View count boost (logarithmic scale to prevent dominance)
+            if view_count > 0:
+                import math
+
+                # 1M views = +1.0, 10M views = +2.0, 100M views = +3.0
+                score += min(math.log10(view_count / 1000) / 3.0, 3.0)
+
+            # Subscriber count boost (channel popularity)
+            if subscriber_count > 0:
+                import math
+
+                # 100K subs = +0.5, 1M subs = +1.0, 10M subs = +1.5
+                score += min(math.log10(subscriber_count / 10000) / 2.0, 2.0)
+
+            # Engagement ratio boost (likes + comments relative to views)
+            if view_count > 1000:  # Only consider if video has meaningful views
+                engagement_count = like_count + (
+                    comment_count * 2
+                )  # Comments worth more
+                engagement_ratio = engagement_count / view_count
+                # Typical good engagement is 1-5%, boost up to +0.5
+                score += min(engagement_ratio * 10, 0.5)
+
+            # Track as potential fallback before applying hard filters
+            if score > fallback_score:
+                fallback_score = score
+                fallback_track = candidate
+
+            # Filter 1: Comprehensive spam title check (hashtags + keywords)
+            if self._is_spam_title(
+                candidate_title_raw, is_verified=is_verified, channel_name=channel_name
+            ):
+                continue
+
+            # Filter 2: Very short videos (likely shorts, not music)
+            if duration_val and duration_val < 45000:  # < 45 seconds
+                LOG.debug(
+                    "🚫 [SHORT VIDEO] Rejected '%s' - too short (duration=%dms, likely YouTube Short)",
+                    candidate_title_raw[:60],
+                    duration_val,
+                )
+                continue
+
+            # Filter 3: Duration tolerance check (reject if outside tolerance)
+            # BUT: be more lenient if this is a high-scoring candidate (verified, official channel)
+            if duration_target and duration_val and duration_tolerance_ms:
+                delta = abs(duration_target - int(duration_val))
+                # Allow 50% more tolerance for high-scoring candidates (verified/official)
+                adjusted_tolerance = (
+                    duration_tolerance_ms * 1.5
+                    if score >= 3.0
+                    else duration_tolerance_ms
+                )
+                if delta > adjusted_tolerance:
+                    LOG.debug(
+                        "🚫 [DURATION FILTER] Rejected '%s' - duration mismatch (expected=%dms, got=%dms, delta=%dms, tolerance=%dms, score=%.2f)",
+                        candidate_title_raw[:60],
+                        duration_target,
+                        duration_val,
+                        delta,
+                        int(adjusted_tolerance),
+                        score,
+                    )
+                    continue
+
+            # Passed all filters - consider for best track
             if score > best_score:
                 best_score = score
                 best_track = candidate
 
+        # Fallback logic: if no track passed all filters, use the best fallback candidate
+        if not best_track and fallback_track:
+            fallback_metadata = self._extract_track_metadata(fallback_track)
+            LOG.warning(
+                "⚠️ All candidates filtered out for '%s - %s', using best fallback (score=%.2f, views=%d, subs=%d, channel='%s')",
+                artist,
+                title,
+                fallback_score,
+                fallback_metadata.get("view_count", 0),
+                fallback_metadata.get("subscriber_count", 0),
+                fallback_metadata.get("channel_name", "Unknown"),
+            )
+            return fallback_track
+
         if not best_track and results:
-            # If all filtered out, fall back to first result but log warning
-            LOG.warning("⚠️ All candidates filtered out for '%s - %s', using first result", artist, title)
+            # Last resort: use first result
+            first_metadata = self._extract_track_metadata(results[0])
+            LOG.warning(
+                "⚠️ No valid candidates found for '%s - %s', using first result as last resort (channel='%s', views=%d)",
+                artist,
+                title,
+                first_metadata.get("channel_name", "Unknown"),
+                first_metadata.get("view_count", 0),
+            )
             return results[0]
-        
+
         return best_track
 
     async def _get_node(self) -> Optional[Any]:
@@ -400,7 +577,16 @@ class TrackResolver:
         duration_ms = info.get("length") or getattr(track_obj, "length", None)
         title = info.get("title") or getattr(track_obj, "title", None)
         verified = bool(info.get("isVerified") or info.get("isOfficial"))
-        track_identifier = getattr(track_obj, "track_id", None) or getattr(track_obj, "track", None)
+        track_identifier = getattr(track_obj, "track_id", None) or getattr(
+            track_obj, "track", None
+        )
+
+        # Extract engagement metrics (may not always be available from Lavalink/Pomice)
+        view_count = info.get("viewCount") or info.get("views") or 0
+        like_count = info.get("likeCount") or info.get("likes") or 0
+        comment_count = info.get("commentCount") or info.get("comments") or 0
+        subscriber_count = info.get("subscriberCount") or info.get("subscribers") or 0
+
         if youtube_id and not url:
             url = f"https://www.youtube.com/watch?v={youtube_id}"
 
@@ -420,14 +606,23 @@ class TrackResolver:
             "duration_ms": duration_int,
             "track_identifier": track_identifier,
             "title": title,
+            "view_count": int(view_count) if view_count else 0,
+            "like_count": int(like_count) if like_count else 0,
+            "comment_count": int(comment_count) if comment_count else 0,
+            "subscriber_count": int(subscriber_count) if subscriber_count else 0,
         }
 
-    def _is_spam_mapping(self, mapping: MappingEntry, expected_duration_ms: Optional[int]) -> bool:
+    def _is_spam_mapping(
+        self, mapping: MappingEntry, expected_duration_ms: Optional[int]
+    ) -> bool:
         """Check if a cached mapping is spam using heuristics."""
-        
+
         # Check 1: Duration mismatch (if we have expected duration)
         if expected_duration_ms and mapping.duration_ms:
-            tolerance_ms = max(expected_duration_ms * DURATION_TOLERANCE_PERCENT, DURATION_TOLERANCE_MIN_MS)
+            tolerance_ms = max(
+                expected_duration_ms * DURATION_TOLERANCE_PERCENT,
+                DURATION_TOLERANCE_MIN_MS,
+            )
             delta = abs(expected_duration_ms - mapping.duration_ms)
             if delta > tolerance_ms:
                 LOG.debug(
@@ -438,7 +633,7 @@ class TrackResolver:
                     int(tolerance_ms),
                 )
                 return True
-        
+
         # Check 2: Very short videos (likely shorts/clips, not music)
         if mapping.duration_ms and mapping.duration_ms < 45000:  # < 45 seconds
             LOG.debug(
@@ -446,23 +641,32 @@ class TrackResolver:
                 mapping.duration_ms,
             )
             return True
-        
+
         # Check 3: Check URL/ID for spam patterns (if available from cached data)
         # Note: MappingEntry doesn't store title, so we can't check hashtags here
         # The hashtag check happens during live search in _search_with_pomice
-        
+
         return False
 
-    def _is_spam_title(self, title: str) -> bool:
-        """Check if a YouTube title indicates spam/non-music content."""
-        
+    def _is_spam_title(
+        self, title: str, is_verified: bool = False, channel_name: str = ""
+    ) -> bool:
+        """Check if a YouTube title indicates spam/non-music content.
+
+        Args:
+            title: The video title
+            is_verified: Whether the channel is verified/official
+            channel_name: The channel name (for additional context)
+        """
+
         if not title:
             return False
-        
+
         title_lower = title.lower()
-        
+        channel_lower = (channel_name or "").lower()
+
         # Check 1: Excessive hashtags
-        hashtag_count = title.count('#')
+        hashtag_count = title.count("#")
         if hashtag_count > HASHTAG_LIMIT:
             LOG.debug(
                 "🚫 [SPAM] Excessive hashtags: count=%d in '%s'",
@@ -470,17 +674,39 @@ class TrackResolver:
                 title[:60],
             )
             return True
-        
+
         # Check 2: Bad keywords
         for keyword in BAD_TITLE_KEYWORDS:
             if keyword in title_lower:
+                # If it's an allowed keyword and the channel is official/verified, skip this filter
+                if keyword in [k.lower() for k in ALLOWED_IF_OFFICIAL]:
+                    if is_verified:
+                        LOG.debug(
+                            "✅ [SPAM BYPASS] Keyword '%s' allowed for verified channel in '%s'",
+                            keyword,
+                            title[:60],
+                        )
+                        continue
+                    # Also allow if channel name suggests official (has artist name, vevo, topic, etc.)
+                    if channel_lower and any(
+                        hint in channel_lower
+                        for hint in ["vevo", "topic", "records", "official"]
+                    ):
+                        LOG.debug(
+                            "✅ [SPAM BYPASS] Keyword '%s' allowed for official channel '%s' in '%s'",
+                            keyword,
+                            channel_name,
+                            title[:60],
+                        )
+                        continue
+
                 LOG.debug(
                     "🚫 [SPAM] Spam keyword '%s' found in '%s'",
                     keyword,
                     title[:60],
                 )
                 return True
-        
+
         return False
 
 
