@@ -26,7 +26,9 @@ DEFAULT_DAILY_LIMIT = 500
 RATE_LIMIT_COOLDOWN_SECONDS = 600
 AUTH_FAILURE_COOLDOWN_SECONDS = 3600
 ENRICHMENT_BATCH_MAX = 25
-ENRICHMENT_BATCH_DELAY_SECONDS = 1.0
+# Increased from 1.0s to 5.0s to allow more tracks to accumulate before flushing
+# This prevents spamming the API with many 1-track requests
+ENRICHMENT_BATCH_DELAY_SECONDS = 5.0
 ENRICHMENT_BATCH_TIMEOUT_SECONDS = 15.0
 
 
@@ -196,7 +198,9 @@ class GeminiService:
     ) -> asyncio.Future:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
-        normalized_tags = [str(tag).strip() for tag in existing_tags if str(tag).strip()]
+        normalized_tags = [
+            str(tag).strip() for tag in existing_tags if str(tag).strip()
+        ]
         entry = EnrichmentRequest(
             artist=artist,
             title=title,
@@ -210,11 +214,15 @@ class GeminiService:
             self._batch_queue.append(entry)
             flush_now = len(self._batch_queue) >= self._batch_max
             if flush_now:
+                # Batch is full - cancel pending flush and flush immediately
                 if self._batch_task and not self._batch_task.done():
                     self._batch_task.cancel()
                 self._batch_task = asyncio.create_task(self._flush_enrichment_batch())
             elif not self._batch_task or self._batch_task.done():
-                self._batch_task = asyncio.create_task(self._schedule_enrichment_flush())
+                # Schedule a flush if no task is active
+                self._batch_task = asyncio.create_task(
+                    self._schedule_enrichment_flush()
+                )
 
         return future
 
@@ -234,15 +242,25 @@ class GeminiService:
         if not batch:
             return
 
-        track_list = ", ".join([f"'{entry.artist} - {entry.title}'" for entry in batch[:3]])
+        track_list = ", ".join(
+            [f"'{entry.artist} - {entry.title}'" for entry in batch[:3]]
+        )
         if len(batch) > 3:
             track_list += f" and {len(batch) - 3} more"
-        
-        LOG.info("📊 [Gemini] Requested Metadata Enrichment for %d tracks: [%s]", len(batch), track_list)
+
+        LOG.info(
+            "📊 [Gemini] Requested Metadata Enrichment for %d tracks: [%s]",
+            len(batch),
+            track_list,
+        )
         try:
             result_map = await self._process_enrichment_batch(batch)
             success_count = sum(1 for v in result_map.values() if v)
-            LOG.info("✅ [Gemini] Batch complete: %d/%d enriched successfully", success_count, len(batch))
+            LOG.info(
+                "✅ [Gemini] Batch complete: %d/%d enriched successfully",
+                success_count,
+                len(batch),
+            )
         except Exception as exc:  # pragma: no cover - defensive logging
             LOG.error("❌ Gemini enrichment batch failed: %s", exc)
             result_map = {}
@@ -620,8 +638,8 @@ class GeminiService:
             "You are a music metadata parser. Extract the primary artist and song title\n"
             "from the provided YouTube metadata. Respond with a compact JSON object\n"
             "containing keys 'artist' and 'title'.\n\n"
-            f"YouTube Title: \"{raw_title}\"\n"
-            f"Channel Name: \"{channel_name}\"\n\n"
+            f'YouTube Title: "{raw_title}"\n'
+            f'Channel Name: "{channel_name}"\n\n'
             "Rules:\n"
             "1. Remove descriptors such as '(Official Video)', '[Lyrics]', 'HD', etc.\n"
             "2. Prefer the canonical artist over channel branding or fan accounts.\n"
@@ -732,4 +750,7 @@ class GeminiService:
     @staticmethod
     def _is_auth_error(message: str) -> bool:
         lowered = message.lower()
-        return any(token in lowered for token in ("401", "403", "permission", "unauthorized", "forbidden"))
+        return any(
+            token in lowered
+            for token in ("401", "403", "permission", "unauthorized", "forbidden")
+        )

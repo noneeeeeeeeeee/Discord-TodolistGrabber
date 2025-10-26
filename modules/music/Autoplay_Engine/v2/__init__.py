@@ -101,6 +101,24 @@ class LastFMAutoplayV2:
             if guild_id in self._context_tracker:
                 self._context_tracker[guild_id].reset_session()
 
+    async def clear_guild_session(self, guild_id: int) -> bool:
+        """
+        Clear guild session data and telemetry when bot leaves VC.
+        Called by MusicPlayer.reset_session_state().
+
+        Returns:
+            True if session was cleared successfully.
+        """
+        # Clear recent history
+        self._recent_history.pop(guild_id, None)
+
+        # Reset context tracker
+        if guild_id in self._context_tracker:
+            self._context_tracker[guild_id].reset_session()
+
+        # Clear telemetry session file
+        return await self._engine.clear_guild_session(guild_id)
+
     async def record_playback_feedback(
         self,
         guild_id: int,

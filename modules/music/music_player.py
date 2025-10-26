@@ -28,7 +28,10 @@ from modules.music.lavalink.manager import (
 
 # Import Last.fm autoplay
 try:
-    from modules.music.Autoplay_Engine.config import get_autoplay_engine, get_autoplay_config
+    from modules.music.Autoplay_Engine.config import (
+        get_autoplay_engine,
+        get_autoplay_config,
+    )
 
     AUTOPLAY_ENGINE_AVAILABLE = True
 except ImportError:
@@ -238,18 +241,18 @@ class MusicPlayer(commands.Cog):
 
     def supports_feedback_buttons(self) -> bool:
         """Check if current autoplay version supports More/Less Like This buttons
-        
+
         Buttons are shown if:
         - Config supports feedback (V2+)
         - Engine instance exists (regardless of Last.fm/Gemini availability)
-        
+
         This allows feedback collection even when recommendations are unavailable.
         """
         if not self._autoplay_config:
             return False
         if not self._autoplay_config.supports_feedback_buttons():
             return False
-        # Just check if engine exists, don't check is_available() 
+        # Just check if engine exists, don't check is_available()
         # (buttons can collect feedback even if recommendations fail)
         return self._autoplay_engine is not None
 
@@ -267,6 +270,20 @@ class MusicPlayer(commands.Cog):
     def reset_session_state(self, guild_id: int) -> None:
         self._session_autoplay_disabled.pop(guild_id, None)
         self._autoplay_session_started.pop(guild_id, None)
+
+        # Clear guild telemetry session when bot leaves VC
+        if (
+            hasattr(self, "_autoplay_engine")
+            and self._autoplay_engine
+            and hasattr(self._autoplay_engine, "clear_guild_session")
+        ):
+            try:
+                asyncio.create_task(self._autoplay_engine.clear_guild_session(guild_id))
+                LOG.debug("Scheduled telemetry session cleanup for guild %s", guild_id)
+            except Exception as exc:
+                LOG.debug(
+                    "Failed to clear telemetry session for guild %s: %s", guild_id, exc
+                )
 
     def set_command_channel(
         self, guild_id: int, channel: discord.abc.Messageable
@@ -1721,7 +1738,9 @@ class MusicPlayer(commands.Cog):
         # Get recommendations
         engine = self._lastfm_autoplay
         if engine is None:
-            LOG.debug("[AutoPlay] Autoplay engine unavailable when enqueueing recommendations")
+            LOG.debug(
+                "[AutoPlay] Autoplay engine unavailable when enqueueing recommendations"
+            )
             return False
 
         recommendations = await engine.get_recommendations_for_track(
@@ -1739,10 +1758,8 @@ class MusicPlayer(commands.Cog):
                 LOG.info(
                     f"[AutoPlay] 🔄 Trying fallback: Last successful track '{last_successful.get('title', 'Unknown')}' by {last_successful.get('author', 'Unknown')}"
                 )
-                recommendations = (
-                    await engine.get_recommendations_for_track(
-                        last_successful, limit=1
-                    )
+                recommendations = await engine.get_recommendations_for_track(
+                    last_successful, limit=1
                 )
 
                 if recommendations:

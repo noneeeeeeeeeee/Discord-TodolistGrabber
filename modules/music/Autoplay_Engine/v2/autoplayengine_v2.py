@@ -24,6 +24,7 @@ LASTFM_API_KEY_ENV = "LASTFM_API_KEY"
 print("[AutoplayEngineV2] Set verbosity to ", DEFAULT_VERBOSITY)
 check_and_load_env_file()
 
+
 @dataclass
 class AvailabilityReport:
     lastfm: bool
@@ -67,43 +68,51 @@ class AutoplayEngineV2:
                 "modules.music.Autoplay_Engine.v2.novelty_controller",
                 "modules.music.Autoplay_Engine.v2.track_resolver",
             ]
-            
+
             # Add console handler to each autoplay logger if not present
             for logger_name in autoplay_loggers:
                 logger = logging.getLogger(logger_name)
                 logger.setLevel(logging.DEBUG)
-                
+
                 # Only add handler if this logger doesn't have one
                 if not logger.handlers:
                     handler = logging.StreamHandler()
                     handler.setLevel(logging.DEBUG)
-                    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+                    formatter = logging.Formatter(
+                        "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+                    )
                     handler.setFormatter(formatter)
                     logger.addHandler(handler)
                     # Don't propagate to avoid duplicate logs
                     logger.propagate = False
-            
-            LOG.debug("[AutoplayV2] Verbosity enabled: level=%s (autoplay modules only)", self._verbose)
+
+            LOG.debug(
+                "[AutoplayV2] Verbosity enabled: level=%s (autoplay modules only)",
+                self._verbose,
+            )
 
         if not self._lastfm_key:
             LOG.warning(
                 "Last.fm API key missing. Populate LASTFM_API_KEY in .env (see modules/enviromentfilegenerator.py)."
             )
         if not self._gemini.is_available:
-            LOG.warning("Gemini unavailable during AutoplayEngineV2 init: %s", self._gemini.status)
+            LOG.warning(
+                "Gemini unavailable during AutoplayEngineV2 init: %s",
+                self._gemini.status,
+            )
 
     @property
     def is_available(self) -> bool:
         """Full system availability: both Last.fm AND Gemini must be ready.
-        
+
         Use this for features that require full enrichment (mood analysis, etc).
         """
         return bool(self._lastfm_key) and self._gemini.is_available
-    
+
     @property
     def can_recommend(self) -> bool:
         """Can generate basic recommendations: only Last.fm is required.
-        
+
         Use this for autoplay trigger checks - recommendations work even if
         Gemini is temporarily rate-limited (tags/moods just won't be enriched).
         """
@@ -133,13 +142,24 @@ class AutoplayEngineV2:
     def track_resolver(self) -> TrackResolver:
         return self._track_resolver
 
-    async def parse_track(self, raw_title: str, channel_name: str) -> Optional[Dict[str, Any]]:
+    async def parse_track(
+        self, raw_title: str, channel_name: str
+    ) -> Optional[Dict[str, Any]]:
         cached = await self._cache.get_parsing(raw_title, channel_name)
         if cached:
             if self._verbose:
-                LOG.debug("[AutoplayV2][parse_track] cache hit: %r / %r -> artist=%s, title=%s",
-                          raw_title, channel_name, cached.artist, cached.title)
-            return {"artist": cached.artist, "title": cached.title, "confidence": cached.confidence}
+                LOG.debug(
+                    "[AutoplayV2][parse_track] cache hit: %r / %r -> artist=%s, title=%s",
+                    raw_title,
+                    channel_name,
+                    cached.artist,
+                    cached.title,
+                )
+            return {
+                "artist": cached.artist,
+                "title": cached.title,
+                "confidence": cached.confidence,
+            }
 
         parsed = await self._try_gemini_parse(raw_title, channel_name)
         if not parsed:
@@ -151,7 +171,12 @@ class AutoplayEngineV2:
             return None
 
         if self._verbose:
-            LOG.debug("[AutoplayV2][parse_track] Gemini parsed %r / %r -> %s", raw_title, channel_name, parsed)
+            LOG.debug(
+                "[AutoplayV2][parse_track] Gemini parsed %r / %r -> %s",
+                raw_title,
+                channel_name,
+                parsed,
+            )
 
         entry = ParsingEntry(
             artist=parsed["artist"],
@@ -185,8 +210,13 @@ class AutoplayEngineV2:
                     },
                 )
             elif self._verbose:
-                LOG.debug("[AutoplayV2][enrich_track] cache hit: %s - tags=%s mood=%s energy=%s",
-                          f"{artist}::{title}", cached.tags[:5], cached.mood, cached.energy)
+                LOG.debug(
+                    "[AutoplayV2][enrich_track] cache hit: %s - tags=%s mood=%s energy=%s",
+                    f"{artist}::{title}",
+                    cached.tags[:5],
+                    cached.mood,
+                    cached.energy,
+                )
             return {
                 "tags": cached.tags,
                 "mood": cached.mood,
@@ -194,7 +224,9 @@ class AutoplayEngineV2:
                 "listeners": cached.listeners,
                 "playcount": cached.playcount,
                 "duration_ms": cached.duration_ms,
-                "mood_vector": await self._cached_mood_vector_dict(cached.mood_vector_id),
+                "mood_vector": await self._cached_mood_vector_dict(
+                    cached.mood_vector_id
+                ),
             }
 
         if not self._gemini.is_available:
@@ -216,18 +248,31 @@ class AutoplayEngineV2:
             return None
 
         if self._verbose >= 2:
-            LOG.debug("[AutoplayV2][enrich_track] Gemini response for %s: tags=%s moods=%s energy=%s",
-                      f"{artist}::{title}", response.get("tags"), response.get("moods"), response.get("energy"))
+            LOG.debug(
+                "[AutoplayV2][enrich_track] Gemini response for %s: tags=%s moods=%s energy=%s",
+                f"{artist}::{title}",
+                response.get("tags"),
+                response.get("moods"),
+                response.get("energy"),
+            )
 
-        tags = [str(tag).lower() for tag in response.get("tags", []) if isinstance(tag, str)]
-        moods = [str(mood).strip() for mood in response.get("moods", []) if isinstance(mood, str) and mood.strip()]
+        tags = [
+            str(tag).lower() for tag in response.get("tags", []) if isinstance(tag, str)
+        ]
+        moods = [
+            str(mood).strip()
+            for mood in response.get("moods", [])
+            if isinstance(mood, str) and mood.strip()
+        ]
         mood_value = moods[0] if moods else None
-        energy = response.get("energy") if isinstance(response.get("energy"), str) else None
+        energy = (
+            response.get("energy") if isinstance(response.get("energy"), str) else None
+        )
 
         # Extract mood vector from enrichment response if present
         mood_vector_data = response.get("mood_vector")
         mood_vector_entry = None
-        
+
         if mood_vector_data and isinstance(mood_vector_data, dict):
             # Parse mood vector from enrichment
             try:
@@ -244,7 +289,7 @@ class AutoplayEngineV2:
             except Exception as exc:
                 LOG.debug("Failed to parse mood_vector from enrichment: %s", exc)
                 mood_vector_entry = None
-        
+
         # If mood vector wasn't in enrichment, fetch separately (fallback)
         mood_vector = None
         if mood_vector_entry:
@@ -352,7 +397,11 @@ class AutoplayEngineV2:
         prefer_cache: bool = True,
     ) -> Optional[Any]:
         if self._verbose >= 2:
-            LOG.debug("[AutoplayV2][resolve_track] resolving %s (duration=%s)", f"{artist}::{title}", expected_duration_ms)
+            LOG.debug(
+                "[AutoplayV2][resolve_track] resolving %s (duration=%s)",
+                f"{artist}::{title}",
+                expected_duration_ms,
+            )
         return await self._track_resolver.resolve_track(
             artist,
             title,
@@ -392,6 +441,15 @@ class AutoplayEngineV2:
             metadata=metadata,
         )
 
+    async def clear_guild_session(self, guild_id: int) -> bool:
+        """
+        Clear guild telemetry session when bot leaves VC.
+
+        Returns:
+            True if session was cleared successfully.
+        """
+        return await self._feedback.clear_guild_session(guild_id)
+
     async def _try_gemini_parse(
         self,
         raw_title: str,
@@ -413,7 +471,11 @@ class AutoplayEngineV2:
         artist = str(response.get("artist", "")).strip()
         title = str(response.get("title", "")).strip()
         if artist and title:
-            payload: Dict[str, Any] = {"artist": artist, "title": title, "confidence": 0.92}
+            payload: Dict[str, Any] = {
+                "artist": artist,
+                "title": title,
+                "confidence": 0.92,
+            }
             return payload
         return None
 
@@ -464,7 +526,9 @@ class AutoplayEngineV2:
         await self._cache.set_mood_vector(key, entry)
         return self._mood_entry_to_dict(key, entry)
 
-    async def _cached_mood_vector_dict(self, key_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    async def _cached_mood_vector_dict(
+        self, key_id: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
         if not key_id:
             return None
         entry = await self._cache.get_mood_vector(key_id)
