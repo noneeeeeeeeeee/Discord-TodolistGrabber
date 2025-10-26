@@ -1,11 +1,95 @@
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Dict, Optional
 
 from .cache_manager import CacheManager, MappingEntry
 
 LOG = logging.getLogger(__name__)
+
+# Spam detection thresholds
+HASHTAG_LIMIT = 3
+DURATION_TOLERANCE_PERCENT = 0.20  # 20%
+DURATION_TOLERANCE_MIN_MS = 30000  # 30 seconds minimum tolerance
+
+# High-quality channel indicators (boost priority)
+GOOD_CHANNEL_HINTS = [
+    "vevo", "official artist channel", "topic", "records", "music", "label",
+]
+
+# Official title markers (boost priority)
+GOOD_TITLE_KEYWORDS = [
+    "official audio", "official video", "official mv", "official music video",
+    "official visualizer", "official lyric video", "official",
+    "album version", "single version",
+]
+
+# Spam keywords that indicate non-music content or low-quality uploads
+BAD_TITLE_KEYWORDS = [
+    # Pitch/speed manipulations
+    "nightcore", "night core", "slowed", "slowed + reverb", "slowed+reverb",
+    "sped up", "speed up", "speedup", "pitch",
+    
+    # Audio effects
+    "8d", "8d audio", "3d audio", "binaural", "spatial audio", "ambisonic",
+    "sound spatial", "stereo widened",
+    
+    # Fan uploads / non-canonical
+    "cover", "karaoke", "karaoke version", "karaoke instrumental",
+    "instrumental", "backing track", "minus one", "tutorial", "lesson", "practice",
+    
+    # Remix / edits / unofficial versions
+    "remix", "remixed", "edit", "rework", "bootleg", "mashup", "reimagined",
+    "redux", "acapella", "a cappella", "midi", "black midi", "audio spectrum",
+    "remake", "music project", "fan edit", "fanmix", "fan mix", "covered by",
+    "extended version", "extended",
+    
+    # Performance / live (usually not studio quality)
+    "live", "live at", "live from", "session", "concert", "performance", "tour",
+    
+    # Long-play / loop / compilation
+    "hour", "hours", "loop", "mix", "mixes", "dj set", "set",
+    
+    # Low-quality / user-added modifiers
+    "lyric", "lyrics", "lyric video", "visualizer", "reupload", "fanmade",
+    
+    # Non-English karaoke markers
+    "伴唱", "カラオケ", "노래방",
+    
+    # Teaser / promo content
+    "teaser", "trailer", "preview", "snippet", "sample", "promo", "promotional",
+    "promotion", "promos",
+    
+    # Music mix / compilations
+    "music mix", "top hits", "best of", "amazing", "greatest", "hits",
+    "collection", "compilation", "playlist",
+    
+    # Subscriber specials & spam entries
+    "subscriber special", "subscriber special mix", "subscriber special edition",
+    "plz", "hz",
+    
+    # Tutorial / educational content
+    "how to", "tutorial", "lesson", "practice", "learn", "teach",
+    
+    # Reactions / commentary
+    "reaction", "review", "critique", "commentary", "analysis",
+    
+    # Gaming / unrelated content
+    "unboxing", "gameplay", "walkthrough",
+    
+    # Announcement / milestone content
+    "milestone", "announcement",
+    
+    # Year tags (often indicate compilation)
+    "2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023", "2024", "2025",
+    
+    # Studio remixes
+    "studio vocals",
+    
+    # Sound test / unofficial versions
+    "sound test", "(sound test)",
+]
 
 
 class TrackResolver:
@@ -30,21 +114,32 @@ class TrackResolver:
         if prefer_cache:
             mapping = await self._cache.get_mapping(artist, title)
             if mapping:
-                rebuilt = await self._create_track_obj_from_mapping(mapping)
-                if rebuilt:
-                    if LOG.isEnabledFor(logging.DEBUG):
-                        LOG.debug(
-                            "Track resolved from cache: %s",
-                            {
-                                "artist": artist,
-                                "title": title,
-                                "youtube_id": mapping.youtube_id,
-                                "channel": mapping.channel_name,
-                                "verified": mapping.verified,
-                                "source": "cache",
-                            },
-                        )
-                    return rebuilt
+                # Validate cached mapping against spam filters
+                if self._is_spam_mapping(mapping, expected_duration_ms):
+                    LOG.warning(
+                        "🚫 [CACHE SPAM] Invalidating cached mapping for '%s - %s' (youtube_id=%s, reason=spam detected)",
+                        artist,
+                        title,
+                        mapping.youtube_id,
+                    )
+                    # Delete bad mapping from cache
+                    await self._cache.delete_mapping(artist, title)
+                else:
+                    rebuilt = await self._create_track_obj_from_mapping(mapping)
+                    if rebuilt:
+                        if LOG.isEnabledFor(logging.DEBUG):
+                            LOG.debug(
+                                "Track resolved from cache: %s",
+                                {
+                                    "artist": artist,
+                                    "title": title,
+                                    "youtube_id": mapping.youtube_id,
+                                    "channel": mapping.channel_name,
+                                    "verified": mapping.verified,
+                                    "source": "cache",
+                                },
+                            )
+                        return rebuilt
 
         track_obj = await self._search_with_pomice(
             artist,
@@ -186,34 +281,92 @@ class TrackResolver:
         duration_target = expected_duration_ms or 0
         normalized_artist = artist.casefold()
         normalized_title = title.casefold()
+        
+        # Duration tolerance: ±20% or ±30 seconds (whichever is larger)
+        duration_tolerance_ms = max(duration_target * 0.20, 30000) if duration_target else 0
 
         for index, candidate in enumerate(results):
             metadata = self._extract_track_metadata(candidate)
+            
+            # SPAM FILTERING
+            candidate_title_raw = getattr(candidate, "title", None) or metadata.get("title") or ""
+            
+            # Filter 1: Comprehensive spam title check (hashtags + keywords)
+            if self._is_spam_title(candidate_title_raw):
+                continue
+            
+            # Filter 2: Very short videos (likely shorts, not music)
+            duration_val = metadata.get("duration_ms") or 0
+            if duration_val and duration_val < 45000:  # < 45 seconds
+                LOG.debug(
+                    "🚫 [SHORT VIDEO] Rejected '%s' - too short (duration=%dms, likely YouTube Short)",
+                    candidate_title_raw[:60],
+                    duration_val,
+                )
+                continue
+            
+            # Filter 3: Duration tolerance check (reject if outside tolerance)
+            if duration_target and duration_val and duration_tolerance_ms:
+                delta = abs(duration_target - int(duration_val))
+                if delta > duration_tolerance_ms:
+                    LOG.debug(
+                        "🚫 [DURATION FILTER] Rejected '%s' - duration mismatch (expected=%dms, got=%dms, delta=%dms, tolerance=%dms)",
+                        candidate_title_raw[:60],
+                        duration_target,
+                        duration_val,
+                        delta,
+                        int(duration_tolerance_ms)
+                    )
+                    continue
+            
+            # SCORING
             score = 0.0
 
+            # Verified badge = huge boost
             if metadata["verified"]:
-                score += 3.0
+                score += 4.0
 
             channel = (metadata.get("channel_name") or "").casefold()
+            
+            # Channel name matches artist = official/authentic
             if channel and normalized_artist in channel:
-                score += 1.5
+                score += 2.0
+            
+            # Channel has official markers (VEVO, Topic, Records, etc.)
+            for hint in GOOD_CHANNEL_HINTS:
+                if hint in channel:
+                    score += 1.5
+                    break
+            
+            # Title has official markers
+            candidate_title = candidate_title_raw.casefold()
+            for good_keyword in GOOD_TITLE_KEYWORDS:
+                if good_keyword in candidate_title:
+                    score += 0.8
+                    break
 
-            candidate_title = (getattr(candidate, "title", None) or metadata.get("title") or "").casefold()
+            # Title matches = relevance boost
             if candidate_title and normalized_title and normalized_title in candidate_title:
                 score += 1.0
 
-            duration_val = metadata.get("duration_ms") or 0
+            # Duration similarity bonus (within tolerance)
             if duration_target and duration_val:
                 delta = abs(duration_target - int(duration_val))
                 score -= min(delta / 1000.0, 10.0)
 
-            score -= index * 0.1
+            # Search rank penalty (lower index = higher rank)
+            score -= index * 0.15
 
             if score > best_score:
                 best_score = score
                 best_track = candidate
 
-        return best_track or results[0]
+        if not best_track and results:
+            # If all filtered out, fall back to first result but log warning
+            LOG.warning("⚠️ All candidates filtered out for '%s - %s', using first result", artist, title)
+            return results[0]
+        
+        return best_track
 
     async def _get_node(self) -> Optional[Any]:
         try:
@@ -268,6 +421,67 @@ class TrackResolver:
             "track_identifier": track_identifier,
             "title": title,
         }
+
+    def _is_spam_mapping(self, mapping: MappingEntry, expected_duration_ms: Optional[int]) -> bool:
+        """Check if a cached mapping is spam using heuristics."""
+        
+        # Check 1: Duration mismatch (if we have expected duration)
+        if expected_duration_ms and mapping.duration_ms:
+            tolerance_ms = max(expected_duration_ms * DURATION_TOLERANCE_PERCENT, DURATION_TOLERANCE_MIN_MS)
+            delta = abs(expected_duration_ms - mapping.duration_ms)
+            if delta > tolerance_ms:
+                LOG.debug(
+                    "🚫 [SPAM] Duration mismatch: expected=%dms, got=%dms, delta=%dms, tolerance=%dms",
+                    expected_duration_ms,
+                    mapping.duration_ms,
+                    delta,
+                    int(tolerance_ms),
+                )
+                return True
+        
+        # Check 2: Very short videos (likely shorts/clips, not music)
+        if mapping.duration_ms and mapping.duration_ms < 45000:  # < 45 seconds
+            LOG.debug(
+                "🚫 [SPAM] Video too short: duration=%dms (likely YouTube Short)",
+                mapping.duration_ms,
+            )
+            return True
+        
+        # Check 3: Check URL/ID for spam patterns (if available from cached data)
+        # Note: MappingEntry doesn't store title, so we can't check hashtags here
+        # The hashtag check happens during live search in _search_with_pomice
+        
+        return False
+
+    def _is_spam_title(self, title: str) -> bool:
+        """Check if a YouTube title indicates spam/non-music content."""
+        
+        if not title:
+            return False
+        
+        title_lower = title.lower()
+        
+        # Check 1: Excessive hashtags
+        hashtag_count = title.count('#')
+        if hashtag_count > HASHTAG_LIMIT:
+            LOG.debug(
+                "🚫 [SPAM] Excessive hashtags: count=%d in '%s'",
+                hashtag_count,
+                title[:60],
+            )
+            return True
+        
+        # Check 2: Bad keywords
+        for keyword in BAD_TITLE_KEYWORDS:
+            if keyword in title_lower:
+                LOG.debug(
+                    "🚫 [SPAM] Spam keyword '%s' found in '%s'",
+                    keyword,
+                    title[:60],
+                )
+                return True
+        
+        return False
 
 
 __all__ = ["TrackResolver"]

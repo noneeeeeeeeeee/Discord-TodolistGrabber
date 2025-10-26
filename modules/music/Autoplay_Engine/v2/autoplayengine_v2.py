@@ -17,6 +17,11 @@ from .contextual_recommender import (
 from .track_resolver import TrackResolver
 
 LOG = logging.getLogger(__name__)
+
+# Verbosity control: set AUTOPLAY_V2_VERBOSITY=0 (off, default), 1 (debug), 2 (very verbose)
+DEFAULT_VERBOSITY = int(os.getenv("AUTOPLAY_V2_VERBOSITY", "0"))
+LASTFM_API_KEY_ENV = "LASTFM_API_KEY"
+print("[AutoplayEngineV2] Set verbosity to ", DEFAULT_VERBOSITY)
 check_and_load_env_file()
 
 @dataclass
@@ -47,6 +52,39 @@ class AutoplayEngineV2:
         self._track_resolver = track_resolver or TrackResolver(self._cache)
         self._lastfm_key = os.getenv(LASTFM_API_KEY_ENV, "").strip()
 
+        # instance verbosity (0 = off, 1 = debug, 2 = very verbose)
+        self._verbose = DEFAULT_VERBOSITY
+        if self._verbose:
+            # Configure logging for autoplay V2 modules only (not root logger)
+            autoplay_loggers = [
+                "modules.music.Autoplay_Engine.v2",
+                "modules.music.Autoplay_Engine.v2.autoplayengine_v2",
+                "modules.music.Autoplay_Engine.v2.gemini_service",
+                "modules.music.Autoplay_Engine.v2.cache_manager",
+                "modules.music.Autoplay_Engine.v2.context_tracker",
+                "modules.music.Autoplay_Engine.v2.contextual_recommender",
+                "modules.music.Autoplay_Engine.v2.feedback_manager",
+                "modules.music.Autoplay_Engine.v2.novelty_controller",
+                "modules.music.Autoplay_Engine.v2.track_resolver",
+            ]
+            
+            # Add console handler to each autoplay logger if not present
+            for logger_name in autoplay_loggers:
+                logger = logging.getLogger(logger_name)
+                logger.setLevel(logging.DEBUG)
+                
+                # Only add handler if this logger doesn't have one
+                if not logger.handlers:
+                    handler = logging.StreamHandler()
+                    handler.setLevel(logging.DEBUG)
+                    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+                    handler.setFormatter(formatter)
+                    logger.addHandler(handler)
+                    # Don't propagate to avoid duplicate logs
+                    logger.propagate = False
+            
+            LOG.debug("[AutoplayV2] Verbosity enabled: level=%s (autoplay modules only)", self._verbose)
+
         if not self._lastfm_key:
             LOG.warning(
                 "Last.fm API key missing. Populate LASTFM_API_KEY in .env (see modules/enviromentfilegenerator.py)."
@@ -56,7 +94,20 @@ class AutoplayEngineV2:
 
     @property
     def is_available(self) -> bool:
+        """Full system availability: both Last.fm AND Gemini must be ready.
+        
+        Use this for features that require full enrichment (mood analysis, etc).
+        """
         return bool(self._lastfm_key) and self._gemini.is_available
+    
+    @property
+    def can_recommend(self) -> bool:
+        """Can generate basic recommendations: only Last.fm is required.
+        
+        Use this for autoplay trigger checks - recommendations work even if
+        Gemini is temporarily rate-limited (tags/moods just won't be enriched).
+        """
+        return bool(self._lastfm_key)
 
     def availability_report(self) -> AvailabilityReport:
         status = "ready" if self.is_available else self._gemini.status
@@ -85,6 +136,9 @@ class AutoplayEngineV2:
     async def parse_track(self, raw_title: str, channel_name: str) -> Optional[Dict[str, Any]]:
         cached = await self._cache.get_parsing(raw_title, channel_name)
         if cached:
+            if self._verbose:
+                LOG.debug("[AutoplayV2][parse_track] cache hit: %r / %r -> artist=%s, title=%s",
+                          raw_title, channel_name, cached.artist, cached.title)
             return {"artist": cached.artist, "title": cached.title, "confidence": cached.confidence}
 
         parsed = await self._try_gemini_parse(raw_title, channel_name)
@@ -95,6 +149,9 @@ class AutoplayEngineV2:
                 channel_name,
             )
             return None
+
+        if self._verbose:
+            LOG.debug("[AutoplayV2][parse_track] Gemini parsed %r / %r -> %s", raw_title, channel_name, parsed)
 
         entry = ParsingEntry(
             artist=parsed["artist"],
@@ -127,6 +184,9 @@ class AutoplayEngineV2:
                         "mood_vector_id": cached.mood_vector_id,
                     },
                 )
+            elif self._verbose:
+                LOG.debug("[AutoplayV2][enrich_track] cache hit: %s - tags=%s mood=%s energy=%s",
+                          f"{artist}::{title}", cached.tags[:5], cached.mood, cached.energy)
             return {
                 "tags": cached.tags,
                 "mood": cached.mood,
@@ -155,18 +215,50 @@ class AutoplayEngineV2:
         if not response:
             return None
 
+        if self._verbose >= 2:
+            LOG.debug("[AutoplayV2][enrich_track] Gemini response for %s: tags=%s moods=%s energy=%s",
+                      f"{artist}::{title}", response.get("tags"), response.get("moods"), response.get("energy"))
+
         tags = [str(tag).lower() for tag in response.get("tags", []) if isinstance(tag, str)]
         moods = [str(mood).strip() for mood in response.get("moods", []) if isinstance(mood, str) and mood.strip()]
         mood_value = moods[0] if moods else None
         energy = response.get("energy") if isinstance(response.get("energy"), str) else None
 
-        mood_vector = await self.get_mood_vector(
-            artist,
-            title,
-            tags=tags,
-            genre=str(response.get("genre", "") or ""),
-            description=str(response.get("description", "") or ""),
-        )
+        # Extract mood vector from enrichment response if present
+        mood_vector_data = response.get("mood_vector")
+        mood_vector_entry = None
+        
+        if mood_vector_data and isinstance(mood_vector_data, dict):
+            # Parse mood vector from enrichment
+            try:
+                mood_vector_entry = MoodVectorEntry(
+                    energy=float(mood_vector_data.get("energy", 0.0) or 0.0),
+                    valence=float(mood_vector_data.get("valence", 0.0) or 0.0),
+                    tempo=float(mood_vector_data.get("tempo", 0.0) or 0.0),
+                    confidence=float(mood_vector_data.get("confidence", 0.0) or 0.0),
+                    mood=(str(mood_vector_data.get("mood", "")).strip() or None),
+                    fetched_at=time.time(),
+                )
+                key = self._make_track_key(artist, title)
+                await self._cache.set_mood_vector(key, mood_vector_entry)
+            except Exception as exc:
+                LOG.debug("Failed to parse mood_vector from enrichment: %s", exc)
+                mood_vector_entry = None
+        
+        # If mood vector wasn't in enrichment, fetch separately (fallback)
+        mood_vector = None
+        if mood_vector_entry:
+            key = self._make_track_key(artist, title)
+            mood_vector = self._mood_entry_to_dict(key, mood_vector_entry)
+        else:
+            # Fallback: request mood vector separately (will batch if many concurrent requests)
+            mood_vector = await self.get_mood_vector(
+                artist,
+                title,
+                tags=tags,
+                genre=str(response.get("genre", "") or ""),
+                description=str(response.get("description", "") or ""),
+            )
 
         entry = EnrichmentEntry(
             tags=tags,
@@ -259,6 +351,8 @@ class AutoplayEngineV2:
         expected_duration_ms: Optional[int] = None,
         prefer_cache: bool = True,
     ) -> Optional[Any]:
+        if self._verbose >= 2:
+            LOG.debug("[AutoplayV2][resolve_track] resolving %s (duration=%s)", f"{artist}::{title}", expected_duration_ms)
         return await self._track_resolver.resolve_track(
             artist,
             title,
@@ -278,6 +372,15 @@ class AutoplayEngineV2:
         source: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        if self._verbose:
+            LOG.debug(
+                "[AutoplayV2][record_feedback_event] guild=%s user=%s track=%s event=%s metadata_keys=%s",
+                guild_id,
+                user_id,
+                track_id,
+                event_type,
+                list((metadata or {}).keys()),
+            )
         return await self._feedback.record_event(
             guild_id=guild_id,
             user_id=user_id,

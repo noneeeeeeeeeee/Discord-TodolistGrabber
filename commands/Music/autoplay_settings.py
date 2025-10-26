@@ -1,4 +1,5 @@
 import os
+import inspect
 import discord
 from discord.ext import commands
 from pathlib import Path
@@ -42,7 +43,7 @@ class AutoPlaySettings(commands.Cog):
 
         # Get player to access Last.fm autoplay
         player = self._get_player()
-        if not player or not player._lastfm_autoplay:
+        if not player or not getattr(player, "_lastfm_autoplay", None):
             await ctx.send(":x: Last.fm AutoPlay is not available.")
             return
 
@@ -83,31 +84,59 @@ class AutoPlaySettings(commands.Cog):
             if str(reaction.emoji) == "✅":
                 # Clear the cache
                 try:
-                    cache_file = Path("cache/music/lastfm_mappings.json")
-                    cache_count = 0
+                    # Support both V1 and V2 mapping cache files
+                    mapping_files = [
+                        Path("cache/music/lastfm_mappings_v1.json"),
+                        Path("cache/music/mappings_v2.json"),
+                    ]
+                    total_deleted = 0
+                    total_entries = 0
 
-                    if cache_file.exists():
-                        # Count entries before clearing
-                        import json
+                    import json
 
+                    for fp in mapping_files:
+                        if fp.exists():
+                            try:
+                                with fp.open("r", encoding="utf-8") as f:
+                                    data = json.load(f)
+                                    if isinstance(data, dict):
+                                        total_entries += len(data)
+                                    elif isinstance(data, list):
+                                        total_entries += len(data)
+                            except Exception:
+                                pass
+                            try:
+                                fp.unlink()
+                                total_deleted += 1
+                            except Exception:
+                                pass
+
+                    # Attempt to clear in-memory caches for current engine if supported
+                    try:
+                        # V2 path: MusicPlayer._lastfm_autoplay is a LastFMAutoplayV2 orchestrator
+                        orchestrator = getattr(player, "_lastfm_autoplay", None)
+                        engine = getattr(orchestrator, "_engine", None)
+                        cache = getattr(engine, "_cache", None)
+                        clear_fn = getattr(cache, "clear_mappings", None)
+                        if callable(clear_fn):
+                            result = clear_fn()
+                            if inspect.isawaitable(result):
+                                await result
+                    except Exception:
+                        # V1 path: try legacy attribute if present
                         try:
-                            with open(cache_file, "r", encoding="utf-8") as f:
-                                data = json.load(f)
-                                cache_count = len(data)
+                            legacy_cache = getattr(player._lastfm_autoplay, "_cache", None)
+                            if legacy_cache and hasattr(legacy_cache, "clear"):
+                                legacy_cache.clear()
                         except Exception:
                             pass
-
-                        # Delete the cache file
-                        cache_file.unlink()
-
-                    # Clear in-memory cache
-                    player._lastfm_autoplay._cache.clear()
 
                     success_embed = discord.Embed(
                         title="✅ Cache Cleared",
                         description=(
                             f"Successfully cleared Last.fm mapping cache.\n\n"
-                            f"**Cleared:** {cache_count} track mappings\n"
+                            f"**Cleared files:** {total_deleted} (V1/V2)\n"
+                            f"**Estimated entries removed:** {total_entries}+\n"
                             f"**Status:** Cache will rebuild as tracks are played"
                         ),
                         color=discord.Color.green(),

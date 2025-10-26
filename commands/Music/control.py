@@ -1,11 +1,143 @@
 import discord
 from discord.ext import commands
+import io
+from collections import Counter
 
 from modules.music.music_player import (
     is_voice_connected,
     is_voice_paused,
     is_voice_playing,
 )
+
+
+class AutoPlayAnalyticsView(discord.ui.View):
+    """View with button to show detailed autoplay analytics."""
+    
+    def __init__(self, player, lastfm_autoplay, guild_id, author):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.player = player
+        self.lastfm_autoplay = lastfm_autoplay
+        self.guild_id = guild_id
+        self.author = author
+    
+    @discord.ui.button(label="📊 View Analytics", style=discord.ButtonStyle.primary)
+    async def view_analytics(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Show detailed analytics with genre distribution graphs."""
+        # Check if user is the command author
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message(
+                "❌ Only the command author can view analytics.", ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=False)
+        
+        try:
+            # Get tracker and context
+            tracker = self.lastfm_autoplay._get_context_tracker(self.guild_id)
+            context = tracker.get_context()
+            history = tracker.get_history()
+            
+            # Generate analytics embed
+            embed = discord.Embed(
+                title="📊 AutoPlay Analytics - Deep Dive",
+                description="Detailed genre distribution and algorithm insights",
+                color=discord.Color.gold()
+            )
+            
+            # Genre Distribution
+            all_genres = []
+            for track in history:
+                all_genres.extend(track.genres)
+            
+            if all_genres:
+                genre_counts = Counter(all_genres)
+                top_genres = genre_counts.most_common(10)
+                
+                # Calculate percentages
+                total = len(all_genres)
+                genre_text = ""
+                for genre, count in top_genres:
+                    percentage = (count / total) * 100
+                    bar_length = int(percentage / 5)  # Scale to max 20 chars
+                    bar = "█" * bar_length + "░" * (20 - bar_length)
+                    genre_text += f"`{bar}` **{genre}** ({percentage:.1f}%)\n"
+                
+                embed.add_field(name="🎸 Genre Distribution", value=genre_text, inline=False)
+            
+            # Track History
+            if history:
+                recent_tracks = history[-5:]
+                track_list = ""
+                for i, track in enumerate(reversed(recent_tracks), 1):
+                    skip_icon = "⏭️" if track.was_skipped else "✅"
+                    track_list += f"{i}. {skip_icon} **{track.title}** - {track.artist}\n"
+                    if track.genres:
+                        track_list += f"   └ *{', '.join(track.genres[:3])}*\n"
+                
+                embed.add_field(name="📜 Recent History", value=track_list, inline=False)
+            
+            # Mood Analysis
+            mood_labels = [t.mood_label for t in history if t.mood_label]
+            if mood_labels:
+                mood_counts = Counter(mood_labels)
+                mood_text = "\n".join([
+                    f"• **{mood}**: {count} tracks"
+                    for mood, count in mood_counts.most_common(5)
+                ])
+                embed.add_field(name="🎭 Mood Distribution", value=mood_text, inline=True)
+            
+            # Skip Analysis
+            total_tracks = len(history)
+            skipped_tracks = sum(1 for t in history if t.was_skipped)
+            if total_tracks > 0:
+                skip_breakdown = f"**Total Tracks:** {total_tracks}\n"
+                skip_breakdown += f"**Completed:** {total_tracks - skipped_tracks}\n"
+                skip_breakdown += f"**Skipped:** {skipped_tracks}\n"
+                skip_breakdown += f"**Skip Rate:** {(skipped_tracks / total_tracks) * 100:.1f}%"
+                embed.add_field(name="⏭️ Skip Analysis", value=skip_breakdown, inline=True)
+            
+            # Artist Frequency
+            artist_counts = Counter([t.artist for t in history])
+            if artist_counts:
+                top_artists = artist_counts.most_common(5)
+                artist_text = "\n".join([
+                    f"{i}. **{artist}** ({count} plays)"
+                    for i, (artist, count) in enumerate(top_artists, 1)
+                ])
+                embed.add_field(name="👥 Top Artists", value=artist_text, inline=False)
+            
+            # Algorithm Insights
+            insights = "**What the algorithm learned:**\n"
+            if context.focus_genres:
+                insights += f"🎯 Locked into: *{', '.join(context.focus_genres[:3])}*\n"
+            if context.skip_rate > 0.3:
+                insights += f"⚠️ High skip rate ({context.skip_rate*100:.0f}%) → exploring alternatives\n"
+            elif context.skip_rate < 0.15:
+                insights += f"✅ Low skip rate ({context.skip_rate*100:.0f}%) → maintaining current style\n"
+            if context.consecutive_skips >= 3:
+                insights += f"🔴 {context.consecutive_skips} consecutive skips → diversity boost active\n"
+            
+            # Add genre preference insights
+            liked_genres = []
+            for genre,count in genre_counts.most_common(5):
+                track_skip_rate = sum(1 for t in history if genre in t.genres and t.was_skipped) / max(1, count)
+                if track_skip_rate < 0.2:
+                    liked_genres.append(genre)
+            
+            if liked_genres:
+                insights += f"💚 You seem to enjoy: *{', '.join(liked_genres[:3])}*\n"
+            
+            embed.add_field(name="🧠 Algorithm Insights", value=insights, inline=False)
+            
+            embed.set_footer(text=f"Session: {(context.last_activity - context.session_start) / 60:.1f} minutes | {len(history)} tracks analyzed")
+            
+            await interaction.followup.send(embed=embed)
+            
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Failed to generate analytics: {str(e)}", ephemeral=True
+            )
 
 
 class ControlCommands(commands.Cog):
@@ -391,9 +523,107 @@ class ControlCommands(commands.Cog):
             return
 
         guild_id = ctx.guild.id
-
-        # Check if autoplay is enabled
         autoplay_enabled = player.is_session_autoplay_enabled(guild_id)
+
+        # Check if this is V2
+        is_v2 = hasattr(lastfm_autoplay, '_context_tracker')
+        
+        if is_v2:
+            await self._show_autoplay_status_v2(ctx, player, lastfm_autoplay, guild_id, autoplay_enabled)
+        else:
+            await self._show_autoplay_status_v1(ctx, player, lastfm_autoplay, guild_id, autoplay_enabled)
+
+    async def _show_autoplay_status_v2(self, ctx, player, lastfm_autoplay, guild_id, autoplay_enabled):
+        """Enhanced V2 status with context tracking."""
+        # Get context tracker
+        tracker = lastfm_autoplay._get_context_tracker(guild_id)
+        context = tracker.get_context()
+        stats = tracker.get_stats()
+        
+        # Get novelty controller stats
+        novelty_stats = lastfm_autoplay._novelty_controller.get_stats()
+        
+        # Detect current phase
+        phase = lastfm_autoplay._novelty_controller.detect_exploration_phase(
+            skip_rate=context.skip_rate,
+            songs_since_novelty=context.songs_since_novelty,
+            session_duration_minutes=(context.last_activity - context.session_start) / 60
+        )
+        
+        exploration_rate = lastfm_autoplay._novelty_controller.compute_exploration_rate(
+            skip_rate=context.skip_rate,
+            consecutive_skips=context.consecutive_skips
+        )
+        
+        proportions = lastfm_autoplay._novelty_controller.get_candidate_proportions(phase)
+        
+        # Build embed
+        embed = discord.Embed(
+            title="🎲 AutoPlay Status (V2 - Contextual Arc Recommender)",
+            description=f"**Status:** {'✅ Enabled' if autoplay_enabled else '❌ Disabled'}",
+            color=discord.Color.blue() if autoplay_enabled else discord.Color.grayed_out()
+        )
+        
+        # Session Context
+        session_info = f"**Duration:** {stats['session_duration_minutes']:.1f} minutes\n"
+        session_info += f"**Tracks Played:** {stats['history_size']}\n"
+        session_info += f"**Skip Rate:** {context.skip_rate * 100:.0f}%"
+        if context.consecutive_skips > 0:
+            session_info += f" (🔴 {context.consecutive_skips} streak)"
+        embed.add_field(name="📊 Session Stats", value=session_info, inline=True)
+        
+        # Exploration Phase
+        phase_emoji = {"stable": "🎯", "rising_boredom": "🔀", "high_exploration": "🌈", "end_session": "🔄"}
+        phase_info = f"**Current Phase:** {phase_emoji.get(phase.value, '🎲')} *{phase.value.replace('_', ' ').title()}*\n"
+        phase_info += f"**Exploration Rate:** {exploration_rate * 100:.0f}%\n"
+        phase_info += f"**Songs Since Novelty:** {context.songs_since_novelty}\n"
+        phase_info += f"**Max Distance:** {novelty_stats['max_distance']}"
+        embed.add_field(name="🎲 Exploration State", value=phase_info, inline=True)
+        
+        # Current Mix Strategy
+        mix_info = f"**Core Cluster:** {proportions['core'] * 100:.0f}%\n"
+        mix_info += f"**Similar:** {proportions['similar'] * 100:.0f}%\n"
+        mix_info += f"**Novel:** {proportions['novel'] * 100:.0f}%\n"
+        mix_info += f"**Rediscovery:** {proportions['rediscover'] * 100:.0f}%"
+        embed.add_field(name="🎯 Candidate Mix", value=mix_info, inline=True)
+        
+        # Focus Genres
+        if context.focus_genres:
+            genre_text = ", ".join([f"**{g}**" for g in context.focus_genres[:5]])
+            embed.add_field(name="🎸 Focus Genres", value=genre_text, inline=False)
+        
+        # Artist Diversity
+        diversity_info = f"**Unique Artists:** {stats['unique_artists']}\n"
+        if stats['history_size'] > 0:
+            diversity_ratio = stats['unique_artists'] / stats['history_size']
+            diversity_info += f"**Diversity Ratio:** {diversity_ratio:.2f}"
+        embed.add_field(name="👥 Artist Diversity", value=diversity_info, inline=True)
+        
+        # Algorithm Thinking
+        thinking = ""
+        if context.skip_rate > 0.35:
+            thinking += "💭 *High skip rate detected → Increasing exploration*\n"
+        elif context.skip_rate < 0.15:
+            thinking += "💭 *User satisfied → Maintaining current vibe*\n"
+        
+        if context.consecutive_skips >= 3:
+            thinking += f"⚠️ *{context.consecutive_skips} consecutive skips → Boosting diversity*\n"
+        
+        if phase.value == "end_session":
+            thinking += "🔄 *Long session → Testing rediscovery*\n"
+        
+        if thinking:
+            embed.add_field(name="🧠 Algorithm Thinking", value=thinking, inline=False)
+        
+        # Add button for detailed analytics
+        view = AutoPlayAnalyticsView(player, lastfm_autoplay, guild_id, ctx.author)
+        
+        embed.set_footer(text=f"💡 Click 'View Analytics' for detailed genre distribution and graphs")
+        
+        await ctx.send(embed=embed, view=view)
+
+    async def _show_autoplay_status_v1(self, ctx, player, lastfm_autoplay, guild_id, autoplay_enabled):
+        """Original V1 status display."""
 
         # Get exploration state
         explore_state = lastfm_autoplay._get_exploration_state(guild_id)

@@ -69,7 +69,7 @@ def get_autoplay_engine(bot):
     config = get_autoplay_config()
     version = config.get_autoplay_version()
     
-    if version in ("v2", "v3"):
+    if version in ("v2"):
         try:
             from .v2 import get_lastfm_autoplay_v2
 

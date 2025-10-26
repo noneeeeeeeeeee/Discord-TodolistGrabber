@@ -18,6 +18,8 @@ import aiohttp
 
 from .autoplayengine_v2 import AutoplayEngineV2, LASTFM_API_KEY_ENV
 from .contextual_recommender import CandidateFeatures
+from .context_tracker import ContextTracker
+from .novelty_controller import NoveltyController, NoveltyConfig
 
 LOG = logging.getLogger(__name__)
 
@@ -47,18 +49,56 @@ class LastFMAutoplayV2:
         self._collaborative_lock = asyncio.Lock()
         self._enrich_semaphore = asyncio.Semaphore(_PARALLEL_ENRICH_LIMIT)
         self._http_timeout = aiohttp.ClientTimeout(total=12)
+        
+        # Issue #3 - Contextual Arc Recommender components
+        verbosity = int(os.getenv("AUTOPLAY_V2_VERBOSITY", "0"))
+        self._context_tracker: Dict[int, ContextTracker] = {}  # Per-guild context
+        self._novelty_controller = NoveltyController(verbose=verbosity)
+        self._verbose = verbosity
+
+    # ------------------------------------------------------------------
+    # Internal helpers for context tracking (Issue #3)
+    # ------------------------------------------------------------------
+    def _get_context_tracker(self, guild_id: int) -> ContextTracker:
+        """Get or create context tracker for a guild."""
+        if guild_id not in self._context_tracker:
+            self._context_tracker[guild_id] = ContextTracker(
+                history_size=15,
+                verbose=self._verbose,
+            )
+        
+        tracker = self._context_tracker[guild_id]
+        
+        # Check if session should reset due to inactivity
+        if tracker.should_reset_session(idle_threshold_minutes=15):
+            tracker.reset_session()
+        
+        return tracker
 
     # ------------------------------------------------------------------
     # Public API expected by ``MusicPlayer``
     # ------------------------------------------------------------------
     def is_available(self) -> bool:
+        """Full system availability: Last.fm AND Gemini must be ready."""
         return self._engine.is_available
+    
+    def can_recommend(self) -> bool:
+        """Can generate basic recommendations: only Last.fm required.
+        
+        Autoplay trigger should use this instead of is_available() to allow
+        recommendations even when Gemini is temporarily rate-limited.
+        """
+        return self._engine.can_recommend
 
     def clear_history(self, guild_id: Optional[int] = None) -> None:
         if guild_id is None:
             self._recent_history.clear()
+            self._context_tracker.clear()
         else:
             self._recent_history.pop(int(guild_id), None)
+            # Reset context tracker but keep it initialized
+            if guild_id in self._context_tracker:
+                self._context_tracker[guild_id].reset_session()
 
     async def record_playback_feedback(
         self,
@@ -99,12 +139,85 @@ class LastFMAutoplayV2:
         if user_id is not None:
             metadata["user_id"] = str(user_id)
 
+        if self._engine._verbose:
+            # Friendly feedback summary
+            if event_type == "like":
+                LOG.info(
+                    "👍 [Feedback] User loved '%s' by '%s' (%.0f%% played) → boosting genre/artist for future picks",
+                    title,
+                    artist,
+                    ratio * 100,
+                )
+            elif event_type == "dislike":
+                LOG.info(
+                    "👎 [Feedback] User disliked '%s' by '%s' (%.0f%% played) → reducing genre/artist weight",
+                    title,
+                    artist,
+                    ratio * 100,
+                )
+            elif event_type == "hard_skip":
+                LOG.info(
+                    "⏭️ [Feedback] Hard skip on '%s' by '%s' (%.0f%% played) → strong penalty for similar tracks",
+                    title,
+                    artist,
+                    ratio * 100,
+                )
+            elif event_type == "skip":
+                LOG.info(
+                    "⏩ [Feedback] Skipped '%s' by '%s' (%.0f%% played) → mild penalty",
+                    title,
+                    artist,
+                    ratio * 100,
+                )
+            elif event_type == "finish":
+                LOG.info(
+                    "✅ [Feedback] Finished '%s' by '%s' (%.0f%% complete) → positive signal for artist/genre",
+                    title,
+                    artist,
+                    ratio * 100,
+                )
+            else:
+                LOG.debug(
+                    "[AutoplayV2][feedback] guild=%s track=%s event=%s ratio=%.3f",
+                    guild_id,
+                    track_id,
+                    event_type,
+                    ratio,
+                )
+
         await self._engine.record_feedback_event(
             guild_id=guild_id,
             user_id=user_id,
             track_id=track_id,
             event_type=event_type,
             metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+        
+        # Issue #3: Record in context tracker for arc recommender with enrichment data
+        tracker = self._get_context_tracker(guild_id)
+        was_skipped = event_type in ("hard_skip", "skip")
+        skip_type = None
+        if event_type == "hard_skip":
+            skip_type = "hard"
+        elif event_type == "skip":
+            skip_type = "medium" if ratio < 0.5 else "soft"
+        
+        # Try to get enrichment data from cache for accurate genre/mood tracking
+        enrichment = await self._engine.enrich_track(artist, title)
+        genres = enrichment.get("tags", [])[:5] if enrichment else []
+        mood_vector = enrichment.get("mood_vector") if enrichment else None
+        mood_label = enrichment.get("mood") if enrichment else None
+        
+        tracker.record_play(
+            track_id=track_id,
+            artist=artist,
+            title=title,
+            genres=genres,
+            mood_vector=mood_vector,
+            mood_label=mood_label,
+            was_skipped=was_skipped,
+            skip_type=skip_type,
+            progress_ratio=ratio,
         )
 
     async def get_recommendations_for_track(
@@ -126,12 +239,38 @@ class LastFMAutoplayV2:
             return []
 
         parsed = await self._engine.parse_track(raw_title, channel_name)
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][seed] raw_title=%r channel=%r -> artist=%s title=%s",
+                raw_title,
+                channel_name,
+                (parsed or {}).get("artist") or channel_name,
+                (parsed or {}).get("title") or raw_title,
+            )
         seed_artist = parsed["artist"] if parsed else channel_name
         seed_title = parsed["title"] if parsed else raw_title
 
         if not seed_artist or not seed_title:
             LOG.debug("Unable to resolve seed metadata; aborting autoplay round")
             return []
+
+        # Issue #3: Get session context for adaptive recommendation
+        tracker = self._get_context_tracker(guild_id)
+        context = tracker.get_context()
+        
+        if self._verbose >= 1:
+            phase = self._novelty_controller.detect_exploration_phase(
+                skip_rate=context.skip_rate,
+                songs_since_novelty=context.songs_since_novelty,
+                session_duration_minutes=(context.last_activity - context.session_start) / 60,
+            )
+            LOG.info(
+                "🎯 [Context] Session state: focus=%s, skip_rate=%.0f%%, streak=%d, phase=%s",
+                context.focus_genres[:2] if context.focus_genres else ["none"],
+                context.skip_rate * 100,
+                context.consecutive_skips,
+                phase.value,
+            )
 
         await self._ensure_collaborative_ready()
 
@@ -164,6 +303,57 @@ class LastFMAutoplayV2:
             session_mood_vector=session_vector,
             target_mood=target_mood,
         )
+
+        # Issue #3: Apply novelty controller adjustments
+        # Apply repetition penalties based on recent history
+        for candidate in scored:
+            repetition_penalty = tracker.compute_repetition_penalty(candidate.track_id, tau=6)
+            candidate.score *= repetition_penalty
+            if self._verbose >= 2 and repetition_penalty < 0.9:
+                LOG.debug(
+                    "🔄 [Novelty] Repetition penalty %.2f for '%s' (recently played)",
+                    repetition_penalty,
+                    candidate.title,
+                )
+        
+        # Re-sort after applying penalties
+        scored.sort(key=lambda c: c.score, reverse=True)
+
+        if self._engine._verbose and scored:
+            top = scored[0]
+            top_meta = metadata_index.get(top.track_id, {})
+            # Try to find mood label from the prepared candidate features
+            top_feat = next((e.features for e in prepared_candidates if e.features.track_id == top.track_id), None)
+            mood_desc = (top_feat.mood_label if top_feat and top_feat.mood_label else target_mood) or "unknown"
+            
+            # Issue #3: Show exploration phase and reasoning
+            phase = self._novelty_controller.detect_exploration_phase(
+                skip_rate=context.skip_rate,
+                songs_since_novelty=context.songs_since_novelty,
+                session_duration_minutes=(context.last_activity - context.session_start) / 60,
+            )
+            
+            # Check if this is a novelty pick or core pick
+            artist_plays = tracker.get_artist_play_count(top_meta.get("artist", ""))
+            is_new_artist = artist_plays == 0
+            exploration_marker = "🔍 NEW" if is_new_artist else "✨ FAMILIAR"
+            
+            LOG.info(
+                "🎯 [Next Pick] %s: '%s' by '%s' (score=%.3f, mood=%s, phase=%s) after '%s'",
+                exploration_marker,
+                top_meta.get("title", "Unknown"),
+                top_meta.get("artist", "Unknown"),
+                top.score,
+                mood_desc,
+                phase.value,
+                f"{seed_artist} - {seed_title}",
+            )
+            
+            # Increment novelty counter if this is exploration
+            if is_new_artist:
+                tracker.reset_novelty_counter()
+            else:
+                tracker.increment_novelty_counter()
 
         results: List[Tuple[str, Any]] = []
         for candidate in scored:
@@ -214,8 +404,24 @@ class LastFMAutoplayV2:
             "api_key": self._lastfm_key,
             "format": "json",
         }
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][lastfm] track.getSimilar artist=%s title=%s limit=%s",
+                artist,
+                title,
+                params["limit"],
+            )
         records = await self._call_lastfm(params, source="track.getSimilar")
         if records:
+            if self._engine._verbose:
+                LOG.debug(
+                    "[AutoplayV2][lastfm] similar returned %d records (samples=%s)",
+                    len(records),
+                    [
+                        f"{self._extract_artist(r)}::{self._extract_title(r)}"
+                        for r in records[:5]
+                    ],
+                )
             return records
 
         fallback_params = {
@@ -226,7 +432,23 @@ class LastFMAutoplayV2:
             "format": "json",
             "autocorrect": "1",
         }
-        return await self._call_lastfm(fallback_params, source="artist.getTopTracks")
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][lastfm] fallback artist.getTopTracks artist=%s limit=%s",
+                artist,
+                fallback_params["limit"],
+            )
+        recs = await self._call_lastfm(fallback_params, source="artist.getTopTracks")
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][lastfm] toptracks returned %d records (samples=%s)",
+                len(recs),
+                [
+                    f"{self._extract_artist(r)}::{self._extract_title(r)}"
+                    for r in recs[:5]
+                ],
+            )
+        return recs
 
     async def _call_lastfm(
         self,
@@ -266,6 +488,12 @@ class LastFMAutoplayV2:
             trimmed.append(record_copy)
             if len(trimmed) >= _DEFAULT_FETCH_LIMIT:
                 break
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][lastfm] parsed %d %s records",
+                len(trimmed),
+                source,
+            )
         return trimmed
 
     async def _prepare_candidates(
@@ -274,7 +502,9 @@ class LastFMAutoplayV2:
         records: Sequence[Dict[str, Any]],
     ) -> List[PreparedCandidate]:
         seen: set[str] = set()
-        tasks: List[asyncio.Task[Optional[PreparedCandidate]]] = []
+        candidates_to_prepare: List[tuple[int, str, str, str, Dict[str, Any]]] = []
+        
+        # First pass: collect all unique candidates
         for index, record in enumerate(records):
             artist = self._extract_artist(record)
             title = self._extract_title(record)
@@ -284,9 +514,88 @@ class LastFMAutoplayV2:
             if track_id in seen:
                 continue
             seen.add(track_id)
+            candidates_to_prepare.append((index, track_id, artist, title, record))
+
+        # Second pass: check cache and enqueue enrichment requests for missing ones
+        enrichment_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        pending_enrichments: Dict[str, asyncio.Task] = {}
+        
+        for _, track_id, artist, title, _ in candidates_to_prepare:
+            # Check if already enriched in cache
+            cached = await self._engine._cache.get_enrichment(artist, title)
+            if cached:
+                # Build enrichment dict from cache
+                enrichment_cache[track_id] = {
+                    "tags": cached.tags,
+                    "mood": cached.mood,
+                    "energy": cached.energy,
+                    "mood_vector": await self._engine._cached_mood_vector_dict(cached.mood_vector_id),
+                }
+            else:
+                # Enqueue for batch enrichment
+                try:
+                    # Use the public request_enrichment API which handles batching internally
+                    task = asyncio.create_task(
+                        self._engine._gemini.request_enrichment(
+                            artist,
+                            title,
+                            existing_tags=[],
+                            allow_grounding=False,
+                        )
+                    )
+                    pending_enrichments[track_id] = task
+                except Exception as exc:
+                    LOG.debug("Failed to enqueue enrichment for %s: %s", track_id, exc)
+                    enrichment_cache[track_id] = None
+
+        # Wait for all pending enrichments to complete (they batch automatically)
+        if pending_enrichments:
+            await asyncio.gather(*pending_enrichments.values(), return_exceptions=True)
+            
+            # Process completed enrichments (mood vector now included in enrichment response)
+            for track_id, task in pending_enrichments.items():
+                try:
+                    if task.done() and not task.cancelled():
+                        result = task.result()
+                        if result:
+                            # Find artist/title for this track_id
+                            artist, title = None, None
+                            for _, tid, a, t, _ in candidates_to_prepare:
+                                if tid == track_id:
+                                    artist, title = a, t
+                                    break
+                            
+                            if artist and title:
+                                # Process enrichment - mood_vector is now in result
+                                tags = [str(tag).lower() for tag in result.get("tags", []) if isinstance(tag, str)]
+                                moods = [str(mood).strip() for mood in result.get("moods", []) if isinstance(mood, str) and mood.strip()]
+                                mood_value = moods[0] if moods else None
+                                energy = result.get("energy") if isinstance(result.get("energy"), str) else None
+                                mood_vector = result.get("mood_vector")  # Already included from enrich_track()
+                                
+                                enrichment_cache[track_id] = {
+                                    "tags": tags,
+                                    "mood": mood_value,
+                                    "energy": energy,
+                                    "mood_vector": mood_vector,
+                                }
+                            else:
+                                enrichment_cache[track_id] = None
+                        else:
+                            enrichment_cache[track_id] = None
+                except Exception as exc:
+                    LOG.debug("Failed to process enrichment result for %s: %s", track_id, exc)
+                    enrichment_cache[track_id] = None
+
+        # Third pass: prepare candidates with pre-fetched enrichment
+        tasks: List[asyncio.Task[Optional[PreparedCandidate]]] = []
+        for index, track_id, artist, title, record in candidates_to_prepare:
+            enrichment = enrichment_cache.get(track_id)
             tasks.append(
                 asyncio.create_task(
-                    self._prepare_single_candidate(guild_id, track_id, artist, title, record, index)
+                    self._prepare_single_candidate(
+                        guild_id, track_id, artist, title, record, index, enrichment
+                    )
                 )
             )
 
@@ -299,6 +608,12 @@ class LastFMAutoplayV2:
                 continue
             if result is not None:
                 prepared.append(result)
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][prepare] kept %d/%d candidates",
+                len(prepared),
+                len(records),
+            )
         return prepared
 
     async def _prepare_single_candidate(
@@ -309,6 +624,7 @@ class LastFMAutoplayV2:
         title: str,
         record: Dict[str, Any],
         rank_index: int,
+        pre_fetched_enrichment: Optional[Dict[str, Any]] = None,
     ) -> Optional[PreparedCandidate]:
         content_similarity = self._extract_match(record)
         if content_similarity < _MIN_CONTENT_SIMILARITY:
@@ -319,12 +635,16 @@ class LastFMAutoplayV2:
         quality = self._extract_quality(record)
         diversity_penalty = self._diversity_penalty(guild_id, artist)
 
-        enrichment: Optional[Dict[str, Any]] = None
-        async with self._enrich_semaphore:
-            try:
-                enrichment = await self._engine.enrich_track(artist, title)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                LOG.debug("Enrichment failed for %s - %s: %s", artist, title, exc)
+        # Use pre-fetched enrichment if provided, otherwise fetch individually
+        enrichment: Optional[Dict[str, Any]] = pre_fetched_enrichment
+        
+        if enrichment is None:
+            # Fall back to individual enrichment only if not pre-fetched
+            async with self._enrich_semaphore:
+                try:
+                    enrichment = await self._engine.enrich_track(artist, title)
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    LOG.debug("Enrichment failed for %s - %s: %s", artist, title, exc)
 
         mood_vector = None
         mood_label = None
@@ -360,6 +680,17 @@ class LastFMAutoplayV2:
             "playcount": record.get("playcount"),
             "listeners": record.get("listeners"),
         }
+        if self._engine._verbose >= 2:
+            LOG.debug(
+                "[AutoplayV2][candidate] %s -> sim=%.3f sess=%.3f nov=%.3f qual=%.3f div=%.3f mood=%s",
+                track_id,
+                content_similarity,
+                session_similarity,
+                novelty,
+                quality,
+                diversity_penalty,
+                features.mood_label,
+            )
         return PreparedCandidate(features=features, metadata=metadata)
 
     def _note_recommendation(self, guild_id: int, artist: str, title: str) -> None:
@@ -396,6 +727,8 @@ class LastFMAutoplayV2:
     @staticmethod
     def _extract_match(record: Dict[str, Any]) -> float:
         raw = record.get("match")
+        if raw is None:
+            return 0.5
         try:
             return max(0.0, min(1.0, float(raw)))
         except (TypeError, ValueError):

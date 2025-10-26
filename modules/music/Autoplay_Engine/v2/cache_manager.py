@@ -323,6 +323,12 @@ class CacheManager:
     # ------------------------------------------------------------------
     # Maintenance helpers
     # ------------------------------------------------------------------
+    async def clear_mappings(self) -> None:
+        """Clear all Last.fm -> YouTube mapping entries (disk + memory)."""
+        async with self._lock:
+            self._mapping_cache.clear()
+            self._save_map(self._mapping_file, self._mapping_cache)
+
     async def purge_expired(self) -> None:
         now = time.time()
         stale_map = [

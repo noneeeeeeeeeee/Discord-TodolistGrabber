@@ -234,8 +234,15 @@ class GeminiService:
         if not batch:
             return
 
+        track_list = ", ".join([f"'{entry.artist} - {entry.title}'" for entry in batch[:3]])
+        if len(batch) > 3:
+            track_list += f" and {len(batch) - 3} more"
+        
+        LOG.info("📊 [Gemini] Requested Metadata Enrichment for %d tracks: [%s]", len(batch), track_list)
         try:
             result_map = await self._process_enrichment_batch(batch)
+            success_count = sum(1 for v in result_map.values() if v)
+            LOG.info("✅ [Gemini] Batch complete: %d/%d enriched successfully", success_count, len(batch))
         except Exception as exc:  # pragma: no cover - defensive logging
             LOG.error("❌ Gemini enrichment batch failed: %s", exc)
             result_map = {}
@@ -331,9 +338,12 @@ class GeminiService:
         )
         instructions = (
             "You are enriching music metadata. Return JSON with a 'results' array. "
-            "Each result must echo the input 'id' and include 'tags' (list of canonical genres), "
-            "'moods' (up to 3 descriptive moods), and 'energy' (single word). "
-            f"{grounding_hint} If unsure, return empty arrays."
+            "Each result must echo the input 'id' and include:\n"
+            "- 'tags' (list of canonical genres)\n"
+            "- 'moods' (up to 3 descriptive moods)\n"
+            "- 'energy' (single word: low, medium, high)\n"
+            "- 'mood_vector' (object with: energy (0-1), valence (0-1), tempo (0-1), confidence (0-1), mood (string))\n"
+            f"{grounding_hint} If unsure, return empty arrays or default values."
         )
         return (
             f"{instructions}\n\n"

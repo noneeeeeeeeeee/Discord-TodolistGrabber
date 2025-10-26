@@ -1012,16 +1012,15 @@ Collect anonymized telemetry across guilds (opt-out) to compute item-to-item and
 
 **Telemetry Signals to Record (anonymized):**
 
-- `user_id` (hashed)
-- `guild_id` (hashed or optional)
 - `track_id` / `artist` / `genre`
 - `event_type` (play, finish, skip, hard_skip, like, dislike, replay)
 - `timestamp`
 - Optional: `session_id`, `device` (if available)
 
+User ID and Guild Id will not be recorded as it is not important
+
 **Storage & Privacy:**
 
-- All IDs are hashed (salted per-bot instance) before storage.
 - Provide per-guild opt-out and per-user opt-out flags.
 - Retention: telemetry retained for 365 days by default; configurable.
 

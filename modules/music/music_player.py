@@ -30,9 +30,9 @@ from modules.music.lavalink.manager import (
 try:
     from modules.music.Autoplay_Engine.config import get_autoplay_engine, get_autoplay_config
 
-    LASTFM_AUTOPLAY_AVAILABLE = True
+    AUTOPLAY_ENGINE_AVAILABLE = True
 except ImportError:
-    LASTFM_AUTOPLAY_AVAILABLE = False
+    AUTOPLAY_ENGINE_AVAILABLE = False
     get_autoplay_engine = None
     get_autoplay_config = None
 
@@ -201,41 +201,57 @@ class MusicPlayer(commands.Cog):
         # Vote tracking with metadata
         self._active_votes: Dict[str, Dict[str, Any]] = {}
 
-        # Initialize Last.fm autoplay
-        LOG.info("[AutoPlay] Attempting to initialize Last.fm module...")
-        self._lastfm_autoplay = None
+        # Initialize configurable autoplay engine
+        LOG.info("[AutoPlay] Attempting to initialize autoplay module...")
+        self._autoplay_engine = None
         self._autoplay_config = None
-        if LASTFM_AUTOPLAY_AVAILABLE and get_autoplay_engine:
+        self._autoplay_available = False
+        if AUTOPLAY_ENGINE_AVAILABLE and get_autoplay_engine and get_autoplay_config:
             try:
                 self._autoplay_config = get_autoplay_config()
-                self._lastfm_autoplay = get_autoplay_engine(bot)
-                if self._lastfm_autoplay and self._lastfm_autoplay.is_available():
+                self._autoplay_engine = get_autoplay_engine(bot)
+                if self._autoplay_engine and self._autoplay_engine.is_available():
                     version = self._autoplay_config.get_autoplay_version()
-                    LOG.info(f"[AutoPlay] ✅ Last.fm autoplay {version.upper()} is READY and AVAILABLE!")
+                    LOG.info(
+                        f"[AutoPlay] ✅ Autoplay engine {version.upper()} is READY and AVAILABLE!"
+                    )
+                    self._autoplay_available = True
                 else:
                     LOG.warning(
-                        "[AutoPlay] Last.fm module loaded but API key not configured"
+                        "[AutoPlay] Autoplay engine loaded but prerequisites not configured"
                     )
             except Exception as e:
-                LOG.error(f"[AutoPlay] ❌ Failed to initialize Last.fm autoplay: {e}")
+                LOG.error(f"[AutoPlay] ❌ Failed to initialize autoplay engine: {e}")
                 import traceback
 
                 traceback.print_exc()
         else:
             LOG.warning(
-                f"[AutoPlay] Last.fm module not available (AVAILABLE={LASTFM_AUTOPLAY_AVAILABLE})"
+                f"[AutoPlay] Autoplay module not available (AVAILABLE={AUTOPLAY_ENGINE_AVAILABLE})"
             )
+
+        # Backwards compatibility for legacy code paths still referencing _lastfm_autoplay
+        self._lastfm_autoplay = self._autoplay_engine
 
         self._disconnect_messages = self._load_disconnect_messages()
         self._bootstrap_node.start()
 
     def supports_feedback_buttons(self) -> bool:
-        """Check if current autoplay version supports More/Less Like This buttons"""
+        """Check if current autoplay version supports More/Less Like This buttons
+        
+        Buttons are shown if:
+        - Config supports feedback (V2+)
+        - Engine instance exists (regardless of Last.fm/Gemini availability)
+        
+        This allows feedback collection even when recommendations are unavailable.
+        """
         if not self._autoplay_config:
             return False
         if not self._autoplay_config.supports_feedback_buttons():
             return False
-        return bool(self._lastfm_autoplay and self._lastfm_autoplay.is_available())
+        # Just check if engine exists, don't check is_available() 
+        # (buttons can collect feedback even if recommendations fail)
+        return self._autoplay_engine is not None
 
     def is_session_autoplay_enabled(self, guild_id: int) -> bool:
         return not self._session_autoplay_disabled.get(guild_id, False)
@@ -1661,7 +1677,7 @@ class MusicPlayer(commands.Cog):
 
         # Try Last.fm-based recommendations first
         lastfm_success = False
-        if self._lastfm_autoplay and self._lastfm_autoplay.is_available():
+        if self._lastfm_autoplay and self._lastfm_autoplay.can_recommend():
             LOG.info(f"[AutoPlay] Using Last.fm recommendations...")
             try:
                 lastfm_success = await self._lastfm_autoplay_enqueue(
@@ -1703,7 +1719,12 @@ class MusicPlayer(commands.Cog):
             self._autoplay_session_started[guild_id] = True
 
         # Get recommendations
-        recommendations = await self._lastfm_autoplay.get_recommendations_for_track(
+        engine = self._lastfm_autoplay
+        if engine is None:
+            LOG.debug("[AutoPlay] Autoplay engine unavailable when enqueueing recommendations")
+            return False
+
+        recommendations = await engine.get_recommendations_for_track(
             track_info, limit=1  # Queue 1 track at a time
         )
 
@@ -1719,7 +1740,7 @@ class MusicPlayer(commands.Cog):
                     f"[AutoPlay] 🔄 Trying fallback: Last successful track '{last_successful.get('title', 'Unknown')}' by {last_successful.get('author', 'Unknown')}"
                 )
                 recommendations = (
-                    await self._lastfm_autoplay.get_recommendations_for_track(
+                    await engine.get_recommendations_for_track(
                         last_successful, limit=1
                     )
                 )
