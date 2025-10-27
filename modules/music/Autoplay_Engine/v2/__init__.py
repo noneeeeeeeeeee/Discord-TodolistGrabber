@@ -25,8 +25,8 @@ from .novelty_controller import NoveltyController, NoveltyConfig
 LOG = logging.getLogger(__name__)
 
 _LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
-_DEFAULT_FETCH_LIMIT = 40
-_HISTORY_LIMIT = 50
+_DEFAULT_FETCH_LIMIT = 50
+_HISTORY_LIMIT = 35
 _PARALLEL_ENRICH_LIMIT = 5
 _MIN_CONTENT_SIMILARITY = 0.05
 
@@ -554,7 +554,10 @@ class LastFMAutoplayV2:
 
         # Second pass: check cache and enqueue enrichment requests for missing ones
         enrichment_cache: Dict[str, Optional[Dict[str, Any]]] = {}
-        pending_enrichments: Dict[str, asyncio.Task] = {}
+        pending_enrichments: Dict[str, asyncio.Future] = {}
+        tracks_needing_enrichment: List[Tuple[str, str, str]] = (
+            []
+        )  # track_id, artist, title
 
         for _, track_id, artist, title, _ in candidates_to_prepare:
             # Check if already enriched in cache
@@ -570,18 +573,21 @@ class LastFMAutoplayV2:
                     ),
                 }
             else:
-                # Enqueue for batch enrichment
+                # Collect for batch enrichment
+                tracks_needing_enrichment.append((track_id, artist, title))
+
+        # Enqueue all enrichment requests at once to maximize batching
+        if tracks_needing_enrichment:
+            for track_id, artist, title in tracks_needing_enrichment:
                 try:
-                    # Use the public request_enrichment API which handles batching internally
-                    task = asyncio.create_task(
-                        self._engine._gemini.request_enrichment(
-                            artist,
-                            title,
-                            existing_tags=[],
-                            allow_grounding=False,
-                        )
+                    # Enqueue enrichment (returns future, doesn't start task yet)
+                    future = await self._engine._gemini._enqueue_enrichment_future(
+                        artist,
+                        title,
+                        existing_tags=[],
+                        allow_grounding=False,
                     )
-                    pending_enrichments[track_id] = task
+                    pending_enrichments[track_id] = future
                 except Exception as exc:
                     LOG.debug("Failed to enqueue enrichment for %s: %s", track_id, exc)
                     enrichment_cache[track_id] = None
@@ -591,10 +597,10 @@ class LastFMAutoplayV2:
             await asyncio.gather(*pending_enrichments.values(), return_exceptions=True)
 
             # Process completed enrichments (mood vector now included in enrichment response)
-            for track_id, task in pending_enrichments.items():
+            for track_id, future in pending_enrichments.items():
                 try:
-                    if task.done() and not task.cancelled():
-                        result = task.result()
+                    if future.done() and not future.cancelled():
+                        result = future.result()
                         if result:
                             # Find artist/title for this track_id
                             artist, title = None, None

@@ -1,8 +1,11 @@
 import asyncio
 import logging
+import math
 import re
 import time
-from typing import Any, Dict, Optional
+import unicodedata
+from difflib import SequenceMatcher
+from typing import Any, Dict, List, Optional, Tuple
 
 from .cache_manager import CacheManager, MappingEntry
 
@@ -12,6 +15,7 @@ LOG = logging.getLogger(__name__)
 HASHTAG_LIMIT = 3
 DURATION_TOLERANCE_PERCENT = 0.20  # 20%
 DURATION_TOLERANCE_MIN_MS = 30000  # 30 seconds minimum tolerance
+SHORT_CLIP_THRESHOLD_MS = 30000  # clips shorter than 30s are likely YouTube Shorts/spam
 
 # High-quality channel indicators (boost priority)
 GOOD_CHANNEL_HINTS = [
@@ -175,6 +179,59 @@ ALLOWED_IF_OFFICIAL = [
     "set",
 ]
 
+# Keywords associated with episodic or non-music content. Values represent penalty weights.
+CONTENT_PENALTY_KEYWORDS: Dict[str, float] = {
+    "episode": 1.5,
+    "season": 1.1,
+    "s0": 0.9,
+    "s1e": 0.9,
+    "s2e": 0.9,
+    "s3e": 0.9,
+    "s4e": 0.9,
+    "chapter": 1.0,
+    "part ": 0.7,
+    "pt.": 0.7,
+    "comic dub": 1.6,
+    "animation meme": 1.4,
+    "audio drama": 1.6,
+    "roleplay": 1.1,
+    "story": 0.6,
+    "fanfic": 1.1,
+    "fan fiction": 1.1,
+    "full episode": 1.8,
+    "full movie": 1.8,
+    "short film": 1.2,
+    "pilot": 1.2,
+}
+
+POSITIVE_MUSIC_HINTS = [
+    "song",
+    "music",
+    "official",
+    "audio",
+    "lyrics",
+    "lyric",
+    "ost",
+]
+
+# Critical spam keywords that nearly always indicate non-music content
+CRITICAL_SPAM_KEYWORDS = {
+    "reaction",
+    "review",
+    "commentary",
+    "analysis",
+    "gameplay",
+    "walkthrough",
+    "tutorial",
+    "how to",
+    "lesson",
+    "practice",
+    "teach",
+    "unboxing",
+    "milestone",
+    "announcement",
+}
+
 
 class TrackResolver:
     """Resolves tracks via Pomice and maintains mapping cache."""
@@ -221,16 +278,28 @@ class TrackResolver:
                                     "channel": mapping.channel_name,
                                     "verified": mapping.verified,
                                     "source": "cache",
+                                    "heuristic_score": round(
+                                        float(mapping.heuristic_score or 0.0), 3
+                                    ),
+                                    "title_similarity": mapping.title_similarity,
+                                    "artist_similarity": mapping.artist_similarity,
+                                    "channel_similarity": mapping.channel_similarity,
+                                    "engagement_score": mapping.engagement_score,
+                                    "duration_score": mapping.duration_score,
+                                    "content_penalty": mapping.content_penalty,
+                                    "spam_penalty": mapping.spam_penalty,
+                                    "spam_flags": mapping.spam_flags,
+                                    "heuristic_version": mapping.heuristic_version,
                                 },
                             )
                         return rebuilt
 
-        track_obj = await self._search_with_pomice(
+        search_result = await self._search_with_pomice(
             artist,
             title,
             expected_duration_ms=expected_duration_ms,
         )
-        if not track_obj:
+        if not search_result:
             if LOG.isEnabledFor(logging.DEBUG):
                 LOG.debug(
                     "Track resolution failed: %s",
@@ -241,6 +310,8 @@ class TrackResolver:
                     },
                 )
             return None
+
+        track_obj, heuristics = search_result
 
         metadata = self._extract_track_metadata(track_obj)
         youtube_id_val = metadata["youtube_id"]
@@ -258,6 +329,23 @@ class TrackResolver:
                 verified=bool(metadata.get("verified", False)),
                 duration_ms=duration_val,
                 track_identifier=metadata.get("track_identifier"),
+                title=str(
+                    metadata.get("title") or heuristics.get("candidate_title") or ""
+                )
+                or None,
+                heuristic_score=float(heuristics.get("score", 0.0) or 0.0),
+                title_similarity=self._safe_float(heuristics.get("title_similarity")),
+                artist_similarity=self._safe_float(heuristics.get("artist_similarity")),
+                channel_similarity=self._safe_float(
+                    heuristics.get("channel_similarity")
+                ),
+                engagement_score=self._safe_float(heuristics.get("engagement_score")),
+                duration_score=self._safe_float(heuristics.get("duration_score")),
+                content_penalty=self._safe_float(heuristics.get("content_penalty")),
+                spam_penalty=self._safe_float(heuristics.get("spam_penalty")),
+                spam_flags=list(heuristics.get("spam_flags", [])),
+                search_rank=int(heuristics.get("search_rank", 0) or 0),
+                heuristic_version=int(heuristics.get("heuristic_version", 2) or 2),
             )
             await self._cache.set_mapping(artist, title, entry)
             if LOG.isEnabledFor(logging.DEBUG):
@@ -271,6 +359,16 @@ class TrackResolver:
                         "channel": entry.channel_name,
                         "verified": entry.verified,
                         "source": "search",
+                        "heuristic_score": round(entry.heuristic_score, 3),
+                        "title_similarity": entry.title_similarity,
+                        "artist_similarity": entry.artist_similarity,
+                        "channel_similarity": entry.channel_similarity,
+                        "engagement_score": entry.engagement_score,
+                        "duration_score": entry.duration_score,
+                        "content_penalty": entry.content_penalty,
+                        "spam_penalty": entry.spam_penalty,
+                        "spam_flags": entry.spam_flags,
+                        "heuristic_version": entry.heuristic_version,
                     },
                 )
         if LOG.isEnabledFor(logging.DEBUG):
@@ -283,6 +381,17 @@ class TrackResolver:
                     "channel": metadata.get("channel_name"),
                     "verified": metadata.get("verified"),
                     "score_duration_ms": metadata.get("duration_ms"),
+                    "heuristic_score": round(
+                        float(heuristics.get("score", 0.0) or 0.0), 3
+                    ),
+                    "title_similarity": heuristics.get("title_similarity"),
+                    "artist_similarity": heuristics.get("artist_similarity"),
+                    "channel_similarity": heuristics.get("channel_similarity"),
+                    "engagement_score": heuristics.get("engagement_score"),
+                    "duration_score": heuristics.get("duration_score"),
+                    "content_penalty": heuristics.get("content_penalty"),
+                    "spam_penalty": heuristics.get("spam_penalty"),
+                    "spam_flags": heuristics.get("spam_flags"),
                 },
             )
         return track_obj
@@ -346,13 +455,55 @@ class TrackResolver:
                 return track_obj
         return tracks[0]
 
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        if not value:
+            return ""
+        lowered = value.lower()
+        cleaned = re.sub(r"[^a-z0-9\s]", " ", lowered)
+        compact = re.sub(r"\s+", " ", cleaned).strip()
+        return compact
+
+    @staticmethod
+    def _fold_text(value: str) -> str:
+        if not value:
+            return ""
+        normalized = unicodedata.normalize("NFKD", value)
+        return normalized.encode("ascii", "ignore").decode("ascii").lower()
+
+    @staticmethod
+    def _token_ratio(lhs: str, rhs: str) -> float:
+        if not lhs or not rhs:
+            return 0.0
+        if lhs == rhs:
+            return 1.0
+        matcher = SequenceMatcher(None, lhs, rhs)
+        base_ratio = matcher.ratio()
+        if base_ratio >= 0.95:
+            return 1.0
+        lhs_tokens = set(lhs.split())
+        rhs_tokens = set(rhs.split())
+        if lhs_tokens and rhs_tokens:
+            overlap = len(lhs_tokens & rhs_tokens) / float(len(lhs_tokens | rhs_tokens))
+            base_ratio = max(base_ratio, overlap)
+        return max(0.0, min(base_ratio, 1.0))
+
     async def _search_with_pomice(
         self,
         artist: str,
         title: str,
         *,
         expected_duration_ms: Optional[int] = None,
-    ) -> Optional[Any]:
+    ) -> Optional[Tuple[Any, Dict[str, Any]]]:
         node = await self._get_node()
         if not node:
             return None
@@ -370,155 +521,96 @@ class TrackResolver:
 
         best_track: Optional[Any] = None
         best_score = float("-inf")
-        fallback_track: Optional[Any] = None  # Track filtered candidates as fallback
-        fallback_score = float("-inf")
-        duration_target = expected_duration_ms or 0
-        normalized_artist = artist.casefold()
-        normalized_title = title.casefold()
+        best_features: Optional[Dict[str, Any]] = None
 
-        # Duration tolerance: ±20% or ±30 seconds (whichever is larger)
-        duration_tolerance_ms = (
-            max(duration_target * 0.20, 30000) if duration_target else 0
-        )
+        fallback_track: Optional[Any] = None
+        fallback_score = float("-inf")
+        fallback_features: Optional[Dict[str, Any]] = None
+
+        features_by_id: Dict[int, Dict[str, Any]] = {}
+
+        duration_target = expected_duration_ms or 0
+        artist_for_similarity = artist.strip()
+        title_for_similarity = title.strip()
 
         for index, candidate in enumerate(results):
             metadata = self._extract_track_metadata(candidate)
 
-            # SPAM FILTERING
             candidate_title_raw = (
                 getattr(candidate, "title", None) or metadata.get("title") or ""
             )
-            is_verified = metadata.get("verified", False)
-            channel_name = metadata.get("channel_name", "")
+            channel_name = metadata.get("channel_name") or ""
+            is_verified = bool(metadata.get("verified", False))
 
-            # Calculate score first (before filtering) for potential fallback
-            score = 0.0
+            features = self._build_candidate_features(
+                artist=artist_for_similarity,
+                title=title_for_similarity,
+                candidate_title=candidate_title_raw,
+                channel_name=channel_name,
+                is_verified=is_verified,
+                metadata=metadata,
+                expected_duration_ms=duration_target if duration_target else None,
+                search_rank=index,
+            )
+            features_by_id[id(candidate)] = features
 
-            # Verified badge = huge boost
-            if is_verified:
-                score += 4.0
+            score, should_reject, rejection_reasons = self._compose_candidate_score(
+                features
+            )
+            features["score"] = score
+            features["rejection_reasons"] = rejection_reasons
 
-            channel = (channel_name or "").casefold()
-
-            # Channel name EXACTLY matches artist (or very close) = extremely likely official
-            if channel and normalized_artist in channel:
-                # Check if it's an exact match or just artist name in channel
-                channel_normalized = re.sub(r"[^a-z0-9]", "", channel)
-                artist_normalized = re.sub(r"[^a-z0-9]", "", normalized_artist)
-                if channel_normalized == artist_normalized:
-                    score += 3.0  # Exact match - very strong signal
-                else:
-                    score += 2.0  # Artist name in channel
-
-            # Channel has official markers (VEVO, Topic, Records, etc.)
-            for hint in GOOD_CHANNEL_HINTS:
-                if hint in channel:
-                    score += 1.5
-                    break
-
-            # Title has official markers
-            candidate_title = candidate_title_raw.casefold()
-            for good_keyword in GOOD_TITLE_KEYWORDS:
-                if good_keyword in candidate_title:
-                    score += 0.8
-                    break
-
-            # Title matches = relevance boost
-            if (
-                candidate_title
-                and normalized_title
-                and normalized_title in candidate_title
-            ):
-                score += 1.0
-
-            duration_val = metadata.get("duration_ms") or 0
-
-            # Duration similarity bonus (within tolerance)
-            if duration_target and duration_val:
-                delta = abs(duration_target - int(duration_val))
-                score -= min(delta / 1000.0, 10.0)
-
-            # Search rank penalty (lower index = higher rank)
-            score -= index * 0.15
-
-            # ENGAGEMENT METRICS BOOST (for fallback quality assessment)
-            view_count = metadata.get("view_count", 0)
-            subscriber_count = metadata.get("subscriber_count", 0)
-            like_count = metadata.get("like_count", 0)
-            comment_count = metadata.get("comment_count", 0)
-
-            # View count boost (logarithmic scale to prevent dominance)
-            if view_count > 0:
-                import math
-
-                # 1M views = +1.0, 10M views = +2.0, 100M views = +3.0
-                score += min(math.log10(view_count / 1000) / 3.0, 3.0)
-
-            # Subscriber count boost (channel popularity)
-            if subscriber_count > 0:
-                import math
-
-                # 100K subs = +0.5, 1M subs = +1.0, 10M subs = +1.5
-                score += min(math.log10(subscriber_count / 10000) / 2.0, 2.0)
-
-            # Engagement ratio boost (likes + comments relative to views)
-            if view_count > 1000:  # Only consider if video has meaningful views
-                engagement_count = like_count + (
-                    comment_count * 2
-                )  # Comments worth more
-                engagement_ratio = engagement_count / view_count
-                # Typical good engagement is 1-5%, boost up to +0.5
-                score += min(engagement_ratio * 10, 0.5)
-
-            # Track as potential fallback before applying hard filters
             if score > fallback_score:
                 fallback_score = score
                 fallback_track = candidate
+                fallback_features = features
 
-            # Filter 1: Comprehensive spam title check (hashtags + keywords)
-            if self._is_spam_title(
-                candidate_title_raw, is_verified=is_verified, channel_name=channel_name
-            ):
-                continue
-
-            # Filter 2: Very short videos (likely shorts, not music)
-            if duration_val and duration_val < 45000:  # < 45 seconds
-                LOG.debug(
-                    "🚫 [SHORT VIDEO] Rejected '%s' - too short (duration=%dms, likely YouTube Short)",
-                    candidate_title_raw[:60],
-                    duration_val,
-                )
-                continue
-
-            # Filter 3: Duration tolerance check (reject if outside tolerance)
-            # BUT: be more lenient if this is a high-scoring candidate (verified, official channel)
-            if duration_target and duration_val and duration_tolerance_ms:
-                delta = abs(duration_target - int(duration_val))
-                # Allow 50% more tolerance for high-scoring candidates (verified/official)
-                adjusted_tolerance = (
-                    duration_tolerance_ms * 1.5
-                    if score >= 3.0
-                    else duration_tolerance_ms
-                )
-                if delta > adjusted_tolerance:
+            if should_reject:
+                if LOG.isEnabledFor(logging.DEBUG):
                     LOG.debug(
-                        "🚫 [DURATION FILTER] Rejected '%s' - duration mismatch (expected=%dms, got=%dms, delta=%dms, tolerance=%dms, score=%.2f)",
-                        candidate_title_raw[:60],
-                        duration_target,
-                        duration_val,
-                        delta,
-                        int(adjusted_tolerance),
+                        "🚫 [FILTER] Rejected '%s' (score=%.2f, reasons=%s, spam_penalty=%.2f, content_penalty=%.2f)",
+                        candidate_title_raw[:80],
                         score,
+                        ",".join(rejection_reasons) or "unspecified",
+                        float(features.get("spam_penalty", 0.0) or 0.0),
+                        float(features.get("content_penalty", 0.0) or 0.0),
                     )
-                    continue
+                continue
 
-            # Passed all filters - consider for best track
             if score > best_score:
                 best_score = score
                 best_track = candidate
+                best_features = features
 
-        # Fallback logic: if no track passed all filters, use the best fallback candidate
-        if not best_track and fallback_track:
+        if best_track and best_features:
+            if LOG.isEnabledFor(logging.DEBUG):
+                LOG.debug(
+                    "Track resolved via Pomice heuristics: %s",
+                    {
+                        "artist": artist,
+                        "title": title,
+                        "score": round(
+                            float(best_features.get("score", 0.0) or 0.0), 3
+                        ),
+                        "title_similarity": round(
+                            float(best_features.get("title_similarity", 0.0) or 0.0), 3
+                        ),
+                        "artist_similarity": round(
+                            float(best_features.get("artist_similarity", 0.0) or 0.0), 3
+                        ),
+                        "channel_similarity": round(
+                            float(best_features.get("channel_similarity", 0.0) or 0.0),
+                            3,
+                        ),
+                        "engagement_score": round(
+                            float(best_features.get("engagement_score", 0.0) or 0.0), 3
+                        ),
+                        "verified": best_features.get("verified", False),
+                    },
+                )
+            return best_track, best_features
+
+        if fallback_track and fallback_features:
             fallback_metadata = self._extract_track_metadata(fallback_track)
             LOG.warning(
                 "⚠️ All candidates filtered out for '%s - %s', using best fallback (score=%.2f, views=%d, subs=%d, channel='%s')",
@@ -529,11 +621,11 @@ class TrackResolver:
                 fallback_metadata.get("subscriber_count", 0),
                 fallback_metadata.get("channel_name", "Unknown"),
             )
-            return fallback_track
+            return fallback_track, fallback_features
 
-        if not best_track and results:
-            # Last resort: use first result
-            first_metadata = self._extract_track_metadata(results[0])
+        if results:
+            first_track = results[0]
+            first_metadata = self._extract_track_metadata(first_track)
             LOG.warning(
                 "⚠️ No valid candidates found for '%s - %s', using first result as last resort (channel='%s', views=%d)",
                 artist,
@@ -541,9 +633,273 @@ class TrackResolver:
                 first_metadata.get("channel_name", "Unknown"),
                 first_metadata.get("view_count", 0),
             )
-            return results[0]
+            return first_track, features_by_id.get(id(first_track), {})
 
-        return best_track
+        return None
+
+    def _build_candidate_features(
+        self,
+        *,
+        artist: str,
+        title: str,
+        candidate_title: str,
+        channel_name: str,
+        is_verified: bool,
+        metadata: Dict[str, Any],
+        expected_duration_ms: Optional[int],
+        search_rank: int,
+    ) -> Dict[str, Any]:
+        normalized_artist = self._normalize_text(artist)
+        normalized_title = self._normalize_text(title)
+        candidate_title_norm = self._normalize_text(candidate_title)
+        channel_name_norm = self._normalize_text(channel_name)
+        title_folded = self._fold_text(candidate_title)
+
+        title_similarity = self._token_ratio(normalized_title, candidate_title_norm)
+        if normalized_title and normalized_title in candidate_title_norm:
+            title_similarity = max(title_similarity, 0.92)
+
+        artist_in_title = (
+            1.0
+            if normalized_artist and normalized_artist in candidate_title_norm
+            else 0.0
+        )
+        artist_in_channel = (
+            1.0 if normalized_artist and normalized_artist in channel_name_norm else 0.0
+        )
+
+        artist_similarity_title = self._token_ratio(
+            normalized_artist, candidate_title_norm
+        )
+        artist_similarity_channel = self._token_ratio(
+            normalized_artist, channel_name_norm
+        )
+        artist_similarity = max(
+            artist_similarity_title,
+            artist_similarity_channel,
+            artist_in_title,
+            artist_in_channel,
+        )
+
+        channel_similarity = artist_similarity_channel
+        if artist_in_channel:
+            channel_similarity = max(channel_similarity, 1.0)
+
+        channel_official_hint_score = 0.0
+        channel_lower = channel_name.lower()
+        for hint in GOOD_CHANNEL_HINTS:
+            if hint in channel_lower:
+                channel_official_hint_score += 0.3
+        channel_official_hint_score = min(channel_official_hint_score, 1.0)
+
+        positive_title_hint_score = 0.0
+        title_lower = candidate_title.lower()
+        for hint in POSITIVE_MUSIC_HINTS:
+            if hint in title_lower or hint in title_folded:
+                positive_title_hint_score += 0.2
+        positive_title_hint_score = min(positive_title_hint_score, 1.0)
+
+        duration_ms = metadata.get("duration_ms") or 0
+        duration_score = None
+        duration_within_tolerance = True
+        duration_delta_ms: Optional[int] = None
+        duration_tolerance_ms = None
+        if expected_duration_ms and duration_ms:
+            duration_delta_ms = abs(expected_duration_ms - int(duration_ms))
+            base_tolerance = max(
+                int(expected_duration_ms * DURATION_TOLERANCE_PERCENT),
+                DURATION_TOLERANCE_MIN_MS,
+            )
+            duration_tolerance_ms = base_tolerance
+            if is_verified or channel_official_hint_score >= 0.6:
+                # Allow slightly wider tolerance for official uploads
+                duration_tolerance_ms = int(base_tolerance * 1.4)
+            duration_within_tolerance = duration_delta_ms <= duration_tolerance_ms
+            ratio = 1.0 - min(duration_delta_ms / max(expected_duration_ms, 1), 1.2)
+            duration_score = max(0.0, min(ratio, 1.0))
+
+        view_count = metadata.get("view_count") or 0
+        like_count = metadata.get("like_count") or 0
+        comment_count = metadata.get("comment_count") or 0
+        subscriber_count = metadata.get("subscriber_count") or 0
+
+        engagement_components: List[float] = []
+        if view_count > 0:
+            engagement_components.append(min(math.log10(view_count + 1) / 7.0, 1.0))
+        if subscriber_count > 0:
+            engagement_components.append(
+                min(math.log10(subscriber_count + 1) / 6.0, 1.0)
+            )
+        if view_count > 1000:
+            engagement_ratio = (like_count + (comment_count * 2)) / view_count
+            engagement_components.append(min(engagement_ratio * 12.0, 1.0))
+        engagement_score = min(sum(engagement_components), 1.2)
+
+        spam_penalty = 0.0
+        spam_flags: List[str] = []
+        hashtag_count = candidate_title.count("#")
+        if hashtag_count > HASHTAG_LIMIT:
+            spam_penalty += 1.0 + 0.1 * (hashtag_count - HASHTAG_LIMIT)
+            spam_flags.append("hashtags")
+
+        allowed_keywords = {kw.lower() for kw in ALLOWED_IF_OFFICIAL}
+        for keyword in BAD_TITLE_KEYWORDS:
+            keyword_lower = keyword.lower()
+            if keyword_lower in title_lower or keyword_lower in title_folded:
+                if (
+                    is_verified or channel_official_hint_score >= 0.6
+                ) and keyword_lower in allowed_keywords:
+                    continue
+                penalty = 0.45
+                if keyword_lower in CRITICAL_SPAM_KEYWORDS:
+                    penalty = max(penalty, 1.2)
+                spam_penalty += penalty
+                spam_flags.append(keyword)
+
+        content_penalty = 0.0
+        episode_like = False
+        for keyword, weight in CONTENT_PENALTY_KEYWORDS.items():
+            if keyword in title_lower or keyword in title_folded:
+                content_penalty += weight
+                spam_flags.append(f"content:{keyword}")
+                if keyword.startswith("episode") or keyword in {
+                    "pilot",
+                    "full episode",
+                }:
+                    episode_like = True
+
+        if not episode_like:
+            if re.search(r"episode\s*\d", title_folded) or re.search(
+                r"s\d+e\d+", title_folded
+            ):
+                episode_like = True
+                spam_flags.append("content:episode_pattern")
+                content_penalty += 1.1
+
+        if content_penalty:
+            if is_verified or channel_official_hint_score >= 0.6:
+                content_penalty *= 0.35
+            if positive_title_hint_score > 0:
+                content_penalty *= max(0.3, 1.0 - (positive_title_hint_score * 0.4))
+
+        short_clip = bool(duration_ms and duration_ms < SHORT_CLIP_THRESHOLD_MS)
+
+        if episode_like and positive_title_hint_score < 0.2:
+            content_penalty += 0.9
+
+        return {
+            "artist": artist,
+            "title": title,
+            "candidate_title": candidate_title,
+            "channel_name": channel_name,
+            "verified": is_verified,
+            "title_similarity": title_similarity,
+            "artist_similarity": artist_similarity,
+            "channel_similarity": channel_similarity,
+            "artist_in_title": artist_in_title,
+            "artist_in_channel": artist_in_channel,
+            "channel_official_hint_score": channel_official_hint_score,
+            "positive_title_hint_score": positive_title_hint_score,
+            "engagement_score": engagement_score,
+            "view_count": view_count,
+            "subscriber_count": subscriber_count,
+            "like_count": like_count,
+            "comment_count": comment_count,
+            "duration_ms": duration_ms,
+            "duration_score": duration_score,
+            "duration_within_tolerance": duration_within_tolerance,
+            "duration_delta_ms": duration_delta_ms,
+            "duration_tolerance_ms": duration_tolerance_ms,
+            "content_penalty": content_penalty,
+            "spam_penalty": spam_penalty,
+            "spam_flags": spam_flags,
+            "search_rank": search_rank,
+            "short_clip": short_clip,
+            "episode_like": episode_like,
+            "heuristic_version": 2,
+        }
+
+    def _compose_candidate_score(
+        self, features: Dict[str, Any]
+    ) -> Tuple[float, bool, List[str]]:
+        score = 0.0
+
+        title_similarity = float(features.get("title_similarity") or 0.0)
+        artist_similarity = float(features.get("artist_similarity") or 0.0)
+        channel_similarity = float(features.get("channel_similarity") or 0.0)
+        engagement_score = float(features.get("engagement_score") or 0.0)
+        duration_score = features.get("duration_score")
+        duration_score_val = (
+            float(duration_score) if duration_score is not None else 0.7
+        )
+        content_penalty = float(features.get("content_penalty") or 0.0)
+        spam_penalty = float(features.get("spam_penalty") or 0.0)
+        channel_official_hint_score = float(
+            features.get("channel_official_hint_score") or 0.0
+        )
+        positive_hint_score = float(features.get("positive_title_hint_score") or 0.0)
+        verified = bool(features.get("verified", False))
+        search_rank = int(features.get("search_rank", 0) or 0)
+        episode_like = bool(features.get("episode_like", False))
+
+        score += 2.0 * title_similarity
+        score += 2.2 * artist_similarity
+        score += 1.2 * channel_similarity
+        score += 1.8 * engagement_score
+        score += 0.9 * channel_official_hint_score
+        score += 0.6 * positive_hint_score
+        score += 1.0 * duration_score_val
+
+        if verified:
+            score += 2.5
+
+        score -= 0.85 * spam_penalty
+        score -= 1.1 * content_penalty
+        score -= search_rank * 0.18
+
+        rejection_reasons: List[str] = []
+        should_reject = False
+
+        if features.get("short_clip") and not verified:
+            should_reject = True
+            rejection_reasons.append("short_clip")
+
+        duration_within_tolerance = bool(
+            features.get("duration_within_tolerance", True)
+        )
+        if (
+            not duration_within_tolerance
+            and (duration_score is not None)
+            and duration_score_val < 0.35
+        ):
+            should_reject = True
+            rejection_reasons.append("duration_mismatch")
+
+        if title_similarity < 0.35 and not verified:
+            should_reject = True
+            rejection_reasons.append("low_title_similarity")
+
+        if artist_similarity < 0.25 and not verified:
+            should_reject = True
+            rejection_reasons.append("low_artist_similarity")
+
+        if spam_penalty >= 1.8 and not verified:
+            should_reject = True
+            rejection_reasons.append("spam_penalty")
+
+        if content_penalty >= 2.2 and (
+            not verified and channel_official_hint_score < 0.4
+        ):
+            should_reject = True
+            rejection_reasons.append("content_penalty")
+
+        if episode_like and positive_hint_score < 0.2:
+            should_reject = True
+            rejection_reasons.append("episode_content")
+        elif episode_like:
+            score -= 2.1
+
+        return score, should_reject, rejection_reasons
 
     async def _get_node(self) -> Optional[Any]:
         try:

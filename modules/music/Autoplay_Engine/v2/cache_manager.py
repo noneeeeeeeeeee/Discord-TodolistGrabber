@@ -1,7 +1,7 @@
 import asyncio
 import json
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +26,18 @@ class MappingEntry:
     verified: bool = False
     duration_ms: Optional[int] = None
     track_identifier: Optional[str] = None
+    title: Optional[str] = None
+    heuristic_score: float = 0.0
+    title_similarity: Optional[float] = None
+    artist_similarity: Optional[float] = None
+    channel_similarity: Optional[float] = None
+    engagement_score: Optional[float] = None
+    duration_score: Optional[float] = None
+    content_penalty: Optional[float] = None
+    spam_penalty: Optional[float] = None
+    spam_flags: List[str] = field(default_factory=list)
+    search_rank: Optional[int] = None
+    heuristic_version: int = 2
 
     def is_expired(self, ttl_seconds: float) -> bool:
         return (time.time() - self.timestamp) > ttl_seconds
@@ -35,18 +47,54 @@ class MappingEntry:
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "MappingEntry":
+        def _safe_float(value: Any) -> Optional[float]:
+            try:
+                if value is None:
+                    return None
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _safe_int(value: Any) -> Optional[int]:
+            try:
+                if value is None:
+                    return None
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        spam_flags_raw = payload.get("spam_flags")
+        if isinstance(spam_flags_raw, list):
+            spam_flags = [str(flag) for flag in spam_flags_raw if str(flag).strip()]
+        else:
+            spam_flags = []
+
         return cls(
             youtube_id=str(payload.get("youtube_id", "")),
             url=str(payload.get("url", "")),
             timestamp=float(payload.get("timestamp", 0.0)),
             channel_name=payload.get("channel_name"),
             verified=bool(payload.get("verified", False)),
-            duration_ms=payload.get("duration_ms"),
+            duration_ms=_safe_int(payload.get("duration_ms")),
             track_identifier=(
                 str(payload["track_identifier"]).strip()
                 if payload.get("track_identifier")
                 else None
             ),
+            title=(
+                str(payload.get("title", "")).strip() if payload.get("title") else None
+            ),
+            heuristic_score=float(payload.get("heuristic_score", 0.0) or 0.0),
+            title_similarity=_safe_float(payload.get("title_similarity")),
+            artist_similarity=_safe_float(payload.get("artist_similarity")),
+            channel_similarity=_safe_float(payload.get("channel_similarity")),
+            engagement_score=_safe_float(payload.get("engagement_score")),
+            duration_score=_safe_float(payload.get("duration_score")),
+            content_penalty=_safe_float(payload.get("content_penalty")),
+            spam_penalty=_safe_float(payload.get("spam_penalty")),
+            spam_flags=spam_flags,
+            search_rank=_safe_int(payload.get("search_rank")),
+            heuristic_version=int(payload.get("heuristic_version", 1) or 1),
         )
 
 
@@ -60,6 +108,12 @@ class EnrichmentEntry:
     fetched_at: float
     mood_vector_id: Optional[str] = None
     energy: Optional[str] = None
+    # Extended metadata for V3
+    bpm: Optional[int] = None
+    key: Optional[str] = None
+    activity_affinity: Optional[str] = None  # e.g., "workout", "study", "party"
+    emotional_intensity: Optional[float] = None  # 0.0-1.0
+    daypart_affinity: Optional[str] = None  # e.g., "morning", "evening", "night"
 
     def is_expired(self, ttl_seconds: float) -> bool:
         return (time.time() - self.fetched_at) > ttl_seconds
@@ -84,6 +138,23 @@ class EnrichmentEntry:
                 else None
             ),
             energy=(str(payload["energy"]).strip() if payload.get("energy") else None),
+            bpm=(int(payload["bpm"]) if payload.get("bpm") else None),
+            key=(str(payload["key"]).strip() if payload.get("key") else None),
+            activity_affinity=(
+                str(payload["activity_affinity"]).strip()
+                if payload.get("activity_affinity")
+                else None
+            ),
+            emotional_intensity=(
+                float(payload["emotional_intensity"])
+                if payload.get("emotional_intensity") is not None
+                else None
+            ),
+            daypart_affinity=(
+                str(payload["daypart_affinity"]).strip()
+                if payload.get("daypart_affinity")
+                else None
+            ),
         )
 
 
@@ -156,7 +227,9 @@ class CollaborativeSnapshot:
         return cls(
             embeddings=safe_embeddings,
             trained_at=float(payload.get("trained_at", 0.0)),
-            version=(str(payload["version"]).strip() if payload.get("version") else None),
+            version=(
+                str(payload["version"]).strip() if payload.get("version") else None
+            ),
         )
 
 
@@ -226,7 +299,9 @@ class CacheManager:
     # ------------------------------------------------------------------
     # Enrichment cache
     # ------------------------------------------------------------------
-    async def get_enrichment(self, artist: str, title: str) -> Optional[EnrichmentEntry]:
+    async def get_enrichment(
+        self, artist: str, title: str
+    ) -> Optional[EnrichmentEntry]:
         key = self._normalize_key(artist, title)
         entry = self._enrichment_cache.get(key)
         if not entry:
@@ -256,7 +331,9 @@ class CacheManager:
     # ------------------------------------------------------------------
     # Parsing cache (Gemini)
     # ------------------------------------------------------------------
-    async def get_parsing(self, raw_title: str, channel_name: str) -> Optional[ParsingEntry]:
+    async def get_parsing(
+        self, raw_title: str, channel_name: str
+    ) -> Optional[ParsingEntry]:
         key = self._normalize_parse_key(raw_title, channel_name)
         entry = self._parsing_cache.get(key)
         if not entry:

@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha1
@@ -26,10 +27,12 @@ DEFAULT_DAILY_LIMIT = 500
 RATE_LIMIT_COOLDOWN_SECONDS = 600
 AUTH_FAILURE_COOLDOWN_SECONDS = 3600
 ENRICHMENT_BATCH_MAX = 25
-# Increased from 1.0s to 5.0s to allow more tracks to accumulate before flushing
-# This prevents spamming the API with many 1-track requests
-ENRICHMENT_BATCH_DELAY_SECONDS = 5.0
+# Increased from 1.0s to 8.0s to allow more tracks to accumulate before flushing
+ENRICHMENT_BATCH_DELAY_SECONDS = 8.0
 ENRICHMENT_BATCH_TIMEOUT_SECONDS = 15.0
+REQUESTS_PER_MINUTE_LIMIT = 15
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+RATE_LIMIT_SAFETY_MARGIN = 0.25
 
 
 @dataclass
@@ -82,6 +85,9 @@ class GeminiService:
         self._batch_max = ENRICHMENT_BATCH_MAX
         self._batch_delay = ENRICHMENT_BATCH_DELAY_SECONDS
         self._batch_timeout = ENRICHMENT_BATCH_TIMEOUT_SECONDS
+        self._rpm_limit = REQUESTS_PER_MINUTE_LIMIT
+        self._rate_window = RATE_LIMIT_WINDOW_SECONDS
+        self._request_history = deque()
 
     # ------------------------------------------------------------------
     # Public API
@@ -316,10 +322,31 @@ class GeminiService:
             tags = record.get("tags") or []
             moods = record.get("moods") or []
             energy = record.get("energy")
+            bpm = record.get("bpm")
+            key = record.get("key")
+            activity_affinity = record.get("activity_affinity")
+            emotional_intensity = record.get("emotional_intensity")
+            daypart_affinity = record.get("daypart_affinity")
+            mood_vector = record.get("mood_vector")
+
             payload_entry = {
                 "tags": tags if isinstance(tags, list) else [],
                 "moods": moods if isinstance(moods, list) else [],
                 "energy": energy if isinstance(energy, str) else None,
+                "bpm": int(bpm) if bpm and str(bpm).isdigit() else None,
+                "key": str(key).strip() if key else None,
+                "activity_affinity": (
+                    str(activity_affinity).strip() if activity_affinity else None
+                ),
+                "emotional_intensity": (
+                    float(emotional_intensity)
+                    if emotional_intensity is not None
+                    else None
+                ),
+                "daypart_affinity": (
+                    str(daypart_affinity).strip() if daypart_affinity else None
+                ),
+                "mood_vector": mood_vector if isinstance(mood_vector, dict) else None,
             }
             if track_id and track_id in unmatched:
                 result_map[track_id] = payload_entry
@@ -361,7 +388,12 @@ class GeminiService:
             "- 'moods' (up to 3 descriptive moods)\n"
             "- 'energy' (single word: low, medium, high)\n"
             "- 'mood_vector' (object with: energy (0-1), valence (0-1), tempo (0-1), confidence (0-1), mood (string))\n"
-            f"{grounding_hint} If unsure, return empty arrays or default values."
+            "- 'bpm' (estimated tempo in beats per minute, integer, or null if unknown)\n"
+            "- 'key' (musical key, e.g., 'C major', 'A minor', or null)\n"
+            "- 'activity_affinity' (best use case: 'workout', 'study', 'party', 'relaxation', 'driving', or null)\n"
+            "- 'emotional_intensity' (0.0 to 1.0, how emotionally intense the track feels)\n"
+            "- 'daypart_affinity' (when track fits best: 'morning', 'afternoon', 'evening', 'night', or null)\n"
+            f"{grounding_hint} If unsure, return empty arrays or null values."
         )
         return (
             f"{instructions}\n\n"
@@ -483,6 +515,8 @@ class GeminiService:
             if not self._ensure_client():
                 return None
 
+            await self._throttle_requests()
+
             try:
                 self._reserve_quota(1)
             except GeminiQuotaExceeded:
@@ -508,6 +542,36 @@ class GeminiService:
             else:
                 self._status = "ready"
                 return response
+
+    async def _throttle_requests(self) -> None:
+        """Throttle per-minute request rate to avoid API 429 responses."""
+        if self._rpm_limit <= 0:
+            return
+
+        history = self._request_history
+        window = self._rate_window
+
+        while True:
+            now = time.monotonic()
+
+            # Drop entries that are outside the rolling window
+            while history and now - history[0] >= window:
+                history.popleft()
+
+            if len(history) < self._rpm_limit:
+                history.append(now)
+                return
+
+            wait = window - (now - history[0]) + RATE_LIMIT_SAFETY_MARGIN
+            if wait <= 0:
+                history.popleft()
+                continue
+
+            if LOG.isEnabledFor(logging.DEBUG):
+                LOG.debug(
+                    "⏳ Gemini throttling for %.2fs to respect per-minute limit", wait
+                )
+            await asyncio.sleep(wait)
 
     def _ensure_client(self) -> bool:
         if not self._keys:

@@ -227,6 +227,11 @@ class AutoplayEngineV2:
                 "mood_vector": await self._cached_mood_vector_dict(
                     cached.mood_vector_id
                 ),
+                "bpm": cached.bpm,
+                "key": cached.key,
+                "activity_affinity": cached.activity_affinity,
+                "emotional_intensity": cached.emotional_intensity,
+                "daypart_affinity": cached.daypart_affinity,
             }
 
         if not self._gemini.is_available:
@@ -305,6 +310,13 @@ class AutoplayEngineV2:
                 description=str(response.get("description", "") or ""),
             )
 
+        # Extract extended metadata fields
+        bpm_val = response.get("bpm")
+        key_val = response.get("key")
+        activity_affinity_val = response.get("activity_affinity")
+        emotional_intensity_val = response.get("emotional_intensity")
+        daypart_affinity_val = response.get("daypart_affinity")
+
         entry = EnrichmentEntry(
             tags=tags,
             mood=mood_value,
@@ -314,6 +326,19 @@ class AutoplayEngineV2:
             fetched_at=time.time(),
             mood_vector_id=mood_vector.get("id") if mood_vector else None,
             energy=energy,
+            bpm=int(bpm_val) if bpm_val and str(bpm_val).isdigit() else None,
+            key=str(key_val).strip() if key_val else None,
+            activity_affinity=(
+                str(activity_affinity_val).strip() if activity_affinity_val else None
+            ),
+            emotional_intensity=(
+                float(emotional_intensity_val)
+                if emotional_intensity_val is not None
+                else None
+            ),
+            daypart_affinity=(
+                str(daypart_affinity_val).strip() if daypart_affinity_val else None
+            ),
         )
         await self._cache.set_enrichment(artist, title, entry)
         if LOG.isEnabledFor(logging.DEBUG):
@@ -326,6 +351,10 @@ class AutoplayEngineV2:
                     "mood": mood_value,
                     "energy": energy,
                     "mood_vector_id": entry.mood_vector_id,
+                    "bpm": entry.bpm,
+                    "key": entry.key,
+                    "activity_affinity": entry.activity_affinity,
+                    "daypart_affinity": entry.daypart_affinity,
                 },
             )
         return {
@@ -336,6 +365,11 @@ class AutoplayEngineV2:
             "playcount": 0,
             "duration_ms": None,
             "mood_vector": mood_vector,
+            "bpm": entry.bpm,
+            "key": entry.key,
+            "activity_affinity": entry.activity_affinity,
+            "emotional_intensity": entry.emotional_intensity,
+            "daypart_affinity": entry.daypart_affinity,
         }
 
     async def hydrate_collaborative(self, source: Optional[Path | str] = None) -> bool:
