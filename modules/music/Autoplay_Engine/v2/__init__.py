@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -540,13 +541,38 @@ class LastFMAutoplayV2:
         seen: set[str] = set()
         candidates_to_prepare: List[tuple[int, str, str, str, Dict[str, Any]]] = []
 
-        # First pass: collect all unique candidates
+        # Get recent history to filter out immediate repetitions
+        history = self._recent_history.get(guild_id, [])
+        recent_track_ids = {entry.get("track_id") for entry in history[-3:]}
+
         for index, record in enumerate(records):
             artist = self._extract_artist(record)
             title = self._extract_title(record)
             if not artist or not title:
                 continue
+
+            # Filter out obvious episode/non-music content
+            if self._is_episode_content(title):
+                if self._engine._verbose:
+                    LOG.debug(
+                        "[AutoplayV2][filter] Rejected episode content: '%s' by '%s'",
+                        title,
+                        artist,
+                    )
+                continue
+
             track_id = self._track_id(artist, title)
+
+            # Skip if this track was recently played
+            if track_id in recent_track_ids:
+                if self._engine._verbose:
+                    LOG.debug(
+                        "[AutoplayV2][filter] Rejected recently played: '%s' by '%s'",
+                        title,
+                        artist,
+                    )
+                continue
+
             if track_id in seen:
                 continue
             seen.add(track_id)
@@ -602,7 +628,6 @@ class LastFMAutoplayV2:
                     if future.done() and not future.cancelled():
                         result = future.result()
                         if result:
-                            # Find artist/title for this track_id
                             artist, title = None, None
                             for _, tid, a, t, _ in candidates_to_prepare:
                                 if tid == track_id:
@@ -610,7 +635,6 @@ class LastFMAutoplayV2:
                                     break
 
                             if artist and title:
-                                # Process enrichment - mood_vector is now in result
                                 tags = [
                                     str(tag).lower()
                                     for tag in result.get("tags", [])
@@ -806,6 +830,53 @@ class LastFMAutoplayV2:
                 continue
             return max(0.3, min(1.0, 0.4 + min(value, 750000.0) / 1_500_000.0))
         return 0.5
+
+    @staticmethod
+    def _is_episode_content(title: str) -> bool:
+        """Check if a title appears to be episode/series content rather than music."""
+        title_lower = title.lower()
+
+        # Episode indicators
+        episode_patterns = [
+            r"\bepisode\s+\d+\b",
+            r"\bep\.?\s*\d+\b",
+            r"\be\d+\b",
+            r"\bs\d+e\d+\b",
+            r"\bseason\s+\d+\b",
+            r"\bchapter\s+\d+\b",
+            r"\bpart\s+\d+\b",
+            r"\bpilot\b",
+        ]
+
+        for pattern in episode_patterns:
+            if re.search(pattern, title_lower):
+                return True
+
+        # Non-music content keywords
+        non_music_keywords = [
+            "animation",
+            "animatic",
+            "comic dub",
+            "fan dub",
+            "audio drama",
+            "audiobook",
+            "podcast",
+            "voice over",
+            "voiceover",
+            "gameplay",
+            "walkthrough",
+            "playthrough",
+            "let's play",
+            "gaming",
+            "stream",
+            "vlog",
+        ]
+
+        for keyword in non_music_keywords:
+            if keyword in title_lower:
+                return True
+
+        return False
 
     @staticmethod
     def _track_id(artist: str, title: str) -> str:
