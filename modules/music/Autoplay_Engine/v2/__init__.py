@@ -191,6 +191,24 @@ class LastFMAutoplayV2:
                     artist,
                     ratio * 100,
                 )
+            elif event_type == "quality_issue":
+                LOG.info(
+                    "⚠️ [Feedback] Quality issue on '%s' by '%s' → cache cleared, will refetch with better heuristics",
+                    title,
+                    artist,
+                )
+            elif event_type == "more_like_this":
+                LOG.info(
+                    "💚 [Feedback] More like this: '%s' by '%s' → strong positive signal for genre/artist",
+                    title,
+                    artist,
+                )
+            elif event_type == "less_like_this":
+                LOG.info(
+                    "💔 [Feedback] Less like this: '%s' by '%s' → negative signal for genre/artist",
+                    title,
+                    artist,
+                )
             elif event_type == "finish":
                 LOG.info(
                     "✅ [Feedback] Finished '%s' by '%s' (%.0f%% complete) → positive signal for artist/genre",
@@ -219,12 +237,30 @@ class LastFMAutoplayV2:
 
         # Issue #3: Record in context tracker for arc recommender with enrichment data
         tracker = self._get_context_tracker(guild_id)
-        was_skipped = event_type in ("hard_skip", "skip")
+
+        # Determine skip status and type from event
+        was_skipped = event_type in (
+            "hard_skip",
+            "skip",
+            "quality_issue",
+            "less_like_this",
+        )
         skip_type = None
+
         if event_type == "hard_skip":
             skip_type = "hard"
+        elif event_type == "quality_issue":
+            # Quality issues are treated as hard skips (strong negative signal)
+            skip_type = "hard"
+        elif event_type == "less_like_this":
+            # "Less like this" is a medium skip (user explicitly dislikes)
+            skip_type = "medium"
         elif event_type == "skip":
             skip_type = "medium" if ratio < 0.5 else "soft"
+        elif event_type == "more_like_this":
+            # Treat as full completion for positive signal
+            ratio = 1.0
+            was_skipped = False
 
         # Try to get enrichment data from cache for accurate genre/mood tracking
         enrichment = await self._engine.enrich_track(artist, title)
@@ -967,7 +1003,6 @@ class LastFMAutoplayV2:
             r"\bpart\s+\d+\b",
             r"\bpt\.?\s*\d+\b",
             r"\bpilot\b",
-            r"\bfinale\b",
             r"\bmidseason\b",
             r"\b\d+x\d+\b",  # 1x01 format
             r"\b#\d+\b",  # #1, #2, etc.
@@ -976,6 +1011,24 @@ class LastFMAutoplayV2:
 
         for pattern in episode_patterns:
             if re.search(pattern, title_lower):
+                return True
+
+        # Context-aware "finale" detection - only flag if combined with series indicators
+        # This prevents false positives like "Sinner's Finale" or "Springtrap Finale"
+        if "finale" in title_lower:
+            series_context_keywords = [
+                "episode",
+                "season",
+                "series",
+                "chapter",
+                "part",
+                "animated",
+                "animation",
+                "show",
+                "full episode",
+            ]
+            # Only flag as episode if "finale" appears with series context
+            if any(keyword in title_lower for keyword in series_context_keywords):
                 return True
 
         # TV/Series indicators (but allow official music videos)

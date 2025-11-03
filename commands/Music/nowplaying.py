@@ -543,7 +543,7 @@ class PlayerControlView(View):
         )
         self._feedback_votes: Dict[int, str] = {}
         self._active_track_key: Optional[str] = self._current_track_key()
-        
+
         # Add feedback buttons if V2+ autoplay is enabled
         if player.supports_feedback_buttons():
             self.add_item(self.more_like_this_button_item())
@@ -802,7 +802,7 @@ class PlayerControlView(View):
             style=discord.ButtonStyle.success,
             custom_id="player:more_like_this",
             label="More Like This",
-            row=2  # Second row
+            row=2,  # Second row
         )
         button.callback = self.more_like_this_callback
         return button
@@ -814,11 +814,11 @@ class PlayerControlView(View):
             style=discord.ButtonStyle.danger,
             custom_id="player:less_like_this",
             label="Less Like This",
-            row=2  # Second row
+            row=2,  # Second row
         )
         button.callback = self.less_like_this_callback
         return button
-    
+
     def low_quality_button_item(self):
         """Factory method for Low Quality button (V2+) - skips without affecting algorithm"""
         button = Button(
@@ -826,7 +826,7 @@ class PlayerControlView(View):
             style=discord.ButtonStyle.secondary,
             custom_id="player:low_quality",
             label="Low Quality",
-            row=2  # Second row
+            row=2,  # Second row
         )
         button.callback = self.low_quality_callback
         return button
@@ -838,7 +838,7 @@ class PlayerControlView(View):
             await interaction.response.defer(ephemeral=False)
         except:
             pass  # Already responded
-        
+
         self._refresh_feedback_state()
         member = self._resolve_member(interaction)
         if not member:
@@ -884,7 +884,9 @@ class PlayerControlView(View):
             return
 
         # Get current track info
-        current_entry = getattr(self.player, "_current_entries", {}).get(self.guild_id, {})
+        current_entry = getattr(self.player, "_current_entries", {}).get(
+            self.guild_id, {}
+        )
         if not current_entry:
             await interaction.followup.send(
                 "❌ No track information available for feedback.", ephemeral=True
@@ -895,7 +897,7 @@ class PlayerControlView(View):
         # Record positive feedback to V2 engine
         try:
             if (
-                hasattr(self.player, '_lastfm_autoplay')
+                hasattr(self.player, "_lastfm_autoplay")
                 and self.player._lastfm_autoplay
                 and self.player._lastfm_autoplay.is_available()
             ):
@@ -905,12 +907,12 @@ class PlayerControlView(View):
                     title=track_title,
                     progress_ratio=1.0,  # Full listen implied
                     feedback_type="more_like_this",
-                    user_id=member.id
+                    user_id=member.id,
                 )
                 self._feedback_votes[member.id] = "more"
                 await interaction.followup.send(
                     f"👍 **{member.display_name}** likes **{track_title}**",
-                    ephemeral=False
+                    ephemeral=False,
                 )
             else:
                 await interaction.followup.send(
@@ -929,7 +931,7 @@ class PlayerControlView(View):
             await interaction.response.defer(ephemeral=False)
         except:
             pass  # Already responded
-        
+
         self._refresh_feedback_state()
         member = self._resolve_member(interaction)
         if not member:
@@ -975,18 +977,20 @@ class PlayerControlView(View):
             return
 
         # Get current track info
-        current_entry = getattr(self.player, "_current_entries", {}).get(self.guild_id, {})
+        current_entry = getattr(self.player, "_current_entries", {}).get(
+            self.guild_id, {}
+        )
         if not current_entry:
             await interaction.followup.send(
                 "❌ No track information available for feedback.", ephemeral=True
             )
             return
         track_title = current_entry.get("title", "Unknown")
-        
+
         # Record negative feedback to V2 engine
         try:
             if (
-                hasattr(self.player, '_lastfm_autoplay')
+                hasattr(self.player, "_lastfm_autoplay")
                 and self.player._lastfm_autoplay
                 and self.player._lastfm_autoplay.is_available()
             ):
@@ -996,12 +1000,12 @@ class PlayerControlView(View):
                     title=track_title,
                     progress_ratio=0.2,  # Early skip implied
                     feedback_type="less_like_this",
-                    user_id=member.id
+                    user_id=member.id,
                 )
                 self._feedback_votes[member.id] = "less"
                 await interaction.followup.send(
                     f"👎 **{member.display_name}** dislikes **{track_title}**",
-                    ephemeral=False
+                    ephemeral=False,
                 )
             else:
                 await interaction.followup.send(
@@ -1012,7 +1016,7 @@ class PlayerControlView(View):
             await interaction.followup.send(
                 "❌ Failed to record feedback", ephemeral=True
             )
-    
+
     async def low_quality_callback(self, interaction: discord.Interaction):
         """Handle Low Quality report - skips track without affecting algorithm (V2+)"""
         # Defer immediately to avoid 3-second timeout
@@ -1020,7 +1024,7 @@ class PlayerControlView(View):
             await interaction.response.defer(ephemeral=False)
         except:
             pass  # Already responded
-        
+
         self._refresh_feedback_state()
         member = self._resolve_member(interaction)
         if not member:
@@ -1060,46 +1064,84 @@ class PlayerControlView(View):
             return
 
         # Check if this is an autoplay track
-        current_entry = getattr(self.player, "_current_entries", {}).get(self.guild_id, {})
+        current_entry = getattr(self.player, "_current_entries", {}).get(
+            self.guild_id, {}
+        )
         if not current_entry:
             await interaction.followup.send(
                 "❌ No track information available.", ephemeral=True
             )
             return
-        
+
         is_autoplay_track = current_entry.get("autoplay", False)
         if not is_autoplay_track:
             await interaction.followup.send(
                 "⚠️ **Low Quality** button is only for autoplay tracks. Use **Skip** for manual queued tracks.",
-                ephemeral=True
+                ephemeral=True,
             )
             return
-        
+
         track_title = current_entry.get("title", "Unknown")
-        
-        # Mark as low quality vote WITHOUT affecting algorithm
-        # This just skips the track and will trigger autoplay to find a new one
+
+        # Mark as low quality and record negative feedback
+        # This should skip the track AND negatively affect the algorithm
         try:
+            # Record quality issue feedback to V2 engine
+            if (
+                hasattr(self.player, "_lastfm_autoplay")
+                and self.player._lastfm_autoplay
+                and self.player._lastfm_autoplay.is_available()
+            ):
+                # Record as quality_issue with very low progress (strong negative signal)
+                await self.player._lastfm_autoplay.record_playback_feedback(
+                    guild_id=self.guild_id,
+                    artist=current_entry.get("author", "Unknown"),
+                    title=track_title,
+                    progress_ratio=0.05,  # Very early skip = strong dislike signal
+                    feedback_type="quality_issue",
+                    user_id=member.id,
+                )
+
+                # Also mark for cache invalidation to trigger refetch
+                # This will force the resolver to find a better match next time
+                track_id = self.player._lastfm_autoplay._track_id(
+                    current_entry.get("author", "Unknown"), track_title
+                )
+                # Clear the mapping from cache to force re-resolution
+                if hasattr(self.player._lastfm_autoplay._engine, "_track_resolver"):
+                    resolver = self.player._lastfm_autoplay._engine._track_resolver
+                    if hasattr(resolver, "_cache_manager"):
+                        cache_mgr = resolver._cache_manager
+                        # Remove the bad mapping so it gets refetched with better heuristics
+                        await cache_mgr.delete_mapping(
+                            current_entry.get("author", "Unknown"), track_title
+                        )
+                        LOG.info(
+                            f"[LowQuality] Cleared cache mapping for '{track_title}' by '{current_entry.get('author')}' - will refetch"
+                        )
+
             self._feedback_votes[member.id] = "low_quality"
-            
-            # Skip the track immediately (no algorithm penalty)
+
+            # Skip the track immediately
             if vc and hasattr(vc, "stop"):
                 await vc.stop()
                 await interaction.followup.send(
-                    f"⚠️ **{member.display_name}** reported low quality on **{track_title}** → skipped (retrying recommendation)",
-                    ephemeral=False
+                    f"⚠️ **{member.display_name}** reported low quality on **{track_title}** → skipped & marked for better resolution",
+                    ephemeral=False,
                 )
             else:
                 await interaction.followup.send(
                     "❌ Unable to skip track", ephemeral=True
                 )
         except Exception as e:
-            LOG.error(f"Failed to skip low quality track: {e}")
+            LOG.error(f"Failed to process low quality report: {e}")
             await interaction.followup.send(
-                "❌ Failed to skip track", ephemeral=True
+                "❌ Failed to process quality report", ephemeral=True
             )
 
-    def _resolve_member(self, interaction: discord.Interaction) -> Optional[discord.Member]:
+    def _resolve_member(
+        self, interaction: discord.Interaction
+    ) -> Optional[discord.Member]:
         """Resolve the interaction user to a guild member when possible."""
         user = interaction.user
         if isinstance(user, discord.Member):
@@ -1110,7 +1152,11 @@ class PlayerControlView(View):
         return None
 
     def _current_track_key(self) -> Optional[str]:
-        entry = self.player._current_entries.get(self.guild_id, {}) if hasattr(self.player, "_current_entries") else {}
+        entry = (
+            self.player._current_entries.get(self.guild_id, {})
+            if hasattr(self.player, "_current_entries")
+            else {}
+        )
         identifier = entry.get("identifier")
         if identifier:
             return f"id::{str(identifier).lower()}"
