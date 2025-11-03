@@ -21,13 +21,11 @@ except Exception:  # pragma: no cover - fallback stub for tooling
 LOG = logging.getLogger(__name__)
 
 GEMINI_KEYS_ENV = "GeminiApiKeys"
-LEGACY_GEMINI_KEY_ENV = "GEMINI_API_KEY"
 DEFAULT_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_DAILY_LIMIT = 500
 RATE_LIMIT_COOLDOWN_SECONDS = 600
 AUTH_FAILURE_COOLDOWN_SECONDS = 3600
-ENRICHMENT_BATCH_MAX = 25
-# Increased from 1.0s to 8.0s to allow more tracks to accumulate before flushing
+ENRICHMENT_BATCH_MAX = 50
 ENRICHMENT_BATCH_DELAY_SECONDS = 8.0
 ENRICHMENT_BATCH_TIMEOUT_SECONDS = 15.0
 REQUESTS_PER_MINUTE_LIMIT = 15
@@ -457,7 +455,7 @@ class GeminiService:
         self._available = False
 
     def _load_api_keys(self) -> List[str]:
-        raw = os.getenv(GEMINI_KEYS_ENV) or os.getenv(LEGACY_GEMINI_KEY_ENV, "")
+        raw = os.getenv(GEMINI_KEYS_ENV)
         keys: List[str] = []
         if not raw:
             return keys
@@ -699,17 +697,56 @@ class GeminiService:
     @staticmethod
     def _build_track_prompt(raw_title: str, channel_name: str) -> str:
         return (
-            "You are a music metadata parser. Extract the primary artist and song title\n"
-            "from the provided YouTube metadata. Respond with a compact JSON object\n"
-            "containing keys 'artist' and 'title'.\n\n"
+            "You are a music metadata parser.\n"
+            "Your task: Extract the performing artist (or primary creator), the song title, "
+            "and any featuring artist(s) from a given YouTube video title and channel name.\n"
+            "Respond **only** with a compact JSON object with keys:\n"
+            '- "artist": string\n'
+            '- "title": string\n'
+            '- "featuring_artists": array of strings (can be empty)\n\n'
+            "Input:\n"
             f'YouTube Title: "{raw_title}"\n'
             f'Channel Name: "{channel_name}"\n\n'
-            "Rules:\n"
-            "1. Remove descriptors such as '(Official Video)', '[Lyrics]', 'HD', etc.\n"
-            "2. Prefer the canonical artist over channel branding or fan accounts.\n"
-            "3. If multiple artists are listed, keep only the primary credited artist.\n"
-            "4. Keep featuring artists inside the title only if they are part of the song name.\n"
-            "5. Return only JSON, with double-quoted keys and string values."
+            "Parsing Instructions:\n"
+            '1. **Clean the title**: Remove standard descriptors such as "(Official Video)", '
+            '"[Lyrics]", "(Audio)", "(Music Video)", "– Lyric Video", etc. '
+            "Also remove trailing or leading extra punctuation and whitespace.\n"
+            "2. **Identify separators**: Common separators between artist and title include "
+            '"–", "—", ":", "|". Use the first such clear separator **if** the text '
+            "before it is plausibly an artist name rather than a franchise/show/series.\n"
+            "3. **Distinguish franchise or show names**: If the title begins with a known series, "
+            'show, game, or franchise name (for example "MURDER DRONES", "FNAF", "Hazbin Hotel", etc.), '
+            'treat that part as *non-artist (series/franchise)*. Do not assign it as the "artist". '
+            "Instead, proceed to identify the artist via the channel or metadata.\n"
+            "4. **Channel name as potential artist**:\n"
+            '   - If the channel name is clearly a music creator or publisher (e.g., "GLITCH", '
+            '"The Living Tombstone"), it may serve as the "artist".\n'
+            "   - If the channel name is a generic label, publisher, or a show/series channel "
+            "(not performing artist), you should still examine the title to find a performing artist.\n"
+            '5. **Featuring artists**: Look for markers like "ft.", "feat.", "featuring", "with" '
+            'in the title. Extract the names following these markers into the "featuring_artists" array. '
+            "The main artist remains the primary one identified earlier.\n"
+            "6. **Ambiguous cases**:\n"
+            "   - If you cannot confidently identify a separate artist in the title, then use the "
+            'channel name as "artist".\n'
+            "   - If both the channel and the title suggest different possible artists, prefer the "
+            "musical creator (rather than a franchise/title).\n"
+            "7. **Song title extraction**: After removing artist parts and descriptors, what remains "
+            'is the "title". Clean up extra whitespace, correct apostrophes or stylization where '
+            "obvious, but don't alter meaning.\n"
+            "8. **Return format**: Exactly one JSON object (no additional commentary).\n\n"
+            "Example:\n"
+            "Input:\n"
+            "YouTube Title: \"MURDER DRONES – FIGHT TIL' I'M GOOD ENOUGH (ft. The Living Tombstone) "
+            '[Official Music Video]"\n'
+            'Channel Name: "GLITCH"\n\n'
+            "Output:\n"
+            "{\n"
+            '  "artist": "GLITCH",\n'
+            '  "title": "Fight Til I\'m Good Enough",\n'
+            '  "featuring_artists": ["The Living Tombstone"]\n'
+            "}\n\n"
+            "Now parse the provided input and return JSON only."
         )
 
     @staticmethod

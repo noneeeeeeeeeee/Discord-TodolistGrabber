@@ -508,7 +508,7 @@ class TrackResolver:
         if not node:
             return None
 
-        query = f"ytsearch:{artist} {title} official audio"
+        query = f"ytmsearch: {artist} {title}"
         try:
             results = await node.get_tracks(query)
         except Exception as exc:
@@ -659,6 +659,38 @@ class TrackResolver:
         if normalized_title and normalized_title in candidate_title_norm:
             title_similarity = max(title_similarity, 0.92)
 
+        # Penalize multi-part titles when looking for simple titles
+        # e.g., "IMPULSE!" vs "Impulse - 2 - Ameliorate"
+        title_part_penalty = 0.0
+        candidate_has_track_number = False
+
+        # Check for track numbers: "- 2 -", "Track 2", "Pt. 2", etc.
+        track_number_patterns = [
+            r"\s-\s\d+\s-\s",  # " - 2 - "
+            r"\strack\s*\d+",  # "Track 2" or "track2"
+            r"\s#\d+",  # " #2"
+            r"\spt\.?\s*\d+",  # "Pt. 2" or "pt2"
+            r"\s\d+\s*of\s*\d+",  # "2 of 12"
+        ]
+
+        for pattern in track_number_patterns:
+            if re.search(pattern, candidate_title_norm):
+                candidate_has_track_number = True
+                title_part_penalty += 0.25
+                break
+
+        # Check if candidate title has multiple parts separated by " - " or " | "
+        title_parts_candidate = len(re.split(r"\s+[-|]\s+", candidate_title_norm))
+        title_parts_expected = len(re.split(r"\s+[-|]\s+", normalized_title))
+
+        if title_parts_candidate > title_parts_expected + 1:
+            # Candidate has more parts than expected (e.g., "Artist - Title - Subtitle")
+            title_part_penalty += 0.15 * (title_parts_candidate - title_parts_expected)
+
+        # If the expected title is very short and simple, be stricter
+        if len(normalized_title.split()) <= 2 and title_parts_candidate > 2:
+            title_part_penalty += 0.2
+
         artist_in_title = (
             1.0
             if normalized_artist and normalized_artist in candidate_title_norm
@@ -680,6 +712,18 @@ class TrackResolver:
             artist_in_title,
             artist_in_channel,
         )
+
+        # Apply stricter artist matching when title has track numbers or extra parts
+        # This prevents matching wrong tracks like "An Endless Sporadic - Impulse - 2"
+        # when looking for "Tanger - IMPULSE!"
+        if title_part_penalty > 0.0:
+            # Require higher artist similarity threshold
+            if artist_similarity < 0.75:
+                # Strong penalty if artist doesn't match well
+                artist_similarity *= 1.0 - min(title_part_penalty * 2.0, 0.9)
+            elif artist_similarity < 0.85:
+                # Moderate penalty for partial matches
+                artist_similarity *= 1.0 - min(title_part_penalty, 0.5)
 
         channel_similarity = artist_similarity_channel
         if artist_in_channel:
@@ -787,13 +831,18 @@ class TrackResolver:
         if episode_like and positive_title_hint_score < 0.2:
             content_penalty += 0.9
 
+        # Apply title part penalty to title similarity
+        adjusted_title_similarity = title_similarity * (
+            1.0 - min(title_part_penalty, 0.7)
+        )
+
         return {
             "artist": artist,
             "title": title,
             "candidate_title": candidate_title,
             "channel_name": channel_name,
             "verified": is_verified,
-            "title_similarity": title_similarity,
+            "title_similarity": adjusted_title_similarity,
             "artist_similarity": artist_similarity,
             "channel_similarity": channel_similarity,
             "artist_in_title": artist_in_title,
@@ -816,6 +865,8 @@ class TrackResolver:
             "search_rank": search_rank,
             "short_clip": short_clip,
             "episode_like": episode_like,
+            "title_part_penalty": title_part_penalty,
+            "candidate_has_track_number": candidate_has_track_number,
             "heuristic_version": 2,
         }
 
@@ -843,7 +894,9 @@ class TrackResolver:
         episode_like = bool(features.get("episode_like", False))
 
         score += 2.0 * title_similarity
-        score += 2.2 * artist_similarity
+        score += (
+            3.0 * artist_similarity
+        )  # Increased from 2.2 to prioritize artist matching
         score += 1.2 * channel_similarity
         score += 1.8 * engagement_score
         score += 0.9 * channel_official_hint_score
@@ -882,6 +935,12 @@ class TrackResolver:
         if artist_similarity < 0.25 and not verified:
             should_reject = True
             rejection_reasons.append("low_artist_similarity")
+
+        # Stricter artist matching when candidate has track numbers/multi-part titles
+        title_part_penalty = float(features.get("title_part_penalty") or 0.0)
+        if title_part_penalty > 0.3 and artist_similarity < 0.65 and not verified:
+            should_reject = True
+            rejection_reasons.append("artist_mismatch_with_track_number")
 
         if spam_penalty >= 1.8 and not verified:
             should_reject = True

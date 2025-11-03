@@ -26,10 +26,12 @@ from .novelty_controller import NoveltyController, NoveltyConfig
 LOG = logging.getLogger(__name__)
 
 _LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
-_DEFAULT_FETCH_LIMIT = 50
+_DEFAULT_FETCH_LIMIT = 100  # Increased from 50 to get more diverse candidates
 _HISTORY_LIMIT = 35
 _PARALLEL_ENRICH_LIMIT = 5
 _MIN_CONTENT_SIMILARITY = 0.05
+_RECENT_TRACKS_FILTER_SIZE = 10  # Prevent repeating last 10 tracks
+_ARTIST_COOLDOWN_SIZE = 5  # Don't pick same artist within last 5 tracks
 
 
 @dataclass(slots=True)
@@ -343,6 +345,35 @@ class LastFMAutoplayV2:
                     candidate.title,
                 )
 
+            # Apply genre/tag penalties for recently skipped content
+            if context.disliked_tags:
+                meta = metadata_index.get(candidate.track_id, {})
+                candidate_tags = meta.get("tags", [])
+
+                # Calculate tag penalty (average of all matching disliked tags)
+                tag_penalties = [
+                    context.disliked_tags.get(tag.lower(), 0.0)
+                    for tag in candidate_tags
+                    if tag.lower() in context.disliked_tags
+                ]
+
+                if tag_penalties:
+                    avg_penalty = sum(tag_penalties) / len(tag_penalties)
+                    tag_multiplier = 1.0 - avg_penalty  # Convert penalty to multiplier
+                    candidate.score *= tag_multiplier
+
+                    if self._verbose >= 2 and avg_penalty > 0.1:
+                        LOG.debug(
+                            "👎 [Skip Penalty] Reducing score by %.1f%% for '%s' (disliked tags: %s)",
+                            avg_penalty * 100,
+                            candidate.title,
+                            [
+                                t
+                                for t in candidate_tags
+                                if t.lower() in context.disliked_tags
+                            ][:3],
+                        )
+
         # Re-sort after applying all penalties
         scored.sort(key=lambda c: c.score, reverse=True)
 
@@ -461,6 +492,7 @@ class LastFMAutoplayV2:
                 )
             return records
 
+        # Fallback 1: Get top tracks from the same artist
         fallback_params = {
             "method": "artist.getTopTracks",
             "artist": artist,
@@ -476,16 +508,79 @@ class LastFMAutoplayV2:
                 fallback_params["limit"],
             )
         recs = await self._call_lastfm(fallback_params, source="artist.getTopTracks")
+
+        # If top tracks returned results, use them
+        if recs:
+            if self._engine._verbose:
+                LOG.debug(
+                    "[AutoplayV2][lastfm] toptracks returned %d records (samples=%s)",
+                    len(recs),
+                    [
+                        f"{self._extract_artist(r)}::{self._extract_title(r)}"
+                        for r in recs[:5]
+                    ],
+                )
+            return recs
+
+        # Fallback 2: Get similar artists and fetch their top tracks for diversity
+        similar_artist_params = {
+            "method": "artist.getSimilar",
+            "artist": artist,
+            "limit": "10",  # Get 10 similar artists
+            "api_key": self._lastfm_key,
+            "format": "json",
+            "autocorrect": "1",
+        }
         if self._engine._verbose:
             LOG.debug(
-                "[AutoplayV2][lastfm] toptracks returned %d records (samples=%s)",
-                len(recs),
-                [
-                    f"{self._extract_artist(r)}::{self._extract_title(r)}"
-                    for r in recs[:5]
-                ],
+                "[AutoplayV2][lastfm] fallback2 artist.getSimilar artist=%s limit=10",
+                artist,
             )
-        return recs
+
+        similar_artists = await self._call_lastfm(
+            similar_artist_params, source="artist.getSimilar"
+        )
+
+        if similar_artists:
+            # Get top tracks from the first 3 similar artists
+            all_tracks = []
+            for similar_artist_record in similar_artists[:3]:
+                similar_artist_name = self._extract_artist(similar_artist_record)
+                if not similar_artist_name:
+                    continue
+
+                similar_tracks_params = {
+                    "method": "artist.getTopTracks",
+                    "artist": similar_artist_name,
+                    "limit": str(_DEFAULT_FETCH_LIMIT // 6),  # ~16 tracks per artist
+                    "api_key": self._lastfm_key,
+                    "format": "json",
+                    "autocorrect": "1",
+                }
+
+                similar_tracks = await self._call_lastfm(
+                    similar_tracks_params, source="artist.getTopTracks"
+                )
+                all_tracks.extend(similar_tracks)
+
+                if len(all_tracks) >= _DEFAULT_FETCH_LIMIT // 2:
+                    break
+
+            if all_tracks:
+                if self._engine._verbose:
+                    LOG.debug(
+                        "[AutoplayV2][lastfm] similar artists fallback returned %d tracks from related artists",
+                        len(all_tracks),
+                    )
+                return all_tracks[: _DEFAULT_FETCH_LIMIT // 2]
+
+        # Last resort: return empty to trigger other mechanisms
+        LOG.warning(
+            "[AutoplayV2][lastfm] All Last.fm methods failed for artist=%s title=%s",
+            artist,
+            title,
+        )
+        return []
 
     async def _call_lastfm(
         self,
@@ -508,6 +603,12 @@ class LastFMAutoplayV2:
             tracks = payload.get("similartracks", {}).get("track", [])
         elif source == "artist.getTopTracks":
             tracks = payload.get("toptracks", {}).get("track", [])
+        elif source == "artist.getSimilar":
+            # For artist.getSimilar, we return artist records, not track records
+            artists = payload.get("similarartists", {}).get("artist", [])
+            if isinstance(artists, dict):
+                artists = [artists]
+            return artists if isinstance(artists, list) else []
         else:
             tracks = []
 
@@ -541,10 +642,18 @@ class LastFMAutoplayV2:
         seen: set[str] = set()
         candidates_to_prepare: List[tuple[int, str, str, str, Dict[str, Any]]] = []
 
-        # Get recent history to filter out immediate repetitions
+        # Get recent history to filter out immediate repetitions and artist cooldown
         history = self._recent_history.get(guild_id, [])
-        recent_track_ids = {entry.get("track_id") for entry in history[-3:]}
+        recent_track_ids = {
+            entry.get("track_id") for entry in history[-_RECENT_TRACKS_FILTER_SIZE:]
+        }
+        recent_artists = {
+            entry.get("artist")
+            for entry in history[-_ARTIST_COOLDOWN_SIZE:]
+            if entry.get("artist")
+        }
 
+        # First pass: collect all unique candidates, filter out episodes and recent plays
         for index, record in enumerate(records):
             artist = self._extract_artist(record)
             title = self._extract_title(record)
@@ -568,6 +677,17 @@ class LastFMAutoplayV2:
                 if self._engine._verbose:
                     LOG.debug(
                         "[AutoplayV2][filter] Rejected recently played: '%s' by '%s'",
+                        title,
+                        artist,
+                    )
+                continue
+
+            # Skip if this artist was played in the last N tracks (cooldown)
+            artist_normalized = artist.lower().strip()
+            if artist_normalized in recent_artists:
+                if self._engine._verbose:
+                    LOG.debug(
+                        "[AutoplayV2][filter] Rejected artist cooldown: '%s' by '%s' (played recently)",
                         title,
                         artist,
                     )
@@ -836,25 +956,48 @@ class LastFMAutoplayV2:
         """Check if a title appears to be episode/series content rather than music."""
         title_lower = title.lower()
 
-        # Episode indicators
+        # Episode indicators - expanded patterns
         episode_patterns = [
             r"\bepisode\s+\d+\b",
             r"\bep\.?\s*\d+\b",
             r"\be\d+\b",
-            r"\bs\d+e\d+\b",
+            r"\bs\d+e\d+\b",  # S01E01 format
             r"\bseason\s+\d+\b",
             r"\bchapter\s+\d+\b",
             r"\bpart\s+\d+\b",
+            r"\bpt\.?\s*\d+\b",
             r"\bpilot\b",
+            r"\bfinale\b",
+            r"\bmidseason\b",
+            r"\b\d+x\d+\b",  # 1x01 format
+            r"\b#\d+\b",  # #1, #2, etc.
+            r"\bvol\.?\s*\d+\b",  # Volume numbers (often series)
         ]
 
         for pattern in episode_patterns:
             if re.search(pattern, title_lower):
                 return True
 
-        # Non-music content keywords
+        # TV/Series indicators (but allow official music videos)
+        if (
+            "official music video" not in title_lower
+            and "music video" not in title_lower
+        ):
+            tv_patterns = [
+                r"\btv\s+show\b",
+                r"\btv\s+series\b",
+                r"\bweb\s+series\b",
+                r"\bmini\s+series\b",
+                r"\bfull\s+episode\b",
+                r"\bfull\s+movie\b",
+            ]
+            for pattern in tv_patterns:
+                if re.search(pattern, title_lower):
+                    return True
+
+        # Non-music content keywords (expanded)
         non_music_keywords = [
-            "animation",
+            "animation meme",  # Often fan content, not music
             "animatic",
             "comic dub",
             "fan dub",
@@ -870,6 +1013,16 @@ class LastFMAutoplayV2:
             "gaming",
             "stream",
             "vlog",
+            "behind the scenes",
+            "making of",
+            "documentary",
+            "interview",
+            "talk show",
+            "news",
+            "trailer",
+            "teaser",
+            "preview",
+            "sneak peek",
         ]
 
         for keyword in non_music_keywords:
