@@ -11,12 +11,11 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# google-genai provides the official Gemini client. Optional import keeps
-# static analysis happy when the dependency is not available at design time.
-try:  # pragma: no cover - import shim
-    from google import genai  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover - fallback stub for tooling
-    genai = None  # type: ignore[assignment]
+# google-genai provides the official Gemini client.
+try:
+    from google import genai
+except Exception:
+    genai = None
 
 LOG = logging.getLogger(__name__)
 
@@ -189,6 +188,32 @@ class GeminiService:
             if not future.done():
                 future.set_result({})
             return {}
+
+    async def query_gemini(self, prompt: str) -> Optional[str]:
+        """
+        Simple query method for Gemini. Returns the text response.
+        Used for non-enrichment tasks like track selection.
+        """
+        response = await self._generate(prompt)
+        if not response:
+            return None
+
+        try:
+            # Extract text from Gemini response
+            if hasattr(response, "text"):
+                return response.text
+            elif hasattr(response, "candidates") and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, "content") and hasattr(
+                    candidate.content, "parts"
+                ):
+                    parts = candidate.content.parts
+                    if parts and hasattr(parts[0], "text"):
+                        return parts[0].text
+            return None
+        except Exception as e:
+            LOG.error(f"Failed to extract text from Gemini response: {e}")
+            return None
 
     async def flush_enrichment_queue(self) -> None:
         await self._flush_enrichment_batch()

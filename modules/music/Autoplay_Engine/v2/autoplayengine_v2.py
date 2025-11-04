@@ -50,7 +50,9 @@ class AutoplayEngineV2:
         self._feedback = feedback_manager or FeedbackManager(cache_dir=cache_path)
         self._collaborative = collaborative_matrix or CollaborativeMatrix(self._cache)
         self._recommender = ContextualRecommender(self._collaborative)
-        self._track_resolver = track_resolver or TrackResolver(self._cache)
+        self._track_resolver = track_resolver or TrackResolver(
+            self._cache, self._gemini
+        )
         self._lastfm_key = os.getenv(LASTFM_API_KEY_ENV, "").strip()
 
         # instance verbosity (0 = off, 1 = debug, 2 = very verbose)

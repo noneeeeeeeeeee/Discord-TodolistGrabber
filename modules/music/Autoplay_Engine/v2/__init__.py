@@ -193,19 +193,19 @@ class LastFMAutoplayV2:
                 )
             elif event_type == "quality_issue":
                 LOG.info(
-                    "⚠️ [Feedback] Quality issue on '%s' by '%s' → cache cleared, will refetch with better heuristics",
+                    "⚠️ [Quality] Bad mapping for '%s' by '%s' → banned, cache cleared, Gemini refetch triggered",
                     title,
                     artist,
                 )
             elif event_type == "more_like_this":
                 LOG.info(
-                    "💚 [Feedback] More like this: '%s' by '%s' → strong positive signal for genre/artist",
+                    "💚 [UserFeedback] More like this: '%s' by '%s' → explicit positive preference (stronger than finish)",
                     title,
                     artist,
                 )
             elif event_type == "less_like_this":
                 LOG.info(
-                    "💔 [Feedback] Less like this: '%s' by '%s' → negative signal for genre/artist",
+                    "💔 [UserFeedback] Less like this: '%s' by '%s' → explicit negative preference",
                     title,
                     artist,
                 )
@@ -239,28 +239,17 @@ class LastFMAutoplayV2:
         tracker = self._get_context_tracker(guild_id)
 
         # Determine skip status and type from event
-        was_skipped = event_type in (
-            "hard_skip",
-            "skip",
-            "quality_issue",
-            "less_like_this",
-        )
+        # ONLY actual skips count as skips - more/less like this are explicit user feedback events
+        was_skipped = event_type in ("hard_skip", "skip")
         skip_type = None
 
         if event_type == "hard_skip":
             skip_type = "hard"
-        elif event_type == "quality_issue":
-            # Quality issues are treated as hard skips (strong negative signal)
-            skip_type = "hard"
-        elif event_type == "less_like_this":
-            # "Less like this" is a medium skip (user explicitly dislikes)
-            skip_type = "medium"
         elif event_type == "skip":
             skip_type = "medium" if ratio < 0.5 else "soft"
-        elif event_type == "more_like_this":
-            # Treat as full completion for positive signal
-            ratio = 1.0
-            was_skipped = False
+
+        # More/Less Like This are NOT skips - they're explicit user preference signals
+        # They get recorded separately with their own weighting based on VC participant count
 
         # Try to get enrichment data from cache for accurate genre/mood tracking
         enrichment = await self._engine.enrich_track(artist, title)

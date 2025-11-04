@@ -17,6 +17,9 @@ DURATION_TOLERANCE_PERCENT = 0.20  # 20%
 DURATION_TOLERANCE_MIN_MS = 30000  # 30 seconds minimum tolerance
 SHORT_CLIP_THRESHOLD_MS = 30000  # clips shorter than 30s are likely YouTube Shorts/spam
 
+# Confidence threshold for hybrid resolution
+LOW_CONFIDENCE_THRESHOLD = 7.0
+
 # High-quality channel indicators (boost priority)
 GOOD_CHANNEL_HINTS = [
     "vevo",
@@ -236,8 +239,10 @@ CRITICAL_SPAM_KEYWORDS = {
 class TrackResolver:
     """Resolves tracks via Pomice and maintains mapping cache."""
 
-    def __init__(self, cache_manager: CacheManager) -> None:
+    def __init__(self, cache_manager: CacheManager, gemini_service: Any = None) -> None:
         self._cache = cache_manager
+        self._gemini_service = gemini_service
+        self._banned_tracks: Dict[Tuple[str, str], List[Tuple[str, str, str]]] = {}
 
     async def resolve_track(
         self,
@@ -299,7 +304,20 @@ class TrackResolver:
             title,
             expected_duration_ms=expected_duration_ms,
         )
+
+        # Phase 4: Confidence Check & Branching
         if not search_result:
+            # No heuristic result at all - try Gemini if available
+            if self._gemini_service:
+                LOG.warning(
+                    "⚠️ [Hybrid] Heuristic search failed for '%s - %s', falling back to Gemini AI",
+                    artist,
+                    title,
+                )
+                return await self.resolve_track_with_gemini(
+                    artist, title, expected_duration_ms=expected_duration_ms
+                )
+
             if LOG.isEnabledFor(logging.DEBUG):
                 LOG.debug(
                     "Track resolution failed: %s",
@@ -312,7 +330,36 @@ class TrackResolver:
             return None
 
         track_obj, heuristics = search_result
+        heuristic_score = float(heuristics.get("score", 0.0) or 0.0)
 
+        # Check confidence threshold
+        if heuristic_score < LOW_CONFIDENCE_THRESHOLD:
+            # Low confidence - fallback to Gemini AI for better accuracy
+            if self._gemini_service:
+                LOG.info(
+                    "🔄 [Hybrid] Low confidence score %.2f < %.2f for '%s - %s', using Gemini AI fallback",
+                    heuristic_score,
+                    LOW_CONFIDENCE_THRESHOLD,
+                    artist,
+                    title,
+                )
+                gemini_track = await self.resolve_track_with_gemini(
+                    artist, title, expected_duration_ms=expected_duration_ms
+                )
+                if gemini_track:
+                    return gemini_track
+                # Gemini failed, use heuristic result as fallback
+                LOG.warning(
+                    "⚠️ [Hybrid] Gemini failed, using low-confidence heuristic result (score=%.2f)",
+                    heuristic_score,
+                )
+            else:
+                LOG.debug(
+                    "[Hybrid] Low confidence score %.2f but Gemini not available, using heuristic result",
+                    heuristic_score,
+                )
+
+        # High confidence or Gemini unavailable - use heuristic result
         metadata = self._extract_track_metadata(track_obj)
         youtube_id_val = metadata["youtube_id"]
         url_val = metadata["url"]
@@ -395,6 +442,261 @@ class TrackResolver:
                 },
             )
         return track_obj
+
+    async def ban_track(
+        self,
+        artist: str,
+        title: str,
+        youtube_id: str,
+        channel_name: str,
+        video_title: str,
+    ) -> None:
+        """
+        Ban a specific YouTube video for a given artist/title combination.
+        This prevents it from being selected again in future resolutions.
+        """
+        key = (artist.strip().lower(), title.strip().lower())
+        if key not in self._banned_tracks:
+            self._banned_tracks[key] = []
+
+        ban_entry = (youtube_id, channel_name, video_title)
+        if ban_entry not in self._banned_tracks[key]:
+            self._banned_tracks[key].append(ban_entry)
+            LOG.info(
+                "🚫 [BAN] Banned YouTube video for future resolutions: artist='%s', title='%s', youtube_id='%s', channel='%s'",
+                artist,
+                title,
+                youtube_id,
+                channel_name,
+            )
+
+    async def resolve_track_with_gemini(
+        self,
+        artist: str,
+        title: str,
+        *,
+        expected_duration_ms: Optional[int] = None,
+    ) -> Optional[Any]:
+        """
+        Resolve track using Gemini AI to intelligently select the best match.
+        This is more expensive but produces better results for ambiguous cases.
+        Used when user reports low quality on a track.
+        """
+        artist = artist.strip()
+        title = title.strip()
+        if not artist or not title:
+            return None
+
+        if not self._gemini_service:
+            LOG.warning(
+                "[Gemini Resolution] Gemini service not available, falling back to heuristic search"
+            )
+            return await self.resolve_track(
+                artist,
+                title,
+                expected_duration_ms=expected_duration_ms,
+                prefer_cache=False,
+            )
+
+        LOG.info(
+            "🤖 [Gemini Resolution] Using AI-powered search for '%s' by '%s'",
+            title,
+            artist,
+        )
+
+        # Get search results from Pomice (up to 15 candidates for Gemini to analyze)
+        node = await self._get_node()
+        if not node:
+            return None
+
+        search_query = f"{artist} {title}"
+        try:
+            search_results = await node.get_tracks(
+                query=f"ytsearch:{search_query}", ctx=None
+            )
+        except Exception as e:
+            LOG.error(f"Pomice search failed: {e}")
+            return None
+
+        if not search_results:
+            return None
+
+        # Filter out banned tracks
+        ban_key = (artist.lower(), title.lower())
+        banned_ids = set()
+        if ban_key in self._banned_tracks:
+            banned_ids = {entry[0] for entry in self._banned_tracks[ban_key]}
+
+        # Collect candidate info for Gemini
+        candidates = []
+        for idx, track in enumerate(search_results[:15]):  # Analyze top 15
+            metadata = self._extract_track_metadata(track)
+            youtube_id = metadata.get("youtube_id", "")
+
+            # Skip banned tracks
+            if youtube_id in banned_ids:
+                LOG.debug(
+                    "[Gemini Resolution] Skipping banned track: youtube_id=%s, channel=%s",
+                    youtube_id,
+                    metadata.get("channel_name"),
+                )
+                continue
+
+            candidates.append(
+                {
+                    "index": idx,
+                    "video_title": metadata.get("title", ""),
+                    "channel_name": metadata.get("channel_name", ""),
+                    "duration_ms": metadata.get("duration_ms", 0),
+                    "verified": metadata.get("verified", False),
+                    "view_count": metadata.get("view_count", 0),
+                    "track_obj": track,
+                }
+            )
+
+        if not candidates:
+            LOG.warning(
+                "[Gemini Resolution] No valid candidates after filtering banned tracks"
+            )
+            return None
+
+        # Build Gemini prompt
+        prompt = self._build_gemini_selection_prompt(
+            artist=artist,
+            title=title,
+            expected_duration_ms=expected_duration_ms,
+            candidates=candidates,
+        )
+
+        # Query Gemini for best match
+        try:
+            response = await self._gemini_service.query_gemini(prompt)
+            selected_index = self._parse_gemini_selection(response, len(candidates))
+
+            if selected_index is None:
+                LOG.warning(
+                    "[Gemini Resolution] Failed to parse Gemini response, falling back to heuristic"
+                )
+                # Fallback to first non-banned candidate
+                selected_index = 0
+
+            selected_candidate = candidates[selected_index]
+            track_obj = selected_candidate["track_obj"]
+
+            # Extract metadata and cache the result
+            metadata = self._extract_track_metadata(track_obj)
+
+            LOG.info(
+                "✅ [Gemini Resolution] Selected: '%s' from '%s' (verified=%s, index=%d/%d)",
+                selected_candidate["video_title"],
+                selected_candidate["channel_name"],
+                selected_candidate["verified"],
+                selected_index + 1,
+                len(candidates),
+            )
+
+            # Cache the Gemini-selected mapping (with high confidence score)
+            entry = MappingEntry(
+                artist=artist,
+                title=title,
+                youtube_id=metadata.get("youtube_id", ""),
+                track_identifier=getattr(track_obj, "identifier", None),
+                track_title=metadata.get("title", ""),
+                channel_name=metadata.get("channel_name", ""),
+                duration_ms=metadata.get("duration_ms"),
+                verified=metadata.get("verified", False),
+                heuristic_score=10.0,  # High score for Gemini selection
+                title_similarity=1.0,
+                artist_similarity=1.0,
+                channel_similarity=1.0,
+                engagement_score=1.0,
+                duration_score=1.0,
+                content_penalty=0.0,
+                spam_penalty=0.0,
+                spam_flags=[],
+                search_rank=selected_index,
+                heuristic_version=3,  # Version 3 = Gemini-powered
+            )
+            await self._cache.set_mapping(artist, title, entry)
+
+            return track_obj
+
+        except Exception as e:
+            LOG.error(
+                f"[Gemini Resolution] Error during AI selection: {e}", exc_info=True
+            )
+            # Fallback to heuristic
+            return await self.resolve_track(
+                artist,
+                title,
+                expected_duration_ms=expected_duration_ms,
+                prefer_cache=False,
+            )
+
+    def _build_gemini_selection_prompt(
+        self,
+        artist: str,
+        title: str,
+        expected_duration_ms: Optional[int],
+        candidates: List[Dict[str, Any]],
+    ) -> str:
+        """Build a prompt for Gemini to select the best matching video."""
+        duration_str = ""
+        if expected_duration_ms:
+            duration_sec = expected_duration_ms / 1000
+            duration_str = f"\nExpected duration: {duration_sec:.0f} seconds"
+
+        candidates_str = ""
+        for i, cand in enumerate(candidates):
+            duration_sec = cand["duration_ms"] / 1000 if cand["duration_ms"] else 0
+            verified_marker = "✓" if cand["verified"] else ""
+            candidates_str += f"\n{i}. \"{cand['video_title']}\" by \"{cand['channel_name']}\" {verified_marker}| Duration: {duration_sec:.0f}s | Views: {cand['view_count']:,}"
+
+        prompt = f"""You are a music track matching expert. Select the BEST YouTube video that matches the requested track.
+
+Requested Track:
+Artist: "{artist}"
+Title: "{title}"{duration_str}
+
+Available YouTube Videos:{candidates_str}
+
+Instructions:
+1. Find the video that BEST matches the artist and title (1:1 match preferred)
+2. Prefer verified channels (marked with ✓) and official uploads
+3. Avoid covers, remixes, nightcore, slowed versions, live performances unless specifically requested
+4. Match duration if provided
+5. Prefer channels matching the artist name or official labels (VEVO, Topic, Records)
+
+Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No explanation needed."""
+
+        return prompt
+
+    def _parse_gemini_selection(self, response: str, max_index: int) -> Optional[int]:
+        """Parse Gemini's response to extract the selected index."""
+        if not response:
+            return None
+
+        # Try to extract number from response
+        response = response.strip()
+
+        # Try direct parsing
+        try:
+            index = int(response)
+            if 0 <= index < max_index:
+                return index
+        except ValueError:
+            pass
+
+        # Try to find first number in response
+        import re
+
+        match = re.search(r"\b(\d+)\b", response)
+        if match:
+            index = int(match.group(1))
+            if 0 <= index < max_index:
+                return index
+
+        return None
 
     async def validate_pomice_path(self) -> bool:
         node = await self._get_node()
@@ -508,7 +810,7 @@ class TrackResolver:
         if not node:
             return None
 
-        query = f"ytmsearch: {artist} {title}"
+        query = f"ytsearch: {artist} {title}"
         try:
             results = await node.get_tracks(query)
         except Exception as exc:
@@ -519,6 +821,12 @@ class TrackResolver:
             LOG.debug("No Pomice results for %s", query)
             return None
 
+        # Get banned tracks for this artist/title combination
+        ban_key = (artist.strip().lower(), title.strip().lower())
+        banned_ids = set()
+        if ban_key in self._banned_tracks:
+            banned_ids = {entry[0] for entry in self._banned_tracks[ban_key]}
+
         best_track: Optional[Any] = None
         best_score = float("-inf")
         best_features: Optional[Dict[str, Any]] = None
@@ -526,7 +834,6 @@ class TrackResolver:
         fallback_track: Optional[Any] = None
         fallback_score = float("-inf")
         fallback_features: Optional[Dict[str, Any]] = None
-
         features_by_id: Dict[int, Dict[str, Any]] = {}
 
         duration_target = expected_duration_ms or 0
@@ -535,6 +842,17 @@ class TrackResolver:
 
         for index, candidate in enumerate(results):
             metadata = self._extract_track_metadata(candidate)
+
+            # Skip banned tracks
+            youtube_id = metadata.get("youtube_id", "")
+            if youtube_id in banned_ids:
+                if LOG.isEnabledFor(logging.DEBUG):
+                    LOG.debug(
+                        "🚫 [Search] Skipping banned track: youtube_id=%s, channel=%s",
+                        youtube_id,
+                        metadata.get("channel_name"),
+                    )
+                continue
 
             candidate_title_raw = (
                 getattr(candidate, "title", None) or metadata.get("title") or ""
@@ -623,17 +941,44 @@ class TrackResolver:
             )
             return fallback_track, fallback_features
 
+        # Phase 6: Final Failure - Use highest engagement as last resort
         if results:
-            first_track = results[0]
-            first_metadata = self._extract_track_metadata(first_track)
-            LOG.warning(
-                "⚠️ No valid candidates found for '%s - %s', using first result as last resort (channel='%s', views=%d)",
-                artist,
-                title,
-                first_metadata.get("channel_name", "Unknown"),
-                first_metadata.get("view_count", 0),
-            )
-            return first_track, features_by_id.get(id(first_track), {})
+            # Find track with highest engagement score
+            best_engagement_track = None
+            best_engagement_score = 0.0
+            best_engagement_features = None
+
+            for candidate in results:
+                metadata = self._extract_track_metadata(candidate)
+                # Calculate simple engagement score based on views and subs
+                view_count = metadata.get("view_count", 0)
+                subscriber_count = metadata.get("subscriber_count", 0)
+
+                engagement = 0.0
+                if view_count > 0:
+                    engagement += math.log10(view_count + 1) / 7.0
+                if subscriber_count > 0:
+                    engagement += math.log10(subscriber_count + 1) / 6.0
+
+                if engagement > best_engagement_score:
+                    best_engagement_score = engagement
+                    best_engagement_track = candidate
+                    best_engagement_features = features_by_id.get(id(candidate), {})
+
+            if best_engagement_track:
+                engagement_metadata = self._extract_track_metadata(
+                    best_engagement_track
+                )
+                LOG.warning(
+                    "⚠️ No valid candidates found for '%s - %s', using highest engagement as last resort (channel='%s', views=%d, subs=%d, engagement=%.2f)",
+                    artist,
+                    title,
+                    engagement_metadata.get("channel_name", "Unknown"),
+                    engagement_metadata.get("view_count", 0),
+                    engagement_metadata.get("subscriber_count", 0),
+                    best_engagement_score,
+                )
+                return best_engagement_track, best_engagement_features or {}
 
         return None
 
@@ -666,11 +1011,11 @@ class TrackResolver:
 
         # Check for track numbers: "- 2 -", "Track 2", "Pt. 2", etc.
         track_number_patterns = [
-            r"\s-\s\d+\s-\s",  # " - 2 - "
-            r"\strack\s*\d+",  # "Track 2" or "track2"
-            r"\s#\d+",  # " #2"
-            r"\spt\.?\s*\d+",  # "Pt. 2" or "pt2"
-            r"\s\d+\s*of\s*\d+",  # "2 of 12"
+            r"\s-\s\d+\s-\s",
+            r"\strack\s*\d+",
+            r"\s#\d+",
+            r"\spt\.?\s*\d+",
+            r"\s\d+\s*of\s*\d+",
         ]
 
         for pattern in track_number_patterns:
@@ -714,8 +1059,6 @@ class TrackResolver:
         )
 
         # Apply stricter artist matching when title has track numbers or extra parts
-        # This prevents matching wrong tracks like "An Endless Sporadic - Impulse - 2"
-        # when looking for "Tanger - IMPULSE!"
         if title_part_penalty > 0.0:
             # Require higher artist similarity threshold
             if artist_similarity < 0.75:

@@ -1082,9 +1082,16 @@ class PlayerControlView(View):
             return
 
         track_title = current_entry.get("title", "Unknown")
+        track_artist = current_entry.get("author", "Unknown")
 
-        # Mark as low quality and record negative feedback
-        # This should skip the track AND negatively affect the algorithm
+        # Get YouTube video info for banning
+        track_obj = current_entry.get("track")
+        youtube_id = getattr(track_obj, "identifier", None) if track_obj else None
+        video_title = (
+            getattr(track_obj, "title", track_title) if track_obj else track_title
+        )
+
+        # Mark as low quality and trigger Gemini-powered re-resolution
         try:
             # Record quality issue feedback to V2 engine
             if (
@@ -1092,32 +1099,46 @@ class PlayerControlView(View):
                 and self.player._lastfm_autoplay
                 and self.player._lastfm_autoplay.is_available()
             ):
-                # Record as quality_issue with very low progress (strong negative signal)
-                await self.player._lastfm_autoplay.record_playback_feedback(
-                    guild_id=self.guild_id,
-                    artist=current_entry.get("author", "Unknown"),
-                    title=track_title,
-                    progress_ratio=0.05,  # Very early skip = strong dislike signal
-                    feedback_type="quality_issue",
-                    user_id=member.id,
+                # Ban the current YouTube video
+                if youtube_id and hasattr(
+                    self.player._lastfm_autoplay._engine, "_track_resolver"
+                ):
+                    resolver = self.player._lastfm_autoplay._engine._track_resolver
+                    await resolver.ban_track(
+                        artist=track_artist,
+                        title=track_title,
+                        youtube_id=youtube_id,
+                        channel_name=track_artist,
+                        video_title=video_title,
+                    )
+
+                # Clear the cache mapping
+                await self.player._lastfm_autoplay._engine._cache.delete_mapping(
+                    track_artist, track_title
                 )
 
-                # Also mark for cache invalidation to trigger refetch
-                # This will force the resolver to find a better match next time
-                track_id = self.player._lastfm_autoplay._track_id(
-                    current_entry.get("author", "Unknown"), track_title
-                )
-                # Clear the mapping from cache to force re-resolution
+                # Immediately trigger Gemini-powered re-resolution
                 if hasattr(self.player._lastfm_autoplay._engine, "_track_resolver"):
                     resolver = self.player._lastfm_autoplay._engine._track_resolver
-                    if hasattr(resolver, "_cache_manager"):
-                        cache_mgr = resolver._cache_manager
-                        # Remove the bad mapping so it gets refetched with better heuristics
-                        await cache_mgr.delete_mapping(
-                            current_entry.get("author", "Unknown"), track_title
-                        )
+                    expected_duration = current_entry.get("length")
+
+                    LOG.info(
+                        f"🤖 [LowQuality] Triggering Gemini-powered re-resolution for '{track_title}' by '{track_artist}'"
+                    )
+
+                    new_track = await resolver.resolve_track_with_gemini(
+                        artist=track_artist,
+                        title=track_title,
+                        expected_duration_ms=expected_duration,
+                    )
+
+                    if new_track:
                         LOG.info(
-                            f"[LowQuality] Cleared cache mapping for '{track_title}' by '{current_entry.get('author')}' - will refetch"
+                            f"✅ [LowQuality] Gemini found better match: {getattr(new_track, 'title', 'Unknown')}"
+                        )
+                    else:
+                        LOG.warning(
+                            f"⚠️ [LowQuality] Gemini failed to find alternative for '{track_title}'"
                         )
 
             self._feedback_votes[member.id] = "low_quality"
@@ -1126,7 +1147,7 @@ class PlayerControlView(View):
             if vc and hasattr(vc, "stop"):
                 await vc.stop()
                 await interaction.followup.send(
-                    f"⚠️ **{member.display_name}** reported low quality on **{track_title}** → skipped & marked for better resolution",
+                    f"🤖 **{member.display_name}** reported low quality on **{track_title}** → using AI to find better match & skipped",
                     ephemeral=False,
                 )
             else:
@@ -1134,7 +1155,7 @@ class PlayerControlView(View):
                     "❌ Unable to skip track", ephemeral=True
                 )
         except Exception as e:
-            LOG.error(f"Failed to process low quality report: {e}")
+            LOG.error(f"Failed to process low quality report: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ Failed to process quality report", ephemeral=True
             )
