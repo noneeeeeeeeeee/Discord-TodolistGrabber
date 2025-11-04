@@ -337,7 +337,7 @@ def cleanup_root_directory(whitelist):
     """
     project_root = ROOT_DIR
     max_retries = 5
-    retry_delay = 2  # seconds
+    retry_delay = 2
 
     try:
         print_progress("Cleanup", "Starting cleanup process...")
@@ -469,7 +469,7 @@ def update_dependencies():
         )
         # Ensure Pomice is available (Lavalink client)
         try:
-            import pomice  # noqa: F401
+            import pomice
         except Exception:
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", "-U", "pomice>=2.9.2"]
@@ -576,7 +576,7 @@ def stop_lavalink_process():
             subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"], check=False)
 
         # Wait for processes to actually exit
-        max_wait = 15  # seconds
+        max_wait = 15
         for attempt in range(max_wait):
             time.sleep(1)
             # Re-check if Lavalink is still running
@@ -781,7 +781,7 @@ def perform_ota_update():
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
         print_progress("Post-Cleanup", "Temporary files removed.")
 
-        # Update Dependencies (AFTER files are updated)
+        # Update Dependencies
         update_dependencies()
 
         # Start the bot
@@ -800,13 +800,19 @@ def perform_ota_update():
             start_kwargs["start_new_session"] = True
 
         try:
-            subprocess.Popen([python_executable, main_script], **start_kwargs)
+            if os.name == "nt":
+                subprocess.Popen(
+                    ["start", "cmd", "/k", python_executable, main_script],
+                    shell=True,
+                    cwd=ROOT_DIR,
+                )
+            else:
+                subprocess.Popen([python_executable, main_script], **start_kwargs)
             print_progress("Process", "Bot started successfully.")
         except Exception as e:
             log_error("Process", "Failed to start bot process.", e)
             raise
         print("<<<---OTA Update completed successfully. The bot will now start.--->>>")
-        # Exit updater
         time.sleep(5)
         sys.exit(0)
     except Exception as e:
