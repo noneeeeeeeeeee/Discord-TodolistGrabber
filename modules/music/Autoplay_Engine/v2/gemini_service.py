@@ -121,9 +121,30 @@ class GeminiService:
 
         artist = str(payload.get("artist", "")).strip()
         title = str(payload.get("title", "")).strip()
-        if artist and title:
-            return {"artist": artist, "title": title}
-        return None
+        if not (artist and title):
+            return None
+
+        # Extract and validate track_type
+        track_type = str(payload.get("track_type", "music")).strip().lower()
+        if track_type not in {"music", "ost", "game_soundtrack", "anime_opening"}:
+            track_type = "music"
+
+        # Extract primary_entity (only valid if track_type is NOT "music")
+        primary_entity = None
+        if track_type != "music":
+            raw_entity = payload.get("primary_entity")
+            if raw_entity and isinstance(raw_entity, str):
+                primary_entity = raw_entity.strip() or None
+            # If OST but no entity, fallback to "music"
+            if not primary_entity:
+                track_type = "music"
+
+        return {
+            "artist": artist,
+            "title": title,
+            "track_type": track_type,
+            "primary_entity": primary_entity,
+        }
 
     async def classify_mood_vector(
         self,
@@ -724,11 +745,13 @@ class GeminiService:
         return (
             "You are a music metadata parser.\n"
             "Your task: Extract the performing artist (or primary creator), the song title, "
-            "and any featuring artist(s) from a given YouTube video title and channel name.\n"
+            "track type, and any franchise entity from a given YouTube video title and channel name.\n"
             "Respond **only** with a compact JSON object with keys:\n"
             '- "artist": string\n'
             '- "title": string\n'
-            '- "featuring_artists": array of strings (can be empty)\n\n'
+            '- "featuring_artists": array of strings (can be empty)\n'
+            '- "track_type": string (one of: "music", "ost", "game_soundtrack", "anime_opening")\n'
+            '- "primary_entity": string or null (franchise/show/game name if this is OST content)\n\n'
             "Input:\n"
             f'YouTube Title: "{raw_title}"\n'
             f'Channel Name: "{channel_name}"\n\n'
@@ -740,26 +763,34 @@ class GeminiService:
             '"–", "—", ":", "|". Use the first such clear separator **if** the text '
             "before it is plausibly an artist name rather than a franchise/show/series.\n"
             "3. **Distinguish franchise or show names**: If the title begins with a known series, "
-            'show, game, or franchise name (for example "MURDER DRONES", "FNAF", "Hazbin Hotel", etc.), '
+            'show, game, or franchise name (for example "MURDER DRONES", "FNAF", "Hazbin Hotel", '
+            '"Undertale", "Jujutsu Kaisen", "Attack on Titan", etc.), '
             'treat that part as *non-artist (series/franchise)*. Do not assign it as the "artist". '
-            "Instead, proceed to identify the artist via the channel or metadata.\n"
-            "4. **Channel name as potential artist**:\n"
+            'Instead, set "track_type" appropriately and "primary_entity" to the franchise name.\n'
+            "4. **Track type classification**:\n"
+            '   - "music": Standard music track (artist is a musical performer/band)\n'
+            '   - "ost": Original soundtrack from a TV show or movie (e.g., Hazbin Hotel, MURDER DRONES)\n'
+            '   - "game_soundtrack": Video game music (e.g., Undertale, FNAF)\n'
+            '   - "anime_opening": Anime opening/ending theme (e.g., Jujutsu Kaisen, Attack on Titan)\n'
+            "5. **Primary entity**: If track_type is NOT 'music', extract the franchise/show/game name "
+            '(e.g., "Hazbin Hotel", "Undertale", "Jujutsu Kaisen"). Otherwise set to null.\n'
+            "6. **Channel name as potential artist**:\n"
             '   - If the channel name is clearly a music creator or publisher (e.g., "GLITCH", '
             '"The Living Tombstone"), it may serve as the "artist".\n'
             "   - If the channel name is a generic label, publisher, or a show/series channel "
             "(not performing artist), you should still examine the title to find a performing artist.\n"
-            '5. **Featuring artists**: Look for markers like "ft.", "feat.", "featuring", "with" '
+            '7. **Featuring artists**: Look for markers like "ft.", "feat.", "featuring", "with" '
             'in the title. Extract the names following these markers into the "featuring_artists" array. '
             "The main artist remains the primary one identified earlier.\n"
-            "6. **Ambiguous cases**:\n"
+            "8. **Ambiguous cases**:\n"
             "   - If you cannot confidently identify a separate artist in the title, then use the "
             'channel name as "artist".\n'
             "   - If both the channel and the title suggest different possible artists, prefer the "
             "musical creator (rather than a franchise/title).\n"
-            "7. **Song title extraction**: After removing artist parts and descriptors, what remains "
+            "9. **Song title extraction**: After removing artist parts and descriptors, what remains "
             'is the "title". Clean up extra whitespace, correct apostrophes or stylization where '
             "obvious, but don't alter meaning.\n"
-            "8. **Return format**: Exactly one JSON object (no additional commentary).\n\n"
+            "10. **Return format**: Exactly one JSON object (no additional commentary).\n\n"
             "Example:\n"
             "Input:\n"
             "YouTube Title: \"MURDER DRONES – FIGHT TIL' I'M GOOD ENOUGH (ft. The Living Tombstone) "
@@ -769,7 +800,21 @@ class GeminiService:
             "{\n"
             '  "artist": "GLITCH",\n'
             '  "title": "Fight Til I\'m Good Enough",\n'
-            '  "featuring_artists": ["The Living Tombstone"]\n'
+            '  "featuring_artists": ["The Living Tombstone"],\n'
+            '  "track_type": "ost",\n'
+            '  "primary_entity": "MURDER DRONES"\n'
+            "}\n\n"
+            "Example 2:\n"
+            "Input:\n"
+            'YouTube Title: "Imagine Dragons - Believer (Official Music Video)"\n'
+            'Channel Name: "ImagineDragonsVEVO"\n\n'
+            "Output:\n"
+            "{\n"
+            '  "artist": "Imagine Dragons",\n'
+            '  "title": "Believer",\n'
+            '  "featuring_artists": [],\n'
+            '  "track_type": "music",\n'
+            '  "primary_entity": null\n'
             "}\n\n"
             "Now parse the provided input and return JSON only."
         )

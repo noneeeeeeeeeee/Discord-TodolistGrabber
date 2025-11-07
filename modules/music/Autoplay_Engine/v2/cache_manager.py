@@ -164,6 +164,8 @@ class ParsingEntry:
     title: str
     confidence: float
     parsed_at: float
+    track_type: str = "music"  # "music", "ost", "game_soundtrack", "anime_opening"
+    primary_entity: Optional[str] = None  # Franchise/show/game name for OST content
 
     def is_expired(self, ttl_seconds: float) -> bool:
         return (time.time() - self.parsed_at) > ttl_seconds
@@ -173,11 +175,27 @@ class ParsingEntry:
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "ParsingEntry":
+        # Backward compatibility: default to "music" if track_type missing
+        track_type = payload.get("track_type", "music")
+        if not isinstance(track_type, str) or track_type not in {
+            "music",
+            "ost",
+            "game_soundtrack",
+            "anime_opening",
+        }:
+            track_type = "music"
+
         return cls(
             artist=str(payload.get("artist", "")),
             title=str(payload.get("title", "")),
             confidence=float(payload.get("confidence", 0.0) or 0.0),
             parsed_at=float(payload.get("parsed_at", 0.0)),
+            track_type=track_type,
+            primary_entity=(
+                str(payload["primary_entity"]).strip()
+                if payload.get("primary_entity")
+                else None
+            ),
         )
 
 

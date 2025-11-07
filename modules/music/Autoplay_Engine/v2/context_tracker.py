@@ -22,7 +22,7 @@ LOG = logging.getLogger(__name__)
 
 @dataclass
 class PlayedTrack:
-    """Record of a played track with context"""
+    """Record of a played track with context and multi-user feedback"""
 
     track_id: str
     artist: str
@@ -35,7 +35,21 @@ class PlayedTrack:
     timestamp: float
     was_skipped: bool
     skip_type: Optional[str]  # "hard", "medium", "soft", or None
-    progress_ratio: float  # 0.0 to 1.0
+    progress_ratio: float
+
+    # Multi-user feedback fields
+    num_likes: int = 0
+    num_dislikes: int = 0
+    num_active_listeners: int = 1
+    consensus_signal: str = "neutral"  # "liked", "disliked", "weak_like", "neutral"
+    recency_weight: float = (
+        1.0  # Temporal weighting (1.0 = most recent, decays with age)
+    )
+    energy: Optional[float] = None  # Track energy for energy curve tracking
+
+    # OST-Aware fields (Phase 0.5)
+    track_type: str = "music"  # "music", "ost", "game_soundtrack", "anime_opening"
+    primary_entity: Optional[str] = None  # Franchise/show/game name for OST content
 
 
 @dataclass
@@ -50,9 +64,18 @@ class SessionContext:
     songs_since_novelty: int  # Counter for exploration timing
     session_start: float
     last_activity: float
-    disliked_tags: Dict[str, float] = field(
-        default_factory=dict
-    )  # Tags from skipped tracks with penalties
+    disliked_tags: Dict[str, float] = field(default_factory=dict)
+
+    # Enhanced context for temporal weighting and safe anchor
+    liked_mood_vector: Optional[List[float]] = (
+        None  # Weighted average of explicitly liked tracks
+    )
+    artist_diversity_pool: List[str] = field(
+        default_factory=list
+    )  # For enforcing max 3 per artist
+    energy_trend: float = (
+        0.0  # Rising/falling energy across last 3 tracks (-1.0 to 1.0)
+    )
 
 
 class ContextTracker:
@@ -85,6 +108,55 @@ class ContextTracker:
 
         LOG.info("🎯 [ContextTracker] Initialized (window=%d tracks)", history_size)
 
+    @staticmethod
+    def _calculate_consensus_signal(
+        num_likes: int, num_dislikes: int, num_active_listeners: int
+    ) -> str:
+        """
+        Calculate consensus signal from multi-user feedback.
+
+        This is for CLASSIFICATION only. Safe Anchor and Fast Rollback use
+        different, looser filters (num_likes > 0 and dislike_ratio >= 0.4).
+
+        Logic:
+        - Solo (n=1): any like='liked', any dislike='disliked'
+        - Multi: like_ratio>=0.5='liked', dislike_ratio>=0.4='disliked',
+                 likes>dislikes='weak_like', else='neutral'
+
+        Args:
+            num_likes: Count of like reactions
+            num_dislikes: Count of dislike reactions
+            num_active_listeners: Total active (non-AFK) listeners
+
+        Returns:
+            Consensus signal: "liked", "disliked", "weak_like", or "neutral"
+        """
+        if num_active_listeners == 0:
+            return "neutral"
+
+        # Solo listener (n=1): definitive signal
+        if num_active_listeners == 1:
+            if num_likes > 0:
+                return "liked"
+            elif num_dislikes > 0:
+                return "disliked"
+            else:
+                return "neutral"
+
+        # Multi-user: calculate ratios
+        like_ratio = num_likes / num_active_listeners
+        dislike_ratio = num_dislikes / num_active_listeners
+
+        # Strong consensus thresholds
+        if like_ratio >= 0.5:
+            return "liked"
+        elif dislike_ratio >= 0.4:
+            return "disliked"
+        elif num_likes > num_dislikes and num_likes > 0:
+            return "weak_like"
+        else:
+            return "neutral"
+
     def record_play(
         self,
         *,
@@ -97,6 +169,11 @@ class ContextTracker:
         was_skipped: bool = False,
         skip_type: Optional[str] = None,
         progress_ratio: float = 1.0,
+        num_likes: int = 0,
+        num_dislikes: int = 0,
+        num_active_listeners: int = 1,
+        track_type: str = "music",
+        primary_entity: Optional[str] = None,
     ) -> None:
         """
         Record a played track in the history.
@@ -111,8 +188,32 @@ class ContextTracker:
             was_skipped: Whether track was skipped
             skip_type: If skipped, type: "hard", "medium", or "soft"
             progress_ratio: How much of track was played (0.0-1.0)
+            num_likes: Count of like reactions
+            num_dislikes: Count of dislike reactions
+            num_active_listeners: Total active (non-AFK) listeners
+            track_type: Track classification (music/ost/game_soundtrack/anime_opening)
+            primary_entity: Franchise/show/game name for OST content
         """
         now = datetime.now().timestamp()
+
+        # Calculate consensus signal
+        consensus_signal = self._calculate_consensus_signal(
+            num_likes, num_dislikes, num_active_listeners
+        )
+
+        # Calculate recency weight based on position in history
+        history_position = len(self._history)
+        recency_weight = max(0.3, 1.0 - (history_position * 0.05))
+
+        # Extract energy from mood_vector if available
+        energy = None
+        if mood_vector:
+            if isinstance(mood_vector, dict):
+                vec = mood_vector.get("vector")
+                if vec and len(vec) > 0:
+                    energy = vec[0]  # First dimension is typically energy
+            elif isinstance(mood_vector, (list, tuple)) and len(mood_vector) > 0:
+                energy = mood_vector[0]
 
         played = PlayedTrack(
             track_id=track_id,
@@ -125,6 +226,14 @@ class ContextTracker:
             was_skipped=was_skipped,
             skip_type=skip_type,
             progress_ratio=progress_ratio,
+            num_likes=num_likes,
+            num_dislikes=num_dislikes,
+            num_active_listeners=num_active_listeners,
+            consensus_signal=consensus_signal,
+            recency_weight=recency_weight,
+            energy=energy,
+            track_type=track_type,
+            primary_entity=primary_entity,
         )
 
         self._history.append(played)
@@ -137,12 +246,17 @@ class ContextTracker:
 
         if self._verbose >= 1:
             status = "⏭️ skipped" if was_skipped else "✅ finished"
+            feedback_str = (
+                f"👍{num_likes} 👎{num_dislikes}" if num_active_listeners > 1 else ""
+            )
             LOG.info(
-                "📊 [Context] Recorded: '%s' by '%s' (%s, %.0f%% played) | History: %d tracks",
+                "📊 [Context] Recorded: '%s' by '%s' (%s, %.0f%% played, consensus=%s %s) | History: %d tracks",
                 title,
                 artist,
                 status,
                 progress_ratio * 100,
+                consensus_signal,
+                feedback_str,
                 len(self._history),
             )
 
@@ -163,41 +277,112 @@ class ContextTracker:
                 songs_since_novelty=self._songs_since_novelty,
                 session_start=self._session_start,
                 last_activity=self._last_activity,
+                liked_mood_vector=None,
+                artist_diversity_pool=[],
+                energy_trend=0.0,
             )
 
-        # Focus genres: most common genres (mode)
-        all_genres = [g for track in self._history for g in track.genres]
-        genre_counts = Counter(all_genres)
-        focus_genres = [g for g, _ in genre_counts.most_common(3)]
+        # ============================================================
+        # Enhanced Context Tracker with Temporal Weighting
+        # ============================================================
 
-        # Current mood vector: average of recent moods
-        # mood_vector can be either a dict with 'vector' key or a list
+        # Calculate temporal recency weights for all tracks
+        # Most recent track = 1.0, oldest track = 0.3 (minimum)
+        recency_weights = []
+        for idx in range(len(self._history)):
+            position_from_recent = len(self._history) - 1 - idx
+            weight = max(0.3, 1.0 - (position_from_recent * 0.05))
+            recency_weights.append(weight)
+
+        # Focus genres: most common genres with temporal weighting
+        genre_weights: Dict[str, float] = {}
+        for idx, track in enumerate(self._history):
+            weight = recency_weights[idx]
+            for genre in track.genres:
+                genre_lower = genre.lower()
+                if genre_lower in genre_weights:
+                    genre_weights[genre_lower] += weight
+                else:
+                    genre_weights[genre_lower] = weight
+
+        # Sort by weighted count and take top 3
+        focus_genres = [
+            g
+            for g, _ in sorted(genre_weights.items(), key=lambda x: x[1], reverse=True)[
+                :3
+            ]
+        ]
+
+        # Current mood vector: weighted average with temporal weighting
         mood_vectors = []
-        for t in self._history:
+        mood_weights = []
+        for idx, t in enumerate(self._history):
             if t.mood_vector:
                 if isinstance(t.mood_vector, dict):
                     vec = t.mood_vector.get("vector")
                     if vec:
                         mood_vectors.append(vec)
+                        mood_weights.append(recency_weights[idx])
                 elif isinstance(t.mood_vector, (list, tuple)):
                     mood_vectors.append(t.mood_vector)
+                    mood_weights.append(recency_weights[idx])
 
         current_mood = None
-        if mood_vectors:
-            # Average each dimension
+        if mood_vectors and mood_weights:
+            # Weighted average each dimension
             dim_count = len(mood_vectors[0])
+            total_weight = sum(mood_weights)
             current_mood = [
-                sum(v[i] for v in mood_vectors) / len(mood_vectors)
+                sum(v[i] * w for v, w in zip(mood_vectors, mood_weights)) / total_weight
                 for i in range(dim_count)
             ]
+
+        # Task 2.2: Safe Anchor - liked_mood_vector
+        # Filter tracks with ANY likes (num_likes > 0), not just consensus='liked'
+        liked_tracks = [
+            (idx, t) for idx, t in enumerate(self._history) if t.num_likes > 0
+        ]
+
+        liked_mood_vector = None
+        if liked_tracks:
+            liked_mood_vectors = []
+            liked_mood_weights = []
+            for idx, track in liked_tracks:
+                if track.mood_vector:
+                    if isinstance(track.mood_vector, dict):
+                        vec = track.mood_vector.get("vector")
+                        if vec:
+                            liked_mood_vectors.append(vec)
+                            liked_mood_weights.append(recency_weights[idx])
+                    elif isinstance(track.mood_vector, (list, tuple)):
+                        liked_mood_vectors.append(track.mood_vector)
+                        liked_mood_weights.append(recency_weights[idx])
+
+            if liked_mood_vectors and liked_mood_weights:
+                # Weighted average of liked tracks' moods
+                dim_count = len(liked_mood_vectors[0])
+                total_weight = sum(liked_mood_weights)
+                liked_mood_vector = [
+                    sum(
+                        v[i] * w for v, w in zip(liked_mood_vectors, liked_mood_weights)
+                    )
+                    / total_weight
+                    for i in range(dim_count)
+                ]
 
         # Recent artists (for diversity)
         recent_artists = {t.artist for t in self._history}
 
-        # Skip rate (last 10 tracks or full history if smaller)
-        recent_window = self._history[-10:]
-        skips = sum(1 for t in recent_window if t.was_skipped)
-        skip_rate = skips / len(recent_window) if recent_window else 0.0
+        # Skip rate (last 10 tracks with temporal weighting)
+        recent_window_size = min(10, len(self._history))
+        recent_window = self._history[-recent_window_size:]
+        recent_window_weights = recency_weights[-recent_window_size:]
+
+        weighted_skips = sum(
+            w for t, w in zip(recent_window, recent_window_weights) if t.was_skipped
+        )
+        total_weight = sum(recent_window_weights)
+        skip_rate = weighted_skips / total_weight if total_weight > 0 else 0.0
 
         # Consecutive skips (from end)
         consecutive_skips = 0
@@ -207,30 +392,56 @@ class ContextTracker:
             else:
                 break
 
-        # Track disliked tags from recently skipped tracks
+        # Task 2.3: Fast Rollback - disliked tags with temporal-weighted penalties
         disliked_tags: Dict[str, float] = {}
-        recent_skips = [
-            t for t in self._history[-10:] if t.was_skipped and t.progress_ratio < 0.5
-        ]  # Early skips
 
-        for track in recent_skips:
-            # Weight by how early the skip was (earlier skip = stronger dislike)
-            skip_weight = 1.0 - track.progress_ratio  # 0.0-1.0 (higher = earlier skip)
+        for idx, track in enumerate(self._history):
+            # Calculate dislike ratio for multi-user feedback
+            if track.num_active_listeners > 0:
+                dislike_ratio = track.num_dislikes / track.num_active_listeners
+            else:
+                dislike_ratio = 0.0
 
-            # Decay based on recency (more recent = stronger signal)
-            recency_idx = len(self._history) - 1 - self._history.index(track)
-            recency_weight = 1.0 / (1.0 + recency_idx * 0.1)  # Decay over distance
-
-            penalty = skip_weight * recency_weight * 0.5  # Scale to 0.0-0.5
-
-            for genre in track.genres:
-                genre_lower = genre.lower()
-                if genre_lower in disliked_tags:
-                    disliked_tags[genre_lower] = min(
-                        0.8, disliked_tags[genre_lower] + penalty
-                    )
+            # Apply penalty if: dislike_ratio >= 0.4 OR track was skipped
+            if dislike_ratio >= 0.4 or track.was_skipped:
+                # Penalty strength based on skip type or dislike ratio
+                if track.was_skipped:
+                    # Hard skip = stronger penalty, soft skip = weaker
+                    if track.skip_type == "hard":
+                        base_penalty = 0.8
+                    elif track.skip_type == "medium":
+                        base_penalty = 0.6
+                    else:  # soft or None
+                        base_penalty = 0.5
                 else:
-                    disliked_tags[genre_lower] = penalty
+                    # Dislike penalty scales with ratio
+                    base_penalty = 0.7 * min(1.0, dislike_ratio / 0.4)
+
+                # Apply temporal weighting (recent = stronger)
+                penalty = recency_weights[idx] * base_penalty
+
+                # Apply to all genres in this track
+                for genre in track.genres:
+                    genre_lower = genre.lower()
+                    if genre_lower in disliked_tags:
+                        # Accumulate penalties, cap at 0.9
+                        disliked_tags[genre_lower] = min(
+                            0.9, disliked_tags[genre_lower] + penalty
+                        )
+                    else:
+                        disliked_tags[genre_lower] = penalty
+
+        # Task 2.4: Energy Trend - calculate energy delta from last 3 tracks
+        energy_trend = 0.0
+        energy_values = []
+
+        for track in self._history[-3:]:  # Last 3 tracks
+            if track.energy is not None:
+                energy_values.append(track.energy)
+
+        if len(energy_values) >= 2:
+            # Energy trend = change from oldest to newest in window
+            energy_trend = energy_values[-1] - energy_values[0]
 
         context = SessionContext(
             focus_genres=focus_genres,
@@ -242,15 +453,20 @@ class ContextTracker:
             session_start=self._session_start,
             last_activity=self._last_activity,
             disliked_tags=disliked_tags,
+            liked_mood_vector=liked_mood_vector,
+            artist_diversity_pool=[],  # Will be populated in Phase 2
+            energy_trend=energy_trend,
         )
 
         if self._verbose >= 2:
             LOG.debug(
-                "🎯 [Context] Current state: genres=%s, skip_rate=%.2f, consecutive_skips=%d, artists=%d",
+                "🎯 [Context] Current state: genres=%s (weighted), skip_rate=%.2f (temporal), consecutive_skips=%d, artists=%d, liked_tracks=%d, energy_trend=%.2f",
                 focus_genres[:2],
                 skip_rate,
                 consecutive_skips,
                 len(recent_artists),
+                len(liked_tracks),
+                energy_trend,
             )
 
         return context
@@ -337,7 +553,7 @@ class ContextTracker:
 
         last_played = self.get_track_last_played(track_id)
         if last_played is None:
-            return 1.0  # Never played, no penalty
+            return 1.0
 
         # Calculate songs since last play
         songs_since = 0
@@ -347,12 +563,12 @@ class ContextTracker:
             songs_since += 1
 
         if songs_since == 0:
-            return 0.01  # Just played, heavy penalty
+            return 0.01
 
         # Exponential decay
         penalty = math.exp(-songs_since / tau)
 
-        return 1.0 - penalty  # Invert so 1.0 = no penalty
+        return 1.0 - penalty
 
     def get_stats(self) -> Dict:
         """Get diagnostic stats for observability commands."""

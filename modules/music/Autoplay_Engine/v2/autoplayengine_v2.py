@@ -150,17 +150,25 @@ class AutoplayEngineV2:
         cached = await self._cache.get_parsing(raw_title, channel_name)
         if cached:
             if self._verbose:
-                LOG.debug(
-                    "[AutoplayV2][parse_track] cache hit: %r / %r -> artist=%s, title=%s",
-                    raw_title,
-                    channel_name,
+                LOG.info(
+                    "📁 [Cache Hit: Parsing] %r / %r -> artist=%s, title=%s, track_type=%s, entity=%s",
+                    raw_title[:50] + "..." if len(raw_title) > 50 else raw_title,
+                    (
+                        channel_name[:30] + "..."
+                        if len(channel_name) > 30
+                        else channel_name
+                    ),
                     cached.artist,
                     cached.title,
+                    cached.track_type,
+                    cached.primary_entity or "N/A",
                 )
             return {
                 "artist": cached.artist,
                 "title": cached.title,
                 "confidence": cached.confidence,
+                "track_type": cached.track_type,
+                "primary_entity": cached.primary_entity,
             }
 
         parsed = await self._try_gemini_parse(raw_title, channel_name)
@@ -173,11 +181,13 @@ class AutoplayEngineV2:
             return None
 
         if self._verbose:
-            LOG.debug(
-                "[AutoplayV2][parse_track] Gemini parsed %r / %r -> %s",
-                raw_title,
-                channel_name,
-                parsed,
+            LOG.info(
+                "🤖 [Gemini Parse] %r / %r -> artist=%s, title=%s, track_type=%s",
+                raw_title[:50] + "..." if len(raw_title) > 50 else raw_title,
+                channel_name[:30] + "..." if len(channel_name) > 30 else channel_name,
+                parsed["artist"],
+                parsed["title"],
+                parsed.get("track_type", "music"),
             )
 
         entry = ParsingEntry(
@@ -185,6 +195,8 @@ class AutoplayEngineV2:
             title=parsed["title"],
             confidence=float(parsed.get("confidence", 1.0)),
             parsed_at=time.time(),
+            track_type=parsed.get("track_type", "music"),
+            primary_entity=parsed.get("primary_entity"),
         )
         await self._cache.set_parsing(raw_title, channel_name, entry)
         return parsed
@@ -199,7 +211,16 @@ class AutoplayEngineV2:
     ) -> Optional[Dict[str, Any]]:
         cached = await self._cache.get_enrichment(artist, title)
         if cached:
-            if LOG.isEnabledFor(logging.DEBUG):
+            if self._verbose:
+                LOG.info(
+                    "📁 [Cache Hit: Enrichment] %s - %s -> tags=%s, mood=%s, energy=%.2f",
+                    artist[:30] + "..." if len(artist) > 30 else artist,
+                    title[:40] + "..." if len(title) > 40 else title,
+                    cached.tags[:3],
+                    cached.mood,
+                    cached.energy or 0.0,
+                )
+            elif LOG.isEnabledFor(logging.DEBUG):
                 LOG.debug(
                     "Enrichment cache hit: %s",
                     {
@@ -210,14 +231,6 @@ class AutoplayEngineV2:
                         "energy": cached.energy,
                         "mood_vector_id": cached.mood_vector_id,
                     },
-                )
-            elif self._verbose:
-                LOG.debug(
-                    "[AutoplayV2][enrich_track] cache hit: %s - tags=%s mood=%s energy=%s",
-                    f"{artist}::{title}",
-                    cached.tags[:5],
-                    cached.mood,
-                    cached.energy,
                 )
             return {
                 "tags": cached.tags,
@@ -239,6 +252,13 @@ class AutoplayEngineV2:
         if not self._gemini.is_available:
             LOG.debug("Gemini unavailable; skipping enrichment")
             return None
+
+        if self._verbose:
+            LOG.info(
+                "🤖 [Gemini Enrichment] Fetching for %s - %s",
+                artist[:30] + "..." if len(artist) > 30 else artist,
+                title[:40] + "..." if len(title) > 40 else title,
+            )
 
         try:
             response = await self._gemini.request_enrichment(
@@ -388,6 +408,11 @@ class AutoplayEngineV2:
         seed_track_ids: Optional[Iterable[str]] = None,
         session_mood_vector: Optional[Sequence[float]] = None,
         target_mood: Optional[str] = None,
+        # Phase 3: Enhanced scoring parameters
+        session_focus_genres: Optional[List[str]] = None,
+        liked_mood_vector: Optional[Sequence[float]] = None,
+        energy_trend: float = 0.0,
+        last_energy: Optional[float] = None,
     ) -> List[ScoredCandidate]:
         return self._recommender.score_candidates(
             guild_id,
@@ -395,6 +420,10 @@ class AutoplayEngineV2:
             seed_track_ids=seed_track_ids,
             session_mood_vector=session_mood_vector,
             target_mood=target_mood,
+            session_focus_genres=session_focus_genres,
+            liked_mood_vector=liked_mood_vector,
+            energy_trend=energy_trend,
+            last_energy=last_energy,
         )
 
     def get_stats(self) -> Dict[str, Any]:

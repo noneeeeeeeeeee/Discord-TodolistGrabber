@@ -26,6 +26,9 @@ class CandidateFeatures:
     extra_weight: float = 1.0
     mood_vector: Optional[Sequence[float]] = None
     mood_label: Optional[str] = None
+    # Phase 3: Enhanced scoring fields
+    genres: Optional[List[str]] = None  # For genre coherence scoring
+    energy: Optional[float] = None  # For energy flow scoring (0.0-1.0)
 
 
 @dataclass
@@ -68,13 +71,20 @@ class ContextualRecommender:
         seed_track_ids: Optional[Iterable[str]] = None,
         session_mood_vector: Optional[Sequence[float]] = None,
         target_mood: Optional[str] = None,
+        # Phase 3: Enhanced scoring parameters
+        session_focus_genres: Optional[List[str]] = None,
+        liked_mood_vector: Optional[Sequence[float]] = None,
+        energy_trend: float = 0.0,
+        last_energy: Optional[float] = None,
     ) -> List[ScoredCandidate]:
         if not candidates:
             return []
 
         collaborative_ready = self.is_collaborative_enabled(guild_id)
         if collaborative_ready:
-            snapshot_available = self._collaborative.snapshot_metadata().get("available")
+            snapshot_available = self._collaborative.snapshot_metadata().get(
+                "available"
+            )
             collaborative_ready = bool(snapshot_available)
 
         seeds = [track_id for track_id in (seed_track_ids or []) if track_id]
@@ -84,6 +94,8 @@ class ContextualRecommender:
         )
 
         session_vector = list(session_mood_vector) if session_mood_vector else None
+        liked_vector = list(liked_mood_vector) if liked_mood_vector else None
+        focus_genres_set = set(g.lower() for g in (session_focus_genres or []))
 
         scored: List[ScoredCandidate] = []
         for candidate in candidates:
@@ -92,34 +104,70 @@ class ContextualRecommender:
             novelty = self._clamp01(candidate.novelty)
             quality = self._clamp01(candidate.quality)
 
+            # Phase 3 Task 4.3: Updated mood alignment with safe anchor (60% weight to liked tracks)
             mood_alignment = 0.5
-            mood_distance = None
+            mood_distance_avg = None
+            mood_distance_liked = None
+
             if session_vector and candidate.mood_vector:
-                mood_distance = self._mood_distance(session_vector, candidate.mood_vector)
-                mood_alignment = self._clamp01(1.0 - mood_distance)
+                mood_distance_avg = self._mood_distance(
+                    session_vector, candidate.mood_vector
+                )
+
+            if liked_vector and candidate.mood_vector:
+                mood_distance_liked = self._mood_distance(
+                    liked_vector, candidate.mood_vector
+                )
+
+            # Blend session average (40%) with liked anchor (60%)
+            if mood_distance_avg is not None and mood_distance_liked is not None:
+                mood_alignment = self._clamp01(
+                    0.4 * (1.0 - mood_distance_avg) + 0.6 * (1.0 - mood_distance_liked)
+                )
+            elif mood_distance_avg is not None:
+                mood_alignment = self._clamp01(1.0 - mood_distance_avg)
+            elif mood_distance_liked is not None:
+                mood_alignment = self._clamp01(1.0 - mood_distance_liked)
 
             novelty_term = novelty
-            if mood_distance is not None:
-                novelty_term = 0.6 * novelty + 0.4 * mood_distance
+            if mood_distance_avg is not None:
+                novelty_term = 0.6 * novelty + 0.4 * mood_distance_avg
 
             if target_mood and candidate.mood_label:
                 if candidate.mood_label.lower() == target_mood.lower():
                     mood_alignment = self._clamp01(mood_alignment + 0.1)
 
+            # Phase 3 Task 4.1: Genre coherence scoring (25% weight)
+            genre_coherence = self._score_genre_coherence(
+                candidate.genres or [], focus_genres_set
+            )
+
+            # Phase 3 Task 4.2: Energy flow scoring (10% weight)
+            energy_flow = self._score_energy_flow(
+                candidate.energy, last_energy, energy_trend
+            )
+
+            # Phase 3 Task 4.4: New score composition
+            # 35% mood + 25% genre + 10% energy + 30% collaborative
             base_score = (
-                content_similarity * 0.35
-                + session_similarity * 0.20
-                + quality * 0.15
-                + novelty_term * 0.15
-                + mood_alignment * 0.15
+                mood_alignment * 0.35
+                + genre_coherence * 0.25
+                + energy_flow * 0.10
+                + content_similarity * 0.15
+                + session_similarity * 0.10
+                + quality * 0.05
             )
 
             collaborative_score = 0.0
             if collaborative_ready and seeds:
-                collaborative_score = self._collaborative_score(candidate.track_id, seeds)
+                collaborative_score = self._collaborative_score(
+                    candidate.track_id, seeds
+                )
 
             if collaborative_ready and collaborative_weight > 0:
-                blended = (1 - collaborative_weight) * base_score + collaborative_weight * collaborative_score
+                blended = (
+                    1 - collaborative_weight
+                ) * base_score + collaborative_weight * collaborative_score
             else:
                 blended = base_score
 
@@ -138,7 +186,16 @@ class ContextualRecommender:
                         "base": base_score,
                         "collaborative": collaborative_score,
                         "mood_alignment": mood_alignment,
-                        "mood_distance": mood_distance if mood_distance is not None else -1.0,
+                        "mood_distance_avg": (
+                            mood_distance_avg if mood_distance_avg is not None else -1.0
+                        ),
+                        "mood_distance_liked": (
+                            mood_distance_liked
+                            if mood_distance_liked is not None
+                            else -1.0
+                        ),
+                        "genre_coherence": genre_coherence,
+                        "energy_flow": energy_flow,
                         "feedback_multiplier": candidate.feedback_multiplier,
                         "diversity_penalty": candidate.diversity_penalty,
                         "extra_weight": candidate.extra_weight,
@@ -159,8 +216,12 @@ class ContextualRecommender:
                     "collaborative_weight": collaborative_weight,
                     "session_mood_vector": bool(session_vector),
                     "target_mood": target_mood,
-                    "top_track": getattr(top_entry, "track_id", None) if top_entry else None,
-                    "top_score": getattr(top_entry, "score", None) if top_entry else None,
+                    "top_track": (
+                        getattr(top_entry, "track_id", None) if top_entry else None
+                    ),
+                    "top_score": (
+                        getattr(top_entry, "score", None) if top_entry else None
+                    ),
                 },
             )
         return scored
@@ -206,6 +267,69 @@ class ContextualRecommender:
             return 0.0
         distance = math.sqrt(sum_sq) / max_distance
         return max(0.0, min(1.0, distance))
+
+    @staticmethod
+    def _score_genre_coherence(
+        candidate_genres: List[str],
+        session_genres_set: set,
+    ) -> float:
+        """
+        Phase 3 Task 4.1: Genre coherence scoring.
+
+        Calculate overlap between candidate genres and session focus genres.
+        Returns score from 0.0 (no overlap) to 1.0 (perfect match).
+        """
+        if not candidate_genres or not session_genres_set:
+            return 0.5  # Neutral score when no genre data available
+
+        # Normalize candidate genres to lowercase
+        candidate_set = set(g.lower() for g in candidate_genres)
+
+        # Calculate overlap ratio
+        overlap = len(candidate_set & session_genres_set)
+        min_len = min(len(candidate_set), len(session_genres_set))
+
+        if min_len == 0:
+            return 0.5
+
+        overlap_ratio = overlap / min_len
+        return max(0.0, min(1.0, overlap_ratio))
+
+    @staticmethod
+    def _score_energy_flow(
+        candidate_energy: Optional[float],
+        last_energy: Optional[float],
+        energy_trend: float,
+    ) -> float:
+        """
+        Phase 3 Task 4.2: Energy flow scoring.
+
+        Penalize sharp energy jumps, bonus for trend continuation.
+        Returns score from 0.0 (terrible transition) to 1.0 (perfect flow).
+        """
+        if candidate_energy is None or last_energy is None:
+            return 0.7  # Neutral-positive score when energy data unavailable
+
+        # Calculate energy delta
+        energy_delta = candidate_energy - last_energy
+
+        # Start with perfect score
+        score = 1.0
+
+        # Penalize sharp jumps (>0.4 delta)
+        if abs(energy_delta) > 0.4:
+            score -= 0.5  # Major penalty for jarring transitions
+        elif abs(energy_delta) > 0.3:
+            score -= 0.2  # Minor penalty for large jumps
+
+        # Bonus for continuing energy trend
+        if abs(energy_trend) > 0.1:  # Only if there's a clear trend
+            if (energy_trend > 0 and energy_delta > 0) or (
+                energy_trend < 0 and energy_delta < 0
+            ):
+                score += 0.3  # Bonus for continuing the trend
+
+        return max(0.0, min(1.0, score))
 
     @staticmethod
     def _clamp01(value: float) -> float:

@@ -60,6 +60,13 @@ class LastFMAutoplayV2:
         self._novelty_controller = NoveltyController(verbose=verbosity)
         self._verbose = verbosity
 
+        # Cache performance tracking (reset per autoplay round)
+        self._cache_stats = {
+            "enrichment_hits": 0,
+            "enrichment_misses": 0,
+            "gemini_calls": 0,
+        }
+
     # ------------------------------------------------------------------
     # Internal helpers for context tracking (Issue #3)
     # ------------------------------------------------------------------
@@ -133,7 +140,26 @@ class LastFMAutoplayV2:
         primary_listener_bias: bool = False,
         feedback_type: Optional[str] = None,
         user_id: Optional[int] = None,
+        num_likes: Optional[int] = None,
+        num_dislikes: Optional[int] = None,
+        num_active_listeners: Optional[int] = None,
     ) -> None:
+        """
+        Record playback feedback for a track with optional multi-user aggregation.
+
+        Args:
+            guild_id: Discord guild ID
+            artist: Track artist
+            title: Track title
+            progress_ratio: How much was played (0.0-1.0)
+            duration_ms: Track duration in milliseconds
+            primary_listener_bias: Deprecated (kept for compatibility)
+            feedback_type: "more_like_this", "less_like_this", or None
+            user_id: Single user ID (legacy, for single-user feedback)
+            num_likes: Count of like reactions (v2.5, overrides user_id if provided)
+            num_dislikes: Count of dislike reactions (v2.5)
+            num_active_listeners: Total active listeners (v2.5)
+        """
         if not self.is_available():
             return
 
@@ -257,6 +283,47 @@ class LastFMAutoplayV2:
         mood_vector = enrichment.get("mood_vector") if enrichment else None
         mood_label = enrichment.get("mood") if enrichment else None
 
+        # Phase 0.5: Try to get track_type and primary_entity from parsing cache
+        # We need to match the track by artist/title from cache
+        track_type = "music"  # Default fallback
+        primary_entity = None
+
+        # Attempt to retrieve from cache by checking the most recent parsing entries
+        # (This is a best-effort approach since we don't have raw_title/channel_name here)
+        # In future, we should pass these through the call chain
+        try:
+            # Check if we have this track in cache
+            # For now, we'll default to "music" type unless we find evidence otherwise
+            # TODO: Pass raw_title/channel_name through track_end_event signature for cache lookup
+            pass
+        except Exception as e:
+            LOG.debug(f"Unable to retrieve track_type from cache: {e}")
+
+        # Aggregate multi-user feedback
+        # If explicit counts provided, use them. Otherwise infer from legacy single-user feedback
+        if (
+            num_likes is not None
+            or num_dislikes is not None
+            or num_active_listeners is not None
+        ):
+            # Multi-user mode: use provided counts
+            final_num_likes = num_likes or 0
+            final_num_dislikes = num_dislikes or 0
+            final_num_active_listeners = num_active_listeners or 1
+        else:
+            # Legacy single-user mode: infer from feedback_type and event_type
+            final_num_active_listeners = 1
+            if feedback_type == "more_like_this" or event_type == "like":
+                final_num_likes = 1
+                final_num_dislikes = 0
+            elif feedback_type == "less_like_this" or event_type == "dislike":
+                final_num_likes = 0
+                final_num_dislikes = 1
+            else:
+                # No explicit feedback, just skip/finish data
+                final_num_likes = 0
+                final_num_dislikes = 0
+
         tracker.record_play(
             track_id=track_id,
             artist=artist,
@@ -267,6 +334,11 @@ class LastFMAutoplayV2:
             was_skipped=was_skipped,
             skip_type=skip_type,
             progress_ratio=ratio,
+            num_likes=final_num_likes,
+            num_dislikes=final_num_dislikes,
+            num_active_listeners=final_num_active_listeners,
+            track_type=track_type,
+            primary_entity=primary_entity,
         )
 
     async def get_recommendations_for_track(
@@ -332,9 +404,33 @@ class LastFMAutoplayV2:
             session_vector = seed_mood.get("vector")
             target_mood = seed_mood.get("mood")
 
-        candidate_records = await self._fetch_candidate_records(seed_artist, seed_title)
+        # Phase 2: Get seed track metadata for OST branching
+        seed_track_type = parsed.get("track_type", "music") if parsed else "music"
+        seed_entity = parsed.get("primary_entity") if parsed else None
+
+        candidate_records = await self._fetch_candidate_records(
+            guild_id=guild_id,
+            seed_artist=seed_artist,
+            seed_title=seed_title,
+            seed_track_type=seed_track_type,
+            seed_entity=seed_entity,
+            context=context,
+            tracker=tracker,
+        )
         if not candidate_records:
             return []
+
+        # Task 3.6: Apply artist diversity filter
+        candidate_records, artist_diversity_pool = self._apply_artist_diversity_filter(
+            candidate_records, max_per_artist=3
+        )
+
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][diversity] Kept %d candidates (filtered %d for artist echo prevention)",
+                len(candidate_records),
+                len(artist_diversity_pool),
+            )
 
         prepared_candidates = await self._prepare_candidates(
             guild_id,
@@ -348,12 +444,24 @@ class LastFMAutoplayV2:
         metadata_index = {
             entry.features.track_id: entry.metadata for entry in prepared_candidates
         }
+
+        # Phase 3: Extract last track's energy for flow scoring
+        last_energy = None
+        if tracker._history:
+            last_track = tracker._history[-1]
+            last_energy = last_track.energy
+
         scored = self._engine.score_candidates(
             guild_id,
             features,
             seed_track_ids=[seed_track_id],
             session_mood_vector=session_vector,
             target_mood=target_mood,
+            # Phase 3: Enhanced scoring context
+            session_focus_genres=context.focus_genres,
+            liked_mood_vector=context.liked_mood_vector,
+            energy_trend=context.energy_trend,
+            last_energy=last_energy,
         )
 
         # Issue #3: Apply novelty controller adjustments
@@ -370,34 +478,39 @@ class LastFMAutoplayV2:
                     candidate.title,
                 )
 
-            # Apply genre/tag penalties for recently skipped content
+            # Phase 3 Task 4.5: Apply temporal-weighted genre/tag penalties for recently skipped content
             if context.disliked_tags:
-                meta = metadata_index.get(candidate.track_id, {})
-                candidate_tags = meta.get("tags", [])
+                # Get candidate features to access genres
+                candidate_features = next(
+                    (f for f in features if f.track_id == candidate.track_id), None
+                )
 
-                # Calculate tag penalty (average of all matching disliked tags)
-                tag_penalties = [
-                    context.disliked_tags.get(tag.lower(), 0.0)
-                    for tag in candidate_tags
-                    if tag.lower() in context.disliked_tags
-                ]
+                if candidate_features and candidate_features.genres:
+                    # Calculate tag penalty (average of all matching disliked tags)
+                    tag_penalties = [
+                        context.disliked_tags.get(genre, 0.0)
+                        for genre in candidate_features.genres
+                        if genre in context.disliked_tags
+                    ]
 
-                if tag_penalties:
-                    avg_penalty = sum(tag_penalties) / len(tag_penalties)
-                    tag_multiplier = 1.0 - avg_penalty  # Convert penalty to multiplier
-                    candidate.score *= tag_multiplier
+                    if tag_penalties:
+                        avg_penalty = sum(tag_penalties) / len(tag_penalties)
+                        tag_multiplier = (
+                            1.0 - avg_penalty
+                        )  # Convert penalty to multiplier
+                        candidate.score *= tag_multiplier
 
-                    if self._verbose >= 2 and avg_penalty > 0.1:
-                        LOG.debug(
-                            "👎 [Skip Penalty] Reducing score by %.1f%% for '%s' (disliked tags: %s)",
-                            avg_penalty * 100,
-                            candidate.title,
-                            [
-                                t
-                                for t in candidate_tags
-                                if t.lower() in context.disliked_tags
-                            ][:3],
-                        )
+                        if self._verbose >= 2 and avg_penalty > 0.1:
+                            LOG.debug(
+                                "👎 [Skip Penalty] Reducing score by %.1f%% for '%s' (disliked tags: %s)",
+                                avg_penalty * 100,
+                                candidate.title,
+                                [
+                                    g
+                                    for g in candidate_features.genres
+                                    if g in context.disliked_tags
+                                ][:3],
+                            )
 
         # Re-sort after applying all penalties
         scored.sort(key=lambda c: c.score, reverse=True)
@@ -481,131 +594,351 @@ class LastFMAutoplayV2:
 
     async def _fetch_candidate_records(
         self,
-        artist: str,
-        title: str,
+        *,
+        guild_id: int,
+        seed_artist: str,
+        seed_title: str,
+        seed_track_type: str = "music",
+        seed_entity: Optional[str] = None,
+        context: Any,  # SessionContext from context_tracker
+        tracker: Any,  # ContextTracker instance
     ) -> List[Dict[str, Any]]:
+        """
+        Fetch candidate pool using Phase 2 diversification strategy.
+
+        Branch A (OST/Entity-based): For OST/anime/game soundtracks with entity
+        Branch B (Artist-based): For standard music
+            - Cold Start: < 3 songs history
+            - Warm Start: >= 3 songs history
+
+        Args:
+            guild_id: Discord guild ID
+            seed_artist: Seed track artist
+            seed_title: Seed track title
+            seed_track_type: Track type from parsing (ost, anime_opening, game_soundtrack, music)
+            seed_entity: Primary entity for OST content (e.g., "Hazbin Hotel")
+            context: SessionContext with history and focus_genres
+            tracker: ContextTracker instance for accessing _history
+
+        Returns:
+            List of track records with _source and pool_source tags
+        """
         if not self._lastfm_key:
             LOG.warning("Last.fm API key missing; cannot fetch candidates")
             return []
 
-        params = {
-            "method": "track.getSimilar",
-            "artist": artist,
-            "track": title,
-            "limit": str(_DEFAULT_FETCH_LIMIT),
-            "autocorrect": "1",
-            "api_key": self._lastfm_key,
-            "format": "json",
-        }
-        if self._engine._verbose:
-            LOG.debug(
-                "[AutoplayV2][lastfm] track.getSimilar artist=%s title=%s limit=%s",
-                artist,
-                title,
-                params["limit"],
+        # Task 3.1: OST branch detection
+        is_ost = seed_track_type in {"ost", "game_soundtrack", "anime_opening"}
+        use_entity_branch = is_ost and seed_entity is not None
+
+        history = self._recent_history.get(guild_id, [])
+        history_size = len(history)
+
+        if use_entity_branch:
+            # Branch A: Entity-based fetch for OST content
+            return await self._fetch_entity_based_pools(
+                seed_artist=seed_artist,
+                seed_title=seed_title,
+                seed_entity=seed_entity,
+                context=context,
+                tracker=tracker,
             )
-        records = await self._call_lastfm(params, source="track.getSimilar")
-        if records:
-            if self._engine._verbose:
-                LOG.debug(
-                    "[AutoplayV2][lastfm] similar returned %d records (samples=%s)",
-                    len(records),
-                    [
-                        f"{self._extract_artist(r)}::{self._extract_title(r)}"
-                        for r in records[:5]
-                    ],
-                )
-            return records
-
-        # Fallback 1: Get top tracks from the same artist
-        fallback_params = {
-            "method": "artist.getTopTracks",
-            "artist": artist,
-            "limit": str(_DEFAULT_FETCH_LIMIT // 2),
-            "api_key": self._lastfm_key,
-            "format": "json",
-            "autocorrect": "1",
-        }
-        if self._engine._verbose:
-            LOG.debug(
-                "[AutoplayV2][lastfm] fallback artist.getTopTracks artist=%s limit=%s",
-                artist,
-                fallback_params["limit"],
+        elif history_size < 3:
+            # Branch B: Cold start
+            return await self._fetch_cold_start_pools(
+                seed_artist=seed_artist,
+                seed_title=seed_title,
+                context=context,
             )
-        recs = await self._call_lastfm(fallback_params, source="artist.getTopTracks")
-
-        # If top tracks returned results, use them
-        if recs:
-            if self._engine._verbose:
-                LOG.debug(
-                    "[AutoplayV2][lastfm] toptracks returned %d records (samples=%s)",
-                    len(recs),
-                    [
-                        f"{self._extract_artist(r)}::{self._extract_title(r)}"
-                        for r in recs[:5]
-                    ],
-                )
-            return recs
-
-        # Fallback 2: Get similar artists and fetch their top tracks for diversity
-        similar_artist_params = {
-            "method": "artist.getSimilar",
-            "artist": artist,
-            "limit": "10",  # Get 10 similar artists
-            "api_key": self._lastfm_key,
-            "format": "json",
-            "autocorrect": "1",
-        }
-        if self._engine._verbose:
-            LOG.debug(
-                "[AutoplayV2][lastfm] fallback2 artist.getSimilar artist=%s limit=10",
-                artist,
+        else:
+            # Branch B: Warm start
+            return await self._fetch_warm_start_pools(
+                seed_artist=seed_artist,
+                seed_title=seed_title,
+                context=context,
+                tracker=tracker,
             )
 
-        similar_artists = await self._call_lastfm(
-            similar_artist_params, source="artist.getSimilar"
-        )
+    async def _fetch_entity_based_pools(
+        self,
+        *,
+        seed_artist: str,
+        seed_title: str,
+        seed_entity: str,
+        context: Any,
+        tracker: Any,
+    ) -> List[Dict[str, Any]]:
+        """
+        Task 3.2: Fetch Branch A (entity-based) pools for OST content.
 
-        if similar_artists:
-            # Get top tracks from the first 3 similar artists
-            all_tracks = []
-            for similar_artist_record in similar_artists[:3]:
-                similar_artist_name = self._extract_artist(similar_artist_record)
-                if not similar_artist_name:
+        Pool A: tag.getTopTracks(entity) - 40 tracks
+        Pool B: track.getSimilar(seed) - 30 tracks
+        Pool C: artist.getTopTracks(recent_artists) - 30 tracks
+        Total: ~100 tracks
+
+        Validates Hazbin Hotel fix from Phase 0.5.
+        """
+        if self._engine._verbose:
+            LOG.info(
+                "🎬 [Branch A] Entity-based fetch for '%s' (entity=%s)",
+                seed_title,
+                seed_entity,
+            )
+
+        # Pool A: Entity cluster (use entity as tag)
+        pool_a = await self._fetch_tag_top_tracks(seed_entity, limit=40)
+        for record in pool_a:
+            record["pool_source"] = "pool_a_entity_cluster"
+
+        # Pool B: Track continuity
+        pool_b = await self._fetch_track_similar(seed_artist, seed_title, limit=30)
+        for record in pool_b:
+            record["pool_source"] = "pool_a_continuity"  # Still Pool A conceptually
+
+        # Pool C: Artist familiarity (get recent artists from history)
+        recent_artists = self._extract_recent_artists(tracker, max_artists=3)
+        pool_c = []
+        for artist in recent_artists:
+            artist_tracks = await self._fetch_artist_top_tracks(artist, limit=10)
+            pool_c.extend(artist_tracks)
+        for record in pool_c:
+            record["pool_source"] = "pool_b_familiarity"
+
+        all_pools = pool_a + pool_b + pool_c
+
+        if self._engine._verbose:
+            LOG.info(
+                "🎬 [Branch A] Fetched %d tracks (A:%d, B:%d, C:%d)",
+                len(all_pools),
+                len(pool_a),
+                len(pool_b),
+                len(pool_c),
+            )
+
+        return all_pools
+
+    async def _fetch_cold_start_pools(
+        self,
+        *,
+        seed_artist: str,
+        seed_title: str,
+        context: Any,
+    ) -> List[Dict[str, Any]]:
+        """
+        Task 3.3: Fetch Branch B cold start pools (<3 songs history).
+
+        Pool A: track.getSimilar(seed) - 60 tracks
+        Pool C: tag.getTopTracks(focus_genres) - 30 tracks
+        Total: ~90 tracks
+
+        Seed-centric strategy for new sessions.
+        """
+        if self._engine._verbose:
+            LOG.info("❄️ [Cold Start] Seed-centric fetch for '%s'", seed_title)
+
+        # Pool A: Continuity from seed
+        pool_a = await self._fetch_track_similar(seed_artist, seed_title, limit=60)
+        for record in pool_a:
+            record["pool_source"] = "pool_a_continuity"
+
+        # Pool C: Safe harbor from top focus genre
+        pool_c = []
+        if context.focus_genres:
+            top_genre = context.focus_genres[0]
+            genre_tracks = await self._fetch_tag_top_tracks(top_genre, limit=30)
+            pool_c.extend(genre_tracks)
+        for record in pool_c:
+            record["pool_source"] = "pool_c_safe_harbor"
+
+        all_pools = pool_a + pool_c
+
+        if self._engine._verbose:
+            LOG.info(
+                "❄️ [Cold Start] Fetched %d tracks (A:%d, C:%d)",
+                len(all_pools),
+                len(pool_a),
+                len(pool_c),
+            )
+
+        return all_pools
+
+    async def _fetch_warm_start_pools(
+        self,
+        *,
+        seed_artist: str,
+        seed_title: str,
+        context: Any,
+        tracker: Any,
+    ) -> List[Dict[str, Any]]:
+        """
+        Task 3.4: Fetch Branch B warm start pools (>=3 songs history).
+
+        Pool A: track.getSimilar(seed) - 30 tracks
+        Pool B: artist.getTopTracks(recent_artists) - 30 tracks
+        Pool C: tag.getTopTracks(focus_genres) - 30 tracks
+        Pool D: artist.getSimilar(most_liked_artist) -> topTracks - 20 tracks
+        Total: ~110 tracks
+
+        Profile-aware strategy with discovery component.
+        """
+        if self._engine._verbose:
+            LOG.info("🔥 [Warm Start] Profile-aware fetch for '%s'", seed_title)
+
+        # Pool A: Continuity from seed
+        pool_a = await self._fetch_track_similar(seed_artist, seed_title, limit=30)
+        for record in pool_a:
+            record["pool_source"] = "pool_a_continuity"
+
+        # Pool B: Familiarity from recent artists
+        recent_artists = self._extract_recent_artists(tracker, max_artists=3)
+        pool_b = []
+        for artist in recent_artists:
+            artist_tracks = await self._fetch_artist_top_tracks(artist, limit=10)
+            pool_b.extend(artist_tracks)
+        for record in pool_b:
+            record["pool_source"] = "pool_b_familiarity"
+
+        # Pool C: Genre safe harbor
+        pool_c = []
+        if context.focus_genres:
+            # Use top genre for safe harbor
+            top_genre = context.focus_genres[0]
+            genre_tracks = await self._fetch_tag_top_tracks(top_genre, limit=30)
+            pool_c.extend(genre_tracks)
+        for record in pool_c:
+            record["pool_source"] = "pool_c_safe_harbor"
+
+        # Pool D: Discovery from similar artists
+        pool_d = []
+        most_liked_artist = self._extract_most_liked_artist(tracker)
+        if most_liked_artist:
+            similar_artists = await self._fetch_artist_similar(
+                most_liked_artist, limit=5
+            )
+            for artist_record in similar_artists:
+                artist_name = self._extract_artist(artist_record)
+                if not artist_name:
                     continue
-
-                similar_tracks_params = {
-                    "method": "artist.getTopTracks",
-                    "artist": similar_artist_name,
-                    "limit": str(_DEFAULT_FETCH_LIMIT // 6),  # ~16 tracks per artist
-                    "api_key": self._lastfm_key,
-                    "format": "json",
-                    "autocorrect": "1",
-                }
-
-                similar_tracks = await self._call_lastfm(
-                    similar_tracks_params, source="artist.getTopTracks"
+                discovery_tracks = await self._fetch_artist_top_tracks(
+                    artist_name, limit=4
                 )
-                all_tracks.extend(similar_tracks)
+                pool_d.extend(discovery_tracks)
+                if len(pool_d) >= 20:
+                    break
+        for record in pool_d:
+            record["pool_source"] = "pool_d_discovery"
 
-                if len(all_tracks) >= _DEFAULT_FETCH_LIMIT // 2:
+        all_pools = pool_a + pool_b + pool_c + pool_d
+
+        if self._engine._verbose:
+            LOG.info(
+                "🔥 [Warm Start] Fetched %d tracks (A:%d, B:%d, C:%d, D:%d)",
+                len(all_pools),
+                len(pool_a),
+                len(pool_b),
+                len(pool_c),
+                len(pool_d),
+            )
+
+        return all_pools
+
+    def _extract_recent_artists(self, tracker: Any, max_artists: int = 3) -> List[str]:
+        """
+        Extract recent artist names from session context.
+
+        Args:
+            tracker: ContextTracker instance
+            max_artists: Maximum number of artists to return
+
+        Returns:
+            List of artist names (most recent first, deduplicated)
+        """
+        seen = set()
+        recent = []
+
+        # Access _history from tracker
+        for track in reversed(tracker._history):
+            if track.artist and track.artist not in seen:
+                seen.add(track.artist)
+                recent.append(track.artist)
+                if len(recent) >= max_artists:
                     break
 
-            if all_tracks:
-                if self._engine._verbose:
-                    LOG.debug(
-                        "[AutoplayV2][lastfm] similar artists fallback returned %d tracks from related artists",
-                        len(all_tracks),
-                    )
-                return all_tracks[: _DEFAULT_FETCH_LIMIT // 2]
+        return recent
 
-        # Last resort: return empty to trigger other mechanisms
-        LOG.warning(
-            "[AutoplayV2][lastfm] All Last.fm methods failed for artist=%s title=%s",
-            artist,
-            title,
-        )
-        return []
+    def _extract_most_liked_artist(self, tracker: Any) -> Optional[str]:
+        """
+        Extract artist with highest like count from session context.
+
+        Args:
+            tracker: ContextTracker instance
+
+        Returns:
+            Artist name with most likes, or None
+        """
+        from collections import defaultdict
+
+        artist_likes: Dict[str, int] = defaultdict(int)
+
+        # Count likes per artist
+        for track in tracker._history:
+            if track.artist and track.num_likes > 0:
+                artist_likes[track.artist] += track.num_likes
+
+        if not artist_likes:
+            return None
+
+        # Return artist with most likes
+        return max(artist_likes.items(), key=lambda x: x[1])[0]
+
+    def _apply_artist_diversity_filter(
+        self,
+        records: List[Dict[str, Any]],
+        max_per_artist: int = 3,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Task 3.6: Enforce artist diversity by limiting tracks per artist.
+
+        Groups tracks by artist, keeps max 3 per artist (sorted by playcount),
+        stores remaining in artist_diversity_pool for future use.
+
+        Args:
+            records: List of track records from Last.fm API
+            max_per_artist: Maximum tracks per artist (default: 3)
+
+        Returns:
+            Tuple of (filtered_records, overflow_pool)
+        """
+        from collections import defaultdict
+
+        # Group by artist
+        artist_tracks: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for record in records:
+            artist = self._extract_artist(record)
+            if artist:
+                artist_tracks[artist].append(record)
+
+        # Filter: keep max 3 per artist (sorted by playcount)
+        filtered = []
+        overflow = []
+
+        for artist, tracks in artist_tracks.items():
+            # Sort by playcount (descending)
+            sorted_tracks = sorted(
+                tracks,
+                key=lambda r: int(r.get("playcount", 0) or 0),
+                reverse=True,
+            )
+
+            # Keep top N, overflow the rest
+            filtered.extend(sorted_tracks[:max_per_artist])
+            overflow.extend(sorted_tracks[max_per_artist:])
+
+        return filtered, overflow
+
+    # ------------------------------------------------------------------
+    # Legacy fallback methods (kept for backward compatibility)
+    # ------------------------------------------------------------------
 
     async def _call_lastfm(
         self,
@@ -617,11 +950,37 @@ class LastFMAutoplayV2:
             async with aiohttp.ClientSession(timeout=self._http_timeout) as session:
                 async with session.get(_LASTFM_API_URL, params=params) as response:
                     if response.status != 200:
-                        LOG.debug("Last.fm %s failed (%s)", source, response.status)
+                        LOG.warning(
+                            "❌ Last.fm %s failed (HTTP %d) - artist=%s, track=%s",
+                            source,
+                            response.status,
+                            params.get("artist", "N/A"),
+                            params.get("track", params.get("tag", "N/A")),
+                        )
                         return []
                     payload = await response.json(content_type=None)
         except Exception as exc:
-            LOG.warning("Last.fm %s request failed: %s", source, exc)
+            LOG.warning(
+                "❌ Last.fm %s request failed: %s - artist=%s, track=%s",
+                source,
+                exc,
+                params.get("artist", "N/A"),
+                params.get("track", params.get("tag", "N/A")),
+            )
+            return []
+
+        # Check for Last.fm API errors in response
+        if "error" in payload:
+            error_code = payload.get("error", "unknown")
+            error_msg = payload.get("message", "No error message")
+            LOG.warning(
+                "❌ Last.fm %s API error %s: %s - artist=%s, track=%s",
+                source,
+                error_code,
+                error_msg,
+                params.get("artist", "N/A"),
+                params.get("track", params.get("tag", "N/A")),
+            )
             return []
 
         if source == "track.getSimilar":
@@ -640,6 +999,13 @@ class LastFMAutoplayV2:
         if isinstance(tracks, dict):
             tracks = [tracks]
         if not isinstance(tracks, list):
+            if self._engine._verbose:
+                LOG.debug(
+                    "⚠️ Last.fm %s returned invalid format (not list/dict) - artist=%s, track=%s",
+                    source,
+                    params.get("artist", "N/A"),
+                    params.get("track", params.get("tag", "N/A")),
+                )
             return []
 
         trimmed: List[Dict[str, Any]] = []
@@ -651,13 +1017,220 @@ class LastFMAutoplayV2:
             trimmed.append(record_copy)
             if len(trimmed) >= _DEFAULT_FETCH_LIMIT:
                 break
+
         if self._engine._verbose:
             LOG.debug(
                 "[AutoplayV2][lastfm] parsed %d %s records",
                 len(trimmed),
                 source,
             )
+
+        # Log warning if no tracks found (might be obscure artist/track)
+        if len(trimmed) == 0:
+            LOG.warning(
+                "⚠️ Last.fm %s returned 0 results - artist='%s', track='%s' (obscure/misspelled?)",
+                source,
+                params.get("artist", "N/A"),
+                params.get("track", params.get("tag", "N/A")),
+            )
+
         return trimmed
+
+    # ------------------------------------------------------------------
+    # Last.fm API Helper Methods (Phase 2: Task 3.7)
+    # ------------------------------------------------------------------
+
+    async def _fetch_track_similar(
+        self,
+        artist: str,
+        title: str,
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch similar tracks using Last.fm's track.getSimilar method.
+
+        Args:
+            artist: Artist name
+            title: Track title
+            limit: Maximum number of results (default: 30)
+
+        Returns:
+            List of track records with _source='track.getSimilar'
+        """
+        if not self._lastfm_key:
+            return []
+
+        params = {
+            "method": "track.getSimilar",
+            "artist": artist,
+            "track": title,
+            "limit": str(limit),
+            "autocorrect": "1",
+            "api_key": self._lastfm_key,
+            "format": "json",
+        }
+
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][pool] track.getSimilar artist=%s title=%s limit=%d",
+                artist,
+                title,
+                limit,
+            )
+
+        return await self._call_lastfm(params, source="track.getSimilar")
+
+    async def _fetch_artist_top_tracks(
+        self,
+        artist: str,
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch artist's top tracks using Last.fm's artist.getTopTracks method.
+
+        Args:
+            artist: Artist name
+            limit: Maximum number of results (default: 30)
+
+        Returns:
+            List of track records with _source='artist.getTopTracks'
+        """
+        if not self._lastfm_key:
+            return []
+
+        params = {
+            "method": "artist.getTopTracks",
+            "artist": artist,
+            "limit": str(limit),
+            "autocorrect": "1",
+            "api_key": self._lastfm_key,
+            "format": "json",
+        }
+
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][pool] artist.getTopTracks artist=%s limit=%d",
+                artist,
+                limit,
+            )
+
+        return await self._call_lastfm(params, source="artist.getTopTracks")
+
+    async def _fetch_tag_top_tracks(
+        self,
+        tag: str,
+        limit: int = 40,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch top tracks by tag/genre using Last.fm's tag.getTopTracks method.
+
+        This is used for:
+        - OST/entity-based recommendations (e.g., tag='Hazbin Hotel')
+        - Genre-based safe harbor (e.g., tag='electronic')
+
+        Args:
+            tag: Tag name (genre, entity, etc.)
+            limit: Maximum number of results (default: 40)
+
+        Returns:
+            List of track records with _source='tag.getTopTracks'
+        """
+        if not self._lastfm_key:
+            return []
+
+        params = {
+            "method": "tag.getTopTracks",
+            "tag": tag,
+            "limit": str(limit),
+            "api_key": self._lastfm_key,
+            "format": "json",
+        }
+
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][pool] tag.getTopTracks tag=%s limit=%d",
+                tag,
+                limit,
+            )
+
+        # Tag API has different response structure
+        try:
+            async with aiohttp.ClientSession(timeout=self._http_timeout) as session:
+                async with session.get(_LASTFM_API_URL, params=params) as response:
+                    if response.status != 200:
+                        LOG.debug(
+                            "Last.fm tag.getTopTracks failed (%s)", response.status
+                        )
+                        return []
+                    payload = await response.json(content_type=None)
+        except Exception as exc:
+            LOG.warning("Last.fm tag.getTopTracks request failed: %s", exc)
+            return []
+
+        # Extract tracks from tag API response
+        tracks = payload.get("tracks", {}).get("track", [])
+        if isinstance(tracks, dict):
+            tracks = [tracks]
+        if not isinstance(tracks, list):
+            return []
+
+        trimmed: List[Dict[str, Any]] = []
+        for record in tracks:
+            if not isinstance(record, dict):
+                continue
+            record_copy = dict(record)
+            record_copy.setdefault("_source", "tag.getTopTracks")
+            trimmed.append(record_copy)
+            if len(trimmed) >= limit:
+                break
+
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][pool] tag.getTopTracks returned %d tracks for tag=%s",
+                len(trimmed),
+                tag,
+            )
+
+        return trimmed
+
+    async def _fetch_artist_similar(
+        self,
+        artist: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch similar artists using Last.fm's artist.getSimilar method.
+
+        Returns artist records (not track records). Use this for Pool D discovery
+        by fetching similar artists, then getting their top tracks.
+
+        Args:
+            artist: Artist name
+            limit: Maximum number of results (default: 20)
+
+        Returns:
+            List of artist records with _source='artist.getSimilar'
+        """
+        if not self._lastfm_key:
+            return []
+
+        params = {
+            "method": "artist.getSimilar",
+            "artist": artist,
+            "limit": str(limit),
+            "autocorrect": "1",
+            "api_key": self._lastfm_key,
+            "format": "json",
+        }
+
+        if self._engine._verbose:
+            LOG.debug(
+                "[AutoplayV2][pool] artist.getSimilar artist=%s limit=%d",
+                artist,
+                limit,
+            )
+
+        return await self._call_lastfm(params, source="artist.getSimilar")
 
     async def _prepare_candidates(
         self,
@@ -723,17 +1296,49 @@ class LastFMAutoplayV2:
             seen.add(track_id)
             candidates_to_prepare.append((index, track_id, artist, title, record))
 
-        # Second pass: check cache and enqueue enrichment requests for missing ones
+        # Second pass: Check cache for enrichment (Last.fm already provides clean metadata, no parsing needed)
         enrichment_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         pending_enrichments: Dict[str, asyncio.Future] = {}
         tracks_needing_enrichment: List[Tuple[str, str, str]] = (
             []
         )  # track_id, artist, title
 
+        # Store clean metadata for later use
+        parsed_metadata: Dict[str, Tuple[str, str]] = (
+            {}
+        )  # track_id -> (clean_artist, clean_title)
+
+        # Reset cache stats for this round
+        self._cache_stats = {
+            "enrichment_hits": 0,
+            "enrichment_misses": 0,
+            "gemini_calls": 0,
+        }
+
         for _, track_id, artist, title, _ in candidates_to_prepare:
-            # Check if already enriched in cache
-            cached = await self._engine._cache.get_enrichment(artist, title)
+            # Last.fm provides clean artist/title - use directly
+            clean_artist = artist
+            clean_title = title
+            parsed_metadata[track_id] = (clean_artist, clean_title)
+
+            # Check if already enriched in cache using CLEAN keys
+            cached = await self._engine._cache.get_enrichment(clean_artist, clean_title)
             if cached:
+                self._cache_stats["enrichment_hits"] += 1
+                if self._engine._verbose:
+                    LOG.info(
+                        "📁 [Cache Hit: Batch Enrichment] %s - %s",
+                        (
+                            clean_artist[:30] + "..."
+                            if len(clean_artist) > 30
+                            else clean_artist
+                        ),
+                        (
+                            clean_title[:40] + "..."
+                            if len(clean_title) > 40
+                            else clean_title
+                        ),
+                    )
                 # Build enrichment dict from cache
                 enrichment_cache[track_id] = {
                     "tags": cached.tags,
@@ -745,7 +1350,18 @@ class LastFMAutoplayV2:
                 }
             else:
                 # Collect for batch enrichment
-                tracks_needing_enrichment.append((track_id, artist, title))
+                self._cache_stats["enrichment_misses"] += 1
+                tracks_needing_enrichment.append((track_id, clean_artist, clean_title))
+
+        # Log batch enrichment stats
+        if self._engine._verbose and (enrichment_cache or tracks_needing_enrichment):
+            total = len(enrichment_cache) + len(tracks_needing_enrichment)
+            LOG.info(
+                "📦 [Batch Enrichment] %d total candidates: %d from cache, %d need Gemini",
+                total,
+                len(enrichment_cache),
+                len(tracks_needing_enrichment),
+            )
 
         # Enqueue all enrichment requests at once to maximize batching
         if tracks_needing_enrichment:
@@ -773,13 +1389,12 @@ class LastFMAutoplayV2:
                     if future.done() and not future.cancelled():
                         result = future.result()
                         if result:
-                            artist, title = None, None
-                            for _, tid, a, t, _ in candidates_to_prepare:
-                                if tid == track_id:
-                                    artist, title = a, t
-                                    break
+                            # Get clean artist/title from parsed metadata
+                            clean_artist, clean_title = parsed_metadata.get(
+                                track_id, (None, None)
+                            )
 
-                            if artist and title:
+                            if clean_artist and clean_title:
                                 tags = [
                                     str(tag).lower()
                                     for tag in result.get("tags", [])
@@ -818,12 +1433,22 @@ class LastFMAutoplayV2:
 
         # Third pass: prepare candidates with pre-fetched enrichment
         tasks: List[asyncio.Task[Optional[PreparedCandidate]]] = []
-        for index, track_id, artist, title, record in candidates_to_prepare:
+        for index, track_id, raw_artist, raw_title, record in candidates_to_prepare:
             enrichment = enrichment_cache.get(track_id)
+            # Use clean keys from parsed metadata
+            clean_artist, clean_title = parsed_metadata.get(
+                track_id, (raw_artist, raw_title)
+            )
             tasks.append(
                 asyncio.create_task(
                     self._prepare_single_candidate(
-                        guild_id, track_id, artist, title, record, index, enrichment
+                        guild_id,
+                        track_id,
+                        clean_artist,
+                        clean_title,
+                        record,
+                        index,
+                        enrichment,
                     )
                 )
             )
@@ -837,6 +1462,26 @@ class LastFMAutoplayV2:
                 continue
             if result is not None:
                 prepared.append(result)
+
+        # Log cache performance summary
+        if self._verbose >= 1:
+            total_checks = (
+                self._cache_stats["enrichment_hits"]
+                + self._cache_stats["enrichment_misses"]
+            )
+            hit_rate = (
+                (self._cache_stats["enrichment_hits"] / total_checks * 100)
+                if total_checks > 0
+                else 0
+            )
+            LOG.info(
+                "📊 [Cache Performance] Enrichment: %d/%d hits (%.1f%%), Gemini calls: %d",
+                self._cache_stats["enrichment_hits"],
+                total_checks,
+                hit_rate,
+                self._cache_stats["gemini_calls"],
+            )
+
         if self._engine._verbose:
             LOG.debug(
                 "[AutoplayV2][prepare] kept %d/%d candidates",
@@ -877,6 +1522,9 @@ class LastFMAutoplayV2:
 
         mood_vector = None
         mood_label = None
+        genres = None
+        energy = None
+
         if enrichment:
             mood_payload = enrichment.get("mood_vector") or {}
             if isinstance(mood_payload, dict):
@@ -886,6 +1534,21 @@ class LastFMAutoplayV2:
                     or enrichment.get("mood")
                     or enrichment.get("energy")
                 )
+
+            # Phase 3: Extract genres and energy for enhanced scoring
+            tags = enrichment.get("tags") or []
+            if tags and isinstance(tags, list):
+                genres = [str(tag).lower() for tag in tags[:5]]  # Top 5 genres
+
+            energy_val = enrichment.get("energy")
+            if energy_val is not None:
+                # Energy is string in cache ("high", "medium", "low")
+                # Convert to numeric for scoring
+                energy_map = {"low": 0.3, "medium": 0.6, "high": 0.9}
+                if isinstance(energy_val, str):
+                    energy = energy_map.get(energy_val.lower(), 0.6)
+                elif isinstance(energy_val, (int, float)):
+                    energy = float(energy_val)
 
         features = CandidateFeatures(
             track_id=track_id,
@@ -900,6 +1563,8 @@ class LastFMAutoplayV2:
             extra_weight=1.0,
             mood_vector=mood_vector,
             mood_label=mood_label,
+            genres=genres,
+            energy=energy,
         )
 
         metadata = {
