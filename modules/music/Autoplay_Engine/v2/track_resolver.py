@@ -948,13 +948,13 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
                 artist,
                 title,
                 fallback_score,
-                fallback_metadata.get("view_count", 0),
-                fallback_metadata.get("subscriber_count", 0),
+                fallback_metadata.get("view_count", None),
+                fallback_metadata.get("subscriber_count", None),
                 fallback_metadata.get("channel_name", "Unknown"),
             )
             return fallback_track, fallback_features
 
-        # Phase 6: Final Failure - Use highest engagement as last resort
+        # Final Failure - Use highest engagement as last resort
         if results:
             # Find track with highest engagement score
             best_engagement_track = None
@@ -1018,11 +1018,9 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             title_similarity = max(title_similarity, 0.92)
 
         # Penalize multi-part titles when looking for simple titles
-        # e.g., "IMPULSE!" vs "Impulse - 2 - Ameliorate"
         title_part_penalty = 0.0
         candidate_has_track_number = False
 
-        # Check for track numbers: "- 2 -", "Track 2", "Pt. 2", etc.
         track_number_patterns = [
             r"\s-\s\d+\s-\s",
             r"\strack\s*\d+",
@@ -1042,7 +1040,6 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         title_parts_expected = len(re.split(r"\s+[-|]\s+", normalized_title))
 
         if title_parts_candidate > title_parts_expected + 1:
-            # Candidate has more parts than expected (e.g., "Artist - Title - Subtitle")
             title_part_penalty += 0.15 * (title_parts_candidate - title_parts_expected)
 
         # If the expected title is very short and simple, be stricter
@@ -1075,10 +1072,8 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         if title_part_penalty > 0.0:
             # Require higher artist similarity threshold
             if artist_similarity < 0.75:
-                # Strong penalty if artist doesn't match well
                 artist_similarity *= 1.0 - min(title_part_penalty * 2.0, 0.9)
             elif artist_similarity < 0.85:
-                # Moderate penalty for partial matches
                 artist_similarity *= 1.0 - min(title_part_penalty, 0.5)
 
         channel_similarity = artist_similarity_channel
@@ -1112,7 +1107,6 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             )
             duration_tolerance_ms = base_tolerance
             if is_verified or channel_official_hint_score >= 0.6:
-                # Allow slightly wider tolerance for official uploads
                 duration_tolerance_ms = int(base_tolerance * 1.4)
             duration_within_tolerance = duration_delta_ms <= duration_tolerance_ms
             ratio = 1.0 - min(duration_delta_ms / max(expected_duration_ms, 1), 1.2)
@@ -1252,7 +1246,7 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         score += 2.0 * title_similarity
         score += (
             3.0 * artist_similarity
-        )  # Increased from 2.2 to prioritize artist matching
+        )  
         score += 1.2 * channel_similarity
         score += 1.8 * engagement_score
         score += 0.9 * channel_official_hint_score
@@ -1318,8 +1312,8 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
 
     async def _get_node(self) -> Optional[Any]:
         try:
-            import pomice  # type: ignore[import-error]
-        except Exception as exc:  # pragma: no cover - dependency optional
+            import pomice 
+        except Exception as exc:  
             LOG.error("Pomice not available: %s", exc)
             return None
 
@@ -1413,10 +1407,6 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             )
             return True
 
-        # Check 3: Check URL/ID for spam patterns (if available from cached data)
-        # Note: MappingEntry doesn't store title, so we can't check hashtags here
-        # The hashtag check happens during live search in _search_with_pomice
-
         return False
 
     def _is_spam_title(
@@ -1458,7 +1448,6 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
                             title[:60],
                         )
                         continue
-                    # Also allow if channel name suggests official (has artist name, vevo, topic, etc.)
                     if channel_lower and any(
                         hint in channel_lower
                         for hint in ["vevo", "topic", "records", "official"]
