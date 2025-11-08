@@ -166,6 +166,7 @@ class ParsingEntry:
     parsed_at: float
     track_type: str = "music"  # "music", "ost", "game_soundtrack", "anime_opening"
     primary_entity: Optional[str] = None  # Franchise/show/game name for OST content
+    schema_version: int = 1
 
     def is_expired(self, ttl_seconds: float) -> bool:
         return (time.time() - self.parsed_at) > ttl_seconds
@@ -196,6 +197,7 @@ class ParsingEntry:
                 if payload.get("primary_entity")
                 else None
             ),
+            schema_version=int(payload.get("schema_version", 1) or 1),
         )
 
 
@@ -371,6 +373,10 @@ class CacheManager:
         async with self._lock:
             self._parsing_cache[key] = entry
             self._save_map(self._parsing_file, self._parsing_cache)
+
+    async def delete_parsing(self, raw_title: str, channel_name: str) -> None:
+        key = self._normalize_parse_key(raw_title, channel_name)
+        await self._delete_parsing(key)
 
     async def _delete_parsing(self, key: str) -> None:
         async with self._lock:

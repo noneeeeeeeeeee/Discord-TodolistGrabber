@@ -9,11 +9,16 @@ code.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import random
 import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import aiohttp
@@ -32,6 +37,26 @@ _PARALLEL_ENRICH_LIMIT = 5
 _MIN_CONTENT_SIMILARITY = 0.05
 _RECENT_TRACKS_FILTER_SIZE = 10  # Prevent repeating last 10 tracks
 _ARTIST_COOLDOWN_SIZE = 5  # Don't pick same artist within last 5 tracks
+_PUBLISHER_KEYWORDS = {
+    "prime video",
+    "watertower music",
+    "universal pictures",
+    "netflix",
+    "crunchyroll",
+    "disney",
+    "official soundtrack",
+    "soundtrack",
+}
+_DEFAULT_PRIMARY_GENRE = "soundtrack"
+_DEFAULT_SECONDARY_GENRE = "musical"
+_DISCOVERY_TAG_FALLBACKS = ["musical theatre", "show tunes", "broadway"]
+
+# Phase 5: Telemetry configuration
+_TELEMETRY_DIR = Path("cache/music/telemetry")
+_TELEMETRY_FILE = "v3_training_data.jsonl"
+_TELEMETRY_MAX_SIZE_MB = 50
+_TELEMETRY_MAX_FILES = 5
+_TELEMETRY_QUALITY_THRESHOLD = 8.0
 
 
 @dataclass(slots=True)
@@ -66,6 +91,14 @@ class LastFMAutoplayV2:
             "enrichment_misses": 0,
             "gemini_calls": 0,
         }
+
+        # Phase 4: Diversity injection tracking (per-guild)
+        self._consecutive_safe_picks: Dict[int, int] = defaultdict(int)
+
+        # Phase 5: Telemetry initialization
+        self._telemetry_dir = _TELEMETRY_DIR
+        self._telemetry_dir.mkdir(parents=True, exist_ok=True)
+        self._telemetry_enabled = os.getenv("AUTOPLAY_TELEMETRY_ENABLED", "1") == "1"
 
     # ------------------------------------------------------------------
     # Internal helpers for context tracking (Issue #3)
@@ -341,6 +374,83 @@ class LastFMAutoplayV2:
             primary_entity=primary_entity,
         )
 
+        # Phase 5: Log telemetry data for ML training
+        # Get session context for telemetry
+        context_data = tracker.get_context()
+
+        # Build telemetry entry
+        telemetry_context = {
+            "focus_genres": (
+                context_data.focus_genres[:5] if context_data.focus_genres else []
+            ),
+            "liked_mood_vector": (
+                list(context_data.liked_mood_vector)
+                if context_data.liked_mood_vector
+                else None
+            ),
+            "disliked_tags": (
+                dict(
+                    sorted(
+                        context_data.disliked_tags.items(),
+                        key=lambda x: x[1],
+                        reverse=True,
+                    )[:10]
+                )
+                if context_data.disliked_tags
+                else {}
+            ),
+            "energy_trend": context_data.energy_trend,
+        }
+
+        telemetry_candidate = {
+            "artist": artist,
+            "title": title,
+            "genres": genres[:5] if genres else [],
+            "mood_vector": (
+                list(mood_vector)
+                if mood_vector and hasattr(mood_vector, "__iter__")
+                else None
+            ),
+            "track_type": track_type,
+            "primary_entity": primary_entity,
+            "pool_source": None,  # Not available in feedback context
+        }
+
+        telemetry_outcome = {
+            "progress_ratio": ratio,
+            "num_likes": final_num_likes,
+            "num_dislikes": final_num_dislikes,
+            "num_active_listeners": final_num_active_listeners,
+        }
+
+        # Estimate quality (we don't have full mapping quality here, use heuristics)
+        # High progress ratio + likes suggest good quality
+        estimated_quality = 0.0
+        if ratio >= 0.85:
+            estimated_quality += 4.0
+        elif ratio >= 0.5:
+            estimated_quality += 2.0
+
+        if final_num_likes > 0:
+            like_ratio = final_num_likes / max(1, final_num_active_listeners)
+            estimated_quality += like_ratio * 5.0
+
+        if final_num_dislikes > 0:
+            dislike_ratio = final_num_dislikes / max(1, final_num_active_listeners)
+            estimated_quality -= dislike_ratio * 3.0
+
+        telemetry_quality = {
+            "heuristic_score": max(0.0, min(10.0, estimated_quality)),
+            "spam_flags": [],  # Not available in feedback context
+        }
+
+        self._log_telemetry(
+            context=telemetry_context,
+            candidate=telemetry_candidate,
+            outcome=telemetry_outcome,
+            mapping_quality=telemetry_quality,
+        )
+
     async def get_recommendations_for_track(
         self,
         track_info: Dict[str, Any],
@@ -515,8 +625,49 @@ class LastFMAutoplayV2:
         # Re-sort after applying all penalties
         scored.sort(key=lambda c: c.score, reverse=True)
 
-        if self._engine._verbose and scored:
-            top = scored[0]
+        # Phase 4: Diversity injection - check if we need to force exploration
+        consecutive_safe = self._consecutive_safe_picks.get(guild_id, 0)
+        force_diversity = consecutive_safe >= 5
+
+        if force_diversity and self._verbose:
+            LOG.info(
+                "🌈 [Diversity Injection] Forcing discovery pick after %d safe picks",
+                consecutive_safe,
+            )
+
+        # Phase 4: Apply diversity injection filter if needed
+        selection_pool = scored
+        if force_diversity:
+            # Filter to pool_d_discovery candidates with score >= 7.0
+            discovery_candidates = [
+                c
+                for c in scored
+                if metadata_index.get(c.track_id, {}).get("pool_source")
+                == "pool_d_discovery"
+                and c.score >= 7.0
+            ]
+
+            if discovery_candidates:
+                selection_pool = discovery_candidates
+                if self._verbose:
+                    LOG.info(
+                        "🌈 [Diversity Injection] Filtered to %d discovery candidates (from %d total)",
+                        len(discovery_candidates),
+                        len(scored),
+                    )
+            else:
+                # Fallback: use any candidate with score >= 7.0
+                fallback_pool = [c for c in scored if c.score >= 7.0]
+                if fallback_pool:
+                    selection_pool = fallback_pool
+                    if self._verbose:
+                        LOG.warning(
+                            "🌈 [Diversity Injection] No discovery candidates, using fallback pool of %d",
+                            len(fallback_pool),
+                        )
+
+        if self._engine._verbose and selection_pool:
+            top = selection_pool[0]
             top_meta = metadata_index.get(top.track_id, {})
             # Try to find mood label from the prepared candidate features
             top_feat = next(
@@ -561,22 +712,129 @@ class LastFMAutoplayV2:
             else:
                 tracker.increment_novelty_counter()
 
+        # Phase 4: Stochastic selection with safe gate
         results: List[Tuple[str, Any]] = []
-        for candidate in scored:
-            meta = metadata_index.get(candidate.track_id)
+        max_retries = 3
+        retry_count = 0
+
+        while (
+            len(results) < max(1, limit)
+            and selection_pool
+            and retry_count <= max_retries
+        ):
+            # Phase 4 Task 5.3: Stochastic selection from top 5
+            top_k = min(5, len(selection_pool))
+            top_candidates = selection_pool[:top_k]
+
+            # Calculate weights as score^2 for non-linear preference
+            weights = [c.score**2 for c in top_candidates]
+            total_weight = sum(weights)
+
+            if total_weight <= 0:
+                # Fallback to uniform if all scores are 0 or negative
+                selected_candidate = top_candidates[0]
+            else:
+                # Weighted random selection
+                selected_candidate = random.choices(
+                    top_candidates, weights=weights, k=1
+                )[0]
+
+            # Log stochastic selection if verbose
+            if self._verbose >= 2 and top_k > 1:
+                LOG.debug(
+                    "🎲 [Stochastic Selection] Picked '%s' (score=%.3f) from top %d candidates",
+                    selected_candidate.title,
+                    selected_candidate.score,
+                    top_k,
+                )
+
+            # Phase 4 Task 5.4: Safe gate - check quality threshold
+            meta = metadata_index.get(selected_candidate.track_id)
             if not meta:
+                # Remove from pool and retry
+                selection_pool = [
+                    c
+                    for c in selection_pool
+                    if c.track_id != selected_candidate.track_id
+                ]
+                retry_count += 1
                 continue
+
+            # Resolve track
             track_obj = await self._engine.resolve_track(
                 meta["artist"],
                 meta["title"],
                 expected_duration_ms=expected_duration_ms,
             )
+
             if not track_obj:
+                # Track resolution failed, remove and retry
+                selection_pool = [
+                    c
+                    for c in selection_pool
+                    if c.track_id != selected_candidate.track_id
+                ]
+                retry_count += 1
+                if self._verbose:
+                    LOG.debug(
+                        "❌ [Safe Gate] Track resolution failed for '%s', retrying (%d/%d)",
+                        selected_candidate.title,
+                        retry_count,
+                        max_retries,
+                    )
                 continue
+
+            # Safe gate quality check
+            quality_threshold = (
+                8.0 if retry_count == 0 else 7.0
+            )  # Lower threshold on retries
+            if (
+                selected_candidate.score < quality_threshold
+                and retry_count < max_retries
+            ):
+                # Score too low, remove and retry
+                selection_pool = [
+                    c
+                    for c in selection_pool
+                    if c.track_id != selected_candidate.track_id
+                ]
+                retry_count += 1
+                if self._verbose:
+                    LOG.info(
+                        "⚠️ [Safe Gate] Score %.3f below threshold %.1f for '%s', retrying (%d/%d)",
+                        selected_candidate.score,
+                        quality_threshold,
+                        selected_candidate.title,
+                        retry_count,
+                        max_retries,
+                    )
+                continue
+
+            # Track passed safe gate
             self._note_recommendation(guild_id, meta["artist"], meta["title"])
-            results.append((candidate.track_id, track_obj))
-            if len(results) >= max(1, limit):
-                break
+            results.append((selected_candidate.track_id, track_obj))
+
+            # Phase 4 Task 5.1/5.2: Update diversity injection counter
+            if selected_candidate.score >= 8.0:
+                self._consecutive_safe_picks[guild_id] = consecutive_safe + 1
+                if self._verbose >= 2:
+                    LOG.debug(
+                        "📈 [Diversity Counter] Incremented to %d after safe pick",
+                        self._consecutive_safe_picks[guild_id],
+                    )
+            elif force_diversity:
+                # Reset counter on diversity injection
+                self._consecutive_safe_picks[guild_id] = 0
+                if self._verbose:
+                    LOG.info(
+                        "🔄 [Diversity Counter] Reset to 0 after diversity injection"
+                    )
+
+            # Remove selected candidate from pool for next iteration
+            selection_pool = [
+                c for c in selection_pool if c.track_id != selected_candidate.track_id
+            ]
+            retry_count = 0  # Reset retry count for next track
 
         if not results:
             LOG.debug("Autoplay V2 produced no playable tracks after resolution")
@@ -671,12 +929,11 @@ class LastFMAutoplayV2:
         """
         Task 3.2: Fetch Branch A (entity-based) pools for OST content.
 
-        Pool A: tag.getTopTracks(entity) - 40 tracks
-        Pool B: track.getSimilar(seed) - 30 tracks
-        Pool C: artist.getTopTracks(recent_artists) - 30 tracks
-        Total: ~100 tracks
-
-        Validates Hazbin Hotel fix from Phase 0.5.
+        Prong 1: tag.getTopTracks(entity) - 40 tracks
+        Prong 2: track.getSimilar(seed) or fallback tag continuity - 30 tracks
+        Prong 3: artist.getTopTracks(recent artists) or secondary genre - 30 tracks
+        Prong 4: tag.getSimilar(entity) -> tag.getTopTracks(discovery tag) - 20 tracks
+        Total: ~110-120 tracks
         """
         if self._engine._verbose:
             LOG.info(
@@ -685,34 +942,95 @@ class LastFMAutoplayV2:
                 seed_entity,
             )
 
-        # Pool A: Entity cluster (use entity as tag)
-        pool_a = await self._fetch_tag_top_tracks(seed_entity, limit=40)
+        # Phase 7 Task 8.1: Parallel pool fetching with asyncio.gather
+        focus_genres = getattr(context, "focus_genres", []) or []
+
+        # Fetch all pools in parallel
+        pool_a_task = self._fetch_tag_top_tracks(seed_entity, limit=40)
+        pool_b_task = (
+            self._fetch_track_similar(seed_artist, seed_title, limit=30)
+            if seed_artist and not self._is_publisher_name(seed_artist)
+            else asyncio.sleep(0, result=[])
+        )
+        pool_d_task = self._fetch_discovery_tag_tracks(
+            seed_entity=seed_entity, focus_genres=focus_genres, limit=20
+        )
+
+        pool_a, pool_b_raw, pool_d = await asyncio.gather(
+            pool_a_task, pool_b_task, pool_d_task
+        )
+
+        # Tag pool sources
         for record in pool_a:
             record["pool_source"] = "pool_a_entity_cluster"
 
-        # Pool B: Track continuity
-        pool_b = await self._fetch_track_similar(seed_artist, seed_title, limit=30)
+        # Pool B: Continuity with fallback
+        pool_b = pool_b_raw if isinstance(pool_b_raw, list) else []
+        continuity_source = "pool_a_continuity"
+
+        if not pool_b:
+            fallback_tag = self._select_genre_tag(
+                focus_genres, 0, _DEFAULT_PRIMARY_GENRE
+            )
+            if fallback_tag:
+                if self._engine._verbose:
+                    LOG.debug(
+                        "[Branch A] Continuity fallback using tag.getTopTracks tag=%s (seed_artist=%s)",
+                        fallback_tag,
+                        seed_artist or "<none>",
+                    )
+                pool_b = await self._fetch_tag_top_tracks(fallback_tag, limit=30)
+                continuity_source = "pool_a_continuity_fallback"
         for record in pool_b:
-            record["pool_source"] = "pool_a_continuity"  # Still Pool A conceptually
+            record["pool_source"] = continuity_source
 
-        # Pool C: Artist familiarity (get recent artists from history)
-        recent_artists = self._extract_recent_artists(tracker, max_artists=3)
-        pool_c = []
-        for artist in recent_artists:
-            artist_tracks = await self._fetch_artist_top_tracks(artist, limit=10)
-            pool_c.extend(artist_tracks)
+        # Pool C: Safe harbor (prefer recent non-publisher artists, fallback to secondary genre)
+        recent_artists = [
+            artist
+            for artist in self._extract_recent_artists(tracker, max_artists=3)
+            if not self._is_publisher_name(artist)
+        ]
+        pool_c: List[Dict[str, Any]] = []
+        safe_harbor_source = "pool_b_familiarity"
+
+        # Phase 7 Task 8.1: Fetch artist tracks in parallel
+        if recent_artists:
+            artist_tasks = [
+                self._fetch_artist_top_tracks(artist, limit=10)
+                for artist in recent_artists
+            ]
+            artist_results = await asyncio.gather(*artist_tasks)
+            for artist_tracks in artist_results:
+                pool_c.extend(artist_tracks)
+
+        if not pool_c:
+            fallback_tag = self._select_genre_tag(
+                focus_genres, 1, _DEFAULT_SECONDARY_GENRE
+            )
+            if fallback_tag:
+                if self._engine._verbose:
+                    LOG.debug(
+                        "[Branch A] Safe harbor fallback using tag.getTopTracks tag=%s (recent artists were publishers)",
+                        fallback_tag,
+                    )
+                pool_c = await self._fetch_tag_top_tracks(fallback_tag, limit=30)
+                safe_harbor_source = "pool_b_familiarity_genre"
         for record in pool_c:
-            record["pool_source"] = "pool_b_familiarity"
+            record["pool_source"] = safe_harbor_source
 
-        all_pools = pool_a + pool_b + pool_c
+        for record in pool_d:
+            record["pool_source"] = "pool_d_discovery"
+
+        all_pools = pool_a + pool_b + pool_c + pool_d
 
         if self._engine._verbose:
             LOG.info(
-                "🎬 [Branch A] Fetched %d tracks (A:%d, B:%d, C:%d)",
+                "🎬 [Branch A] Fetched %d tracks (Entity:%d, Continuity:%d, Safe:%d, Discovery:%d)",
                 len(all_pools),
                 len(pool_a),
                 len(pool_b),
                 len(pool_c),
+                len(pool_d),
             )
 
         return all_pools
@@ -736,17 +1054,20 @@ class LastFMAutoplayV2:
         if self._engine._verbose:
             LOG.info("❄️ [Cold Start] Seed-centric fetch for '%s'", seed_title)
 
-        # Pool A: Continuity from seed
-        pool_a = await self._fetch_track_similar(seed_artist, seed_title, limit=60)
+        # Phase 7 Task 8.1: Parallel pool fetching
+        pool_a_task = self._fetch_track_similar(seed_artist, seed_title, limit=60)
+
+        # Pool C: Safe harbor from top focus genre
+        pool_c_task = asyncio.sleep(0, result=[])
+        if context.focus_genres:
+            top_genre = context.focus_genres[0]
+            pool_c_task = self._fetch_tag_top_tracks(top_genre, limit=30)
+
+        pool_a, pool_c = await asyncio.gather(pool_a_task, pool_c_task)
+
         for record in pool_a:
             record["pool_source"] = "pool_a_continuity"
 
-        # Pool C: Safe harbor from top focus genre
-        pool_c = []
-        if context.focus_genres:
-            top_genre = context.focus_genres[0]
-            genre_tracks = await self._fetch_tag_top_tracks(top_genre, limit=30)
-            pool_c.extend(genre_tracks)
         for record in pool_c:
             record["pool_source"] = "pool_c_safe_harbor"
 
@@ -784,47 +1105,73 @@ class LastFMAutoplayV2:
         if self._engine._verbose:
             LOG.info("🔥 [Warm Start] Profile-aware fetch for '%s'", seed_title)
 
-        # Pool A: Continuity from seed
-        pool_a = await self._fetch_track_similar(seed_artist, seed_title, limit=30)
+        # Phase 7 Task 8.1: Parallel pool fetching
+        pool_a_task = self._fetch_track_similar(seed_artist, seed_title, limit=30)
+
+        # Pool B: Familiarity from recent artists (fetch in parallel)
+        recent_artists = self._extract_recent_artists(tracker, max_artists=3)
+        pool_b_tasks = [
+            self._fetch_artist_top_tracks(artist, limit=10) for artist in recent_artists
+        ]
+
+        # Pool C: Genre safe harbor
+        pool_c_task = asyncio.sleep(0, result=[])
+        if context.focus_genres:
+            top_genre = context.focus_genres[0]
+            pool_c_task = self._fetch_tag_top_tracks(top_genre, limit=30)
+
+        # Execute Pool A, B, C in parallel
+        pool_a, pool_b_results, pool_c = await asyncio.gather(
+            pool_a_task,
+            (
+                asyncio.gather(*pool_b_tasks)
+                if pool_b_tasks
+                else asyncio.sleep(0, result=[])
+            ),
+            pool_c_task,
+        )
+
+        # Flatten Pool B results
+        pool_b = []
+        if isinstance(pool_b_results, list):
+            for artist_tracks in pool_b_results:
+                if isinstance(artist_tracks, list):
+                    pool_b.extend(artist_tracks)
+
         for record in pool_a:
             record["pool_source"] = "pool_a_continuity"
 
-        # Pool B: Familiarity from recent artists
-        recent_artists = self._extract_recent_artists(tracker, max_artists=3)
-        pool_b = []
-        for artist in recent_artists:
-            artist_tracks = await self._fetch_artist_top_tracks(artist, limit=10)
-            pool_b.extend(artist_tracks)
         for record in pool_b:
             record["pool_source"] = "pool_b_familiarity"
 
-        # Pool C: Genre safe harbor
-        pool_c = []
-        if context.focus_genres:
-            # Use top genre for safe harbor
-            top_genre = context.focus_genres[0]
-            genre_tracks = await self._fetch_tag_top_tracks(top_genre, limit=30)
-            pool_c.extend(genre_tracks)
         for record in pool_c:
             record["pool_source"] = "pool_c_safe_harbor"
 
-        # Pool D: Discovery from similar artists
+        # Pool D: Discovery from similar artists (sequential due to dependencies)
         pool_d = []
         most_liked_artist = self._extract_most_liked_artist(tracker)
         if most_liked_artist:
             similar_artists = await self._fetch_artist_similar(
                 most_liked_artist, limit=5
             )
-            for artist_record in similar_artists:
+
+            # Fetch discovery tracks in parallel
+            discovery_tasks = []
+            for artist_record in similar_artists[:5]:  # Limit to 5 similar artists
                 artist_name = self._extract_artist(artist_record)
-                if not artist_name:
-                    continue
-                discovery_tracks = await self._fetch_artist_top_tracks(
-                    artist_name, limit=4
-                )
-                pool_d.extend(discovery_tracks)
-                if len(pool_d) >= 20:
-                    break
+                if artist_name:
+                    discovery_tasks.append(
+                        self._fetch_artist_top_tracks(artist_name, limit=4)
+                    )
+
+            if discovery_tasks:
+                discovery_results = await asyncio.gather(*discovery_tasks)
+                for discovery_tracks in discovery_results:
+                    pool_d.extend(discovery_tracks)
+                    if len(pool_d) >= 20:
+                        pool_d = pool_d[:20]  # Trim to limit
+                        break
+
         for record in pool_d:
             record["pool_source"] = "pool_d_discovery"
 
@@ -865,6 +1212,26 @@ class LastFMAutoplayV2:
                     break
 
         return recent
+
+    def _is_publisher_name(self, name: Optional[str]) -> bool:
+        if not name:
+            return False
+        normalized = name.lower().strip()
+        if not normalized:
+            return False
+        return any(keyword in normalized for keyword in _PUBLISHER_KEYWORDS)
+
+    def _select_genre_tag(
+        self,
+        focus_genres: Sequence[str],
+        index: int,
+        default: str,
+    ) -> Optional[str]:
+        if focus_genres and index < len(focus_genres):
+            candidate = str(focus_genres[index]).strip()
+            if candidate:
+                return candidate
+        return default
 
     def _extract_most_liked_artist(self, tracker: Any) -> Optional[str]:
         """
@@ -1193,6 +1560,97 @@ class LastFMAutoplayV2:
 
         return trimmed
 
+    async def _fetch_similar_tags(
+        self,
+        tag: str,
+        limit: int = 5,
+    ) -> List[str]:
+        if not self._lastfm_key or not tag:
+            return []
+
+        params = {
+            "method": "tag.getSimilar",
+            "tag": tag,
+            "limit": str(limit),
+            "api_key": self._lastfm_key,
+            "format": "json",
+        }
+
+        try:
+            async with aiohttp.ClientSession(timeout=self._http_timeout) as session:
+                async with session.get(_LASTFM_API_URL, params=params) as response:
+                    if response.status != 200:
+                        if self._engine._verbose:
+                            LOG.debug(
+                                "Last.fm tag.getSimilar failed (%s) for tag=%s",
+                                response.status,
+                                tag,
+                            )
+                        return []
+                    payload = await response.json(content_type=None)
+        except Exception as exc:
+            LOG.debug("Last.fm tag.getSimilar request failed for %s: %s", tag, exc)
+            return []
+
+        tags = payload.get("similartags", {}).get("tag", [])
+        if isinstance(tags, dict):
+            tags = [tags]
+        if not isinstance(tags, list):
+            return []
+
+        results: List[str] = []
+        for entry in tags:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                continue
+            results.append(name)
+            if len(results) >= limit:
+                break
+
+        return results
+
+    async def _fetch_discovery_tag_tracks(
+        self,
+        *,
+        seed_entity: str,
+        focus_genres: Sequence[str],
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        normalized_entity = seed_entity.lower().strip()
+        discovery_tags = await self._fetch_similar_tags(seed_entity, limit=5)
+
+        # Build a prioritized list of tags to try
+        sequence: List[str] = []
+        sequence.extend(discovery_tags)
+        sequence.extend(str(g).strip() for g in focus_genres[:2] if g)
+        sequence.extend(_DISCOVERY_TAG_FALLBACKS)
+
+        seen: set[str] = set()
+        for tag in sequence:
+            candidate = str(tag).strip()
+            if not candidate:
+                continue
+            candidate_lower = candidate.lower()
+            if candidate_lower == normalized_entity:
+                continue
+            if candidate_lower in seen:
+                continue
+            seen.add(candidate_lower)
+
+            tracks = await self._fetch_tag_top_tracks(candidate, limit=limit)
+            if tracks:
+                if self._engine._verbose:
+                    LOG.debug(
+                        "[Branch A] Discovery tag '%s' yielded %d tracks",
+                        candidate,
+                        len(tracks),
+                    )
+                return tracks
+
+        return []
+
     async def _fetch_artist_similar(
         self,
         artist: str,
@@ -1325,21 +1783,6 @@ class LastFMAutoplayV2:
             cached = await self._engine._cache.get_enrichment(clean_artist, clean_title)
             if cached:
                 self._cache_stats["enrichment_hits"] += 1
-                if self._engine._verbose:
-                    LOG.info(
-                        "📁 [Cache Hit: Batch Enrichment] %s - %s",
-                        (
-                            clean_artist[:30] + "..."
-                            if len(clean_artist) > 30
-                            else clean_artist
-                        ),
-                        (
-                            clean_title[:40] + "..."
-                            if len(clean_title) > 40
-                            else clean_title
-                        ),
-                    )
-                # Build enrichment dict from cache
                 enrichment_cache[track_id] = {
                     "tags": cached.tags,
                     "mood": cached.mood,
@@ -1383,6 +1826,12 @@ class LastFMAutoplayV2:
         if pending_enrichments:
             await asyncio.gather(*pending_enrichments.values(), return_exceptions=True)
 
+            # Track Gemini usage for this batch
+            self._cache_stats["gemini_calls"] += 1
+
+            # CRITICAL FIX: Store ALL batch results in cache (not just the selected track)
+            await self._store_batch_enrichments(tracks_needing_enrichment)
+
             # Process completed enrichments (mood vector now included in enrichment response)
             for track_id, future in pending_enrichments.items():
                 try:
@@ -1395,32 +1844,41 @@ class LastFMAutoplayV2:
                             )
 
                             if clean_artist and clean_title:
-                                tags = [
-                                    str(tag).lower()
-                                    for tag in result.get("tags", [])
-                                    if isinstance(tag, str)
-                                ]
-                                moods = [
-                                    str(mood).strip()
-                                    for mood in result.get("moods", [])
-                                    if isinstance(mood, str) and mood.strip()
-                                ]
-                                mood_value = moods[0] if moods else None
-                                energy = (
-                                    result.get("energy")
-                                    if isinstance(result.get("energy"), str)
-                                    else None
+                                cached_entry = await self._engine._cache.get_enrichment(
+                                    clean_artist, clean_title
                                 )
-                                mood_vector = result.get(
-                                    "mood_vector"
-                                )  # Already included from enrich_track()
-
-                                enrichment_cache[track_id] = {
-                                    "tags": tags,
-                                    "mood": mood_value,
-                                    "energy": energy,
-                                    "mood_vector": mood_vector,
-                                }
+                                if cached_entry:
+                                    enrichment_cache[track_id] = {
+                                        "tags": cached_entry.tags,
+                                        "mood": cached_entry.mood,
+                                        "energy": cached_entry.energy,
+                                        "mood_vector": await self._engine._cached_mood_vector_dict(
+                                            cached_entry.mood_vector_id
+                                        ),
+                                    }
+                                else:
+                                    tags = [
+                                        str(tag).lower()
+                                        for tag in result.get("tags", [])
+                                        if isinstance(tag, str)
+                                    ]
+                                    moods = [
+                                        str(mood).strip()
+                                        for mood in result.get("moods", [])
+                                        if isinstance(mood, str) and mood.strip()
+                                    ]
+                                    mood_value = moods[0] if moods else None
+                                    energy = (
+                                        result.get("energy")
+                                        if isinstance(result.get("energy"), str)
+                                        else None
+                                    )
+                                    enrichment_cache[track_id] = {
+                                        "tags": tags,
+                                        "mood": mood_value,
+                                        "energy": energy,
+                                        "mood_vector": result.get("mood_vector"),
+                                    }
                             else:
                                 enrichment_cache[track_id] = None
                         else:
@@ -1489,6 +1947,114 @@ class LastFMAutoplayV2:
                 len(records),
             )
         return prepared
+
+    async def _store_batch_enrichments(
+        self, tracks_needing_enrichment: List[Tuple[str, str, str]]
+    ) -> None:
+        """Store all batch enrichment results in cache (fixes 98% quota waste bug)."""
+        batch_results = self._engine._gemini.get_last_batch_results()
+        if not batch_results:
+            return
+
+        stored_count = 0
+        for track_id, artist, title in tracks_needing_enrichment:
+            normalized_key = f"{artist.strip().lower()}::{title.strip().lower()}"
+            payload = batch_results.get(normalized_key)
+
+            if not payload:
+                continue
+
+            try:
+                # Build enrichment entry (same logic as enrich_track)
+                tags = [
+                    str(tag).lower()
+                    for tag in payload.get("tags", [])
+                    if isinstance(tag, str)
+                ]
+                moods = [
+                    str(m).strip()
+                    for m in payload.get("moods", [])
+                    if isinstance(m, str) and m.strip()
+                ]
+                mood_value = moods[0] if moods else None
+                energy = (
+                    payload.get("energy")
+                    if isinstance(payload.get("energy"), str)
+                    else None
+                )
+
+                # Extract mood vector if present
+                mood_vector_id = None
+                mood_vector_data = payload.get("mood_vector")
+                if mood_vector_data and isinstance(mood_vector_data, dict):
+                    try:
+                        from .cache_manager import MoodVectorEntry
+
+                        mood_vector_entry = MoodVectorEntry(
+                            energy=float(mood_vector_data.get("energy", 0.0) or 0.0),
+                            valence=float(mood_vector_data.get("valence", 0.0) or 0.0),
+                            tempo=float(mood_vector_data.get("tempo", 0.0) or 0.0),
+                            confidence=float(
+                                mood_vector_data.get("confidence", 0.0) or 0.0
+                            ),
+                            mood=(
+                                str(mood_vector_data.get("mood", "")).strip() or None
+                            ),
+                            fetched_at=time.time(),
+                        )
+                        await self._engine._cache.set_mood_vector(
+                            normalized_key, mood_vector_entry
+                        )
+                        mood_vector_id = normalized_key
+                    except Exception as exc:
+                        LOG.debug(
+                            f"Failed to parse mood_vector for {normalized_key}: {exc}"
+                        )
+
+                # Extract extended metadata
+                bpm_val = payload.get("bpm")
+                key_val = payload.get("key")
+                activity_val = payload.get("activity_affinity")
+                intensity_val = payload.get("emotional_intensity")
+                daypart_val = payload.get("daypart_affinity")
+
+                from .cache_manager import EnrichmentEntry
+
+                enrichment_entry = EnrichmentEntry(
+                    tags=tags,
+                    mood=mood_value,
+                    listeners=0,  # TODO: Fetch from Last.fm
+                    playcount=0,  # TODO: Fetch from Last.fm
+                    duration_ms=None,  # TODO: Fetch from Last.fm
+                    fetched_at=time.time(),
+                    mood_vector_id=mood_vector_id,
+                    energy=energy,
+                    bpm=int(bpm_val) if bpm_val and str(bpm_val).isdigit() else None,
+                    key=str(key_val).strip() if key_val else None,
+                    activity_affinity=(
+                        str(activity_val).strip() if activity_val else None
+                    ),
+                    emotional_intensity=(
+                        float(intensity_val) if intensity_val is not None else None
+                    ),
+                    daypart_affinity=(
+                        str(daypart_val).strip() if daypart_val else None
+                    ),
+                )
+
+                await self._engine._cache.set_enrichment(
+                    artist, title, enrichment_entry
+                )
+                stored_count += 1
+            except Exception as exc:
+                LOG.debug(
+                    f"Failed to store batch enrichment for {normalized_key}: {exc}"
+                )
+
+        if stored_count > 0:
+            LOG.info(
+                f"💾 [Batch Storage] Cached {stored_count}/{len(tracks_needing_enrichment)} enrichments from batch"
+            )
 
     async def _prepare_single_candidate(
         self,
@@ -1573,6 +2139,9 @@ class LastFMAutoplayV2:
             "source": record.get("_source"),
             "playcount": record.get("playcount"),
             "listeners": record.get("listeners"),
+            "pool_source": record.get(
+                "pool_source"
+            ),  # Phase 4: For diversity injection
         }
         if self._engine._verbose >= 2:
             LOG.debug(
@@ -1737,6 +2306,92 @@ class LastFMAutoplayV2:
                 return True
 
         return False
+
+    # ------------------------------------------------------------------
+    # Phase 5: Telemetry logging for v3 ML training data
+    # ------------------------------------------------------------------
+    def _log_telemetry(
+        self,
+        context: Dict[str, Any],
+        candidate: Dict[str, Any],
+        outcome: Dict[str, Any],
+        mapping_quality: Dict[str, Any],
+    ) -> None:
+        """Log telemetry data for future ML training (Phase 5 Task 6.3)."""
+        if not self._telemetry_enabled:
+            return
+
+        # Quality gating (Phase 5 Task 6.2)
+        heuristic_score = mapping_quality.get("heuristic_score", 0.0)
+        spam_flags = mapping_quality.get("spam_flags", [])
+
+        if heuristic_score < _TELEMETRY_QUALITY_THRESHOLD or len(spam_flags) > 0:
+            # Skip low-quality or spam tracks
+            return
+
+        telemetry_entry = {
+            "context": context,
+            "candidate": candidate,
+            "outcome": outcome,
+            "mapping_quality": mapping_quality,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+
+        # Write to JSONL file
+        telemetry_path = self._telemetry_dir / _TELEMETRY_FILE
+        try:
+            with open(telemetry_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(telemetry_entry) + "\n")
+
+            # Phase 5 Task 6.4: Check for log rotation
+            self._rotate_telemetry_if_needed(telemetry_path)
+
+        except Exception as exc:
+            LOG.debug(f"Failed to write telemetry: {exc}")
+
+    def _rotate_telemetry_if_needed(self, telemetry_path: Path) -> None:
+        """Rotate telemetry log if it exceeds size limit (Phase 5 Task 6.4)."""
+        try:
+            if not telemetry_path.exists():
+                return
+
+            file_size_mb = telemetry_path.stat().st_size / (1024 * 1024)
+
+            if file_size_mb > _TELEMETRY_MAX_SIZE_MB:
+                # Rotate: rename current file with timestamp
+                timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                rotated_name = f"v3_training_data_{timestamp}.jsonl"
+                rotated_path = self._telemetry_dir / rotated_name
+
+                telemetry_path.rename(rotated_path)
+                LOG.info(
+                    f"📊 [Telemetry] Rotated log to {rotated_name} ({file_size_mb:.1f} MB)"
+                )
+
+                # Clean up old files (keep last N)
+                self._cleanup_old_telemetry_files()
+
+        except Exception as exc:
+            LOG.debug(f"Failed to rotate telemetry: {exc}")
+
+    def _cleanup_old_telemetry_files(self) -> None:
+        """Keep only the last N rotated telemetry files."""
+        try:
+            # Find all rotated files
+            pattern = "v3_training_data_*.jsonl"
+            rotated_files = sorted(
+                self._telemetry_dir.glob(pattern),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+
+            # Delete files beyond the limit
+            for old_file in rotated_files[_TELEMETRY_MAX_FILES:]:
+                old_file.unlink()
+                LOG.debug(f"📊 [Telemetry] Deleted old log: {old_file.name}")
+
+        except Exception as exc:
+            LOG.debug(f"Failed to cleanup telemetry files: {exc}")
 
     @staticmethod
     def _track_id(artist: str, title: str) -> str:

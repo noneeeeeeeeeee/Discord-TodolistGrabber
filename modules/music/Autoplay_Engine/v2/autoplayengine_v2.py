@@ -21,6 +21,7 @@ LOG = logging.getLogger(__name__)
 # Verbosity control: set AUTOPLAY_V2_VERBOSITY=0 (off, default), 1 (debug), 2 (very verbose)
 DEFAULT_VERBOSITY = int(os.getenv("AUTOPLAY_V2_VERBOSITY", "0"))
 LASTFM_API_KEY_ENV = "LASTFM_API_KEY"
+PARSING_SCHEMA_VERSION = 2
 print("[AutoplayEngineV2] Set verbosity to ", DEFAULT_VERBOSITY)
 check_and_load_env_file()
 
@@ -149,27 +150,53 @@ class AutoplayEngineV2:
     ) -> Optional[Dict[str, Any]]:
         cached = await self._cache.get_parsing(raw_title, channel_name)
         if cached:
+            schema_version = getattr(cached, "schema_version", 1)
+            schema_mismatch = schema_version < PARSING_SCHEMA_VERSION
+            heuristic_refresh = self._should_refresh_parsing_cache(
+                raw_title,
+                channel_name,
+                cached,
+            )
+            needs_refresh = schema_mismatch or heuristic_refresh
+
+            if not needs_refresh:
+                if self._verbose:
+                    LOG.info(
+                        "📁 [Cache Hit: Parsing] %r / %r -> artist=%s, title=%s, track_type=%s, entity=%s",
+                        raw_title[:50] + "..." if len(raw_title) > 50 else raw_title,
+                        (
+                            channel_name[:30] + "..."
+                            if len(channel_name) > 30
+                            else channel_name
+                        ),
+                        cached.artist,
+                        cached.title,
+                        cached.track_type,
+                        cached.primary_entity or "N/A",
+                    )
+                return {
+                    "artist": cached.artist,
+                    "title": cached.title,
+                    "confidence": cached.confidence,
+                    "track_type": cached.track_type,
+                    "primary_entity": cached.primary_entity,
+                }
+
             if self._verbose:
+                reason = "schema_version" if schema_mismatch else "ost_heuristic"
                 LOG.info(
-                    "📁 [Cache Hit: Parsing] %r / %r -> artist=%s, title=%s, track_type=%s, entity=%s",
+                    "♻️ [Parsing Refresh] Re-parsing %r / %r due to %s mismatch",
                     raw_title[:50] + "..." if len(raw_title) > 50 else raw_title,
                     (
                         channel_name[:30] + "..."
                         if len(channel_name) > 30
                         else channel_name
                     ),
-                    cached.artist,
-                    cached.title,
-                    cached.track_type,
-                    cached.primary_entity or "N/A",
+                    reason,
                 )
-            return {
-                "artist": cached.artist,
-                "title": cached.title,
-                "confidence": cached.confidence,
-                "track_type": cached.track_type,
-                "primary_entity": cached.primary_entity,
-            }
+
+            # Drop stale parsing result so we can refresh with updated prompt logic
+            await self._cache.delete_parsing(raw_title, channel_name)
 
         parsed = await self._try_gemini_parse(raw_title, channel_name)
         if not parsed:
@@ -197,9 +224,47 @@ class AutoplayEngineV2:
             parsed_at=time.time(),
             track_type=parsed.get("track_type", "music"),
             primary_entity=parsed.get("primary_entity"),
+            schema_version=PARSING_SCHEMA_VERSION,
         )
         await self._cache.set_parsing(raw_title, channel_name, entry)
         return parsed
+
+    def _should_refresh_parsing_cache(
+        self,
+        raw_title: str,
+        channel_name: str,
+        cached: ParsingEntry,
+    ) -> bool:
+        """Heuristic to invalidate stale parsing entries after prompt updates."""
+        if cached.track_type != "music":
+            return False
+
+        if getattr(cached, "primary_entity", None):
+            return False
+
+        text = f"{raw_title} {channel_name}".lower()
+        ost_tokens = (
+            " ost",
+            "official soundtrack",
+            "original soundtrack",
+            "soundtrack",
+            "score",
+            "opening",
+            "ending theme",
+            "bgm",
+        )
+        if any(token in text for token in ost_tokens):
+            return True
+
+        artist = (cached.artist or "").lower().strip()
+        if artist.endswith(" cast") or artist.endswith(" ost"):
+            return True
+
+        channel = channel_name.lower().strip()
+        if channel in {"prime video", "netflix", "crunchyroll"}:
+            return True
+
+        return False
 
     async def enrich_track(
         self,
@@ -213,12 +278,12 @@ class AutoplayEngineV2:
         if cached:
             if self._verbose:
                 LOG.info(
-                    "📁 [Cache Hit: Enrichment] %s - %s -> tags=%s, mood=%s, energy=%.2f",
+                    "📁 [Cache Hit: Enrichment] %s - %s -> tags=%s, mood=%s, energy=%s",
                     artist[:30] + "..." if len(artist) > 30 else artist,
                     title[:40] + "..." if len(title) > 40 else title,
                     cached.tags[:3],
                     cached.mood,
-                    cached.energy or 0.0,
+                    cached.energy or "0.0",
                 )
             elif LOG.isEnabledFor(logging.DEBUG):
                 LOG.debug(
@@ -540,6 +605,8 @@ class AutoplayEngineV2:
                 "artist": artist,
                 "title": title,
                 "confidence": 0.92,
+                "track_type": response.get("track_type", "music"),
+                "primary_entity": response.get("primary_entity"),
             }
             return payload
         return None

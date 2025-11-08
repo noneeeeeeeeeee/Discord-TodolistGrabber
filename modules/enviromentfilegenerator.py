@@ -28,6 +28,8 @@ def check_and_load_env_file():
             "LAVALINK_SECURE=false\n"
             "\n"
             "LASTFM_API_KEY=YOUR_LASTFM_API_KEY\n"
+            "AUTOPLAY_TELEMETRY_ENABLED=1\n"
+            "AUTOPLAY_V2_VERBOSITY=0\n"
         )
         with open(env_path, "w") as env_file:
             env_file.write(example_env_content)

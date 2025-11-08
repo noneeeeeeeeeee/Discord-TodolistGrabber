@@ -119,14 +119,32 @@ class GeminiService:
         if not isinstance(payload, dict):
             return None
 
-        artist = str(payload.get("artist", "")).strip()
+        # DEBUG: Log raw Gemini response for OST detection debugging
+        raw_track_type = payload.get("track_type")
+        raw_entity = payload.get("primary_entity")
+        if raw_track_type and raw_track_type != "music":
+            LOG.info(
+                f"🎬 [OST Detection Debug] Track: '{raw_title}' | "
+                f"Channel: '{channel_name}' | "
+                f"Gemini returned track_type='{raw_track_type}', primary_entity='{raw_entity}'"
+            )
+
+        # Extract artist and title
+        raw_artist = payload.get("artist")
+        artist = str(raw_artist).strip() if raw_artist else None
         title = str(payload.get("title", "")).strip()
-        if not (artist and title):
+
+        # Title is required, artist can be null for OST content
+        if not title:
             return None
 
         # Extract and validate track_type
         track_type = str(payload.get("track_type", "music")).strip().lower()
         if track_type not in {"music", "ost", "game_soundtrack", "anime_opening"}:
+            LOG.warning(
+                f"⚠️ [OST Detection] Invalid track_type '{track_type}' returned by Gemini for '{raw_title}', "
+                f"falling back to 'music'"
+            )
             track_type = "music"
 
         # Extract primary_entity (only valid if track_type is NOT "music")
@@ -137,7 +155,22 @@ class GeminiService:
                 primary_entity = raw_entity.strip() or None
             # If OST but no entity, fallback to "music"
             if not primary_entity:
+                LOG.warning(
+                    f"⚠️ [OST Detection] track_type='{track_type}' but no valid primary_entity for '{raw_title}', "
+                    f"falling back to 'music'"
+                )
                 track_type = "music"
+
+        # For standard music, artist is required
+        if track_type == "music" and not artist:
+            return None
+
+        # Log final classification
+        if track_type != "music":
+            LOG.info(
+                f"✅ [OST Classification] '{artist or 'Unknown'} - {title}' classified as track_type='{track_type}', "
+                f"primary_entity='{primary_entity}'"
+            )
 
         return {
             "artist": artist,
@@ -237,7 +270,12 @@ class GeminiService:
             return None
 
     async def flush_enrichment_queue(self) -> None:
+        """Manually flush the enrichment queue and return batch results."""
         await self._flush_enrichment_batch()
+
+    def get_last_batch_results(self) -> Dict[str, Dict[str, Any]]:
+        """Get the last batch enrichment results for caching by caller."""
+        return getattr(self, "_last_batch_results", {})
 
     async def _enqueue_enrichment_future(
         self,
@@ -315,6 +353,11 @@ class GeminiService:
             LOG.error("❌ Gemini enrichment batch failed: %s", exc)
             result_map = {}
 
+        # Store batch results for caller to cache
+        self._last_batch_results = result_map
+        self._last_batch_entries = batch
+
+        # Set futures with results (caller will handle caching)
         for entry in batch:
             payload = result_map.get(entry.key, {})
             if not entry.future.done():
@@ -762,11 +805,12 @@ class GeminiService:
             "2. **Identify separators**: Common separators between artist and title include "
             '"–", "—", ":", "|". Use the first such clear separator **if** the text '
             "before it is plausibly an artist name rather than a franchise/show/series.\n"
-            "3. **Distinguish franchise or show names**: If the title begins with a known series, "
+            "3. **Distinguish franchise or show names**: If the title contains a known series, "
             'show, game, or franchise name (for example "MURDER DRONES", "FNAF", "Hazbin Hotel", '
-            '"Undertale", "Jujutsu Kaisen", "Attack on Titan", etc.), '
-            'treat that part as *non-artist (series/franchise)*. Do not assign it as the "artist". '
-            'Instead, set "track_type" appropriately and "primary_entity" to the franchise name.\n'
+            '"Helluva Boss", "Undertale", "Jujutsu Kaisen", "Attack on Titan", etc.), '
+            "treat that part as *non-artist (series/franchise)*. "
+            "Look for patterns like 'Song Title | Franchise Name' or 'Franchise - Song Title'. "
+            'Set "track_type" appropriately and "primary_entity" to the franchise name.\n'
             "4. **Track type classification**:\n"
             '   - "music": Standard music track (artist is a musical performer/band)\n'
             '   - "ost": Original soundtrack from a TV show or movie (e.g., Hazbin Hotel, MURDER DRONES)\n'
@@ -777,8 +821,11 @@ class GeminiService:
             "6. **Channel name as potential artist**:\n"
             '   - If the channel name is clearly a music creator or publisher (e.g., "GLITCH", '
             '"The Living Tombstone"), it may serve as the "artist".\n'
-            "   - If the channel name is a generic label, publisher, or a show/series channel "
-            "(not performing artist), you should still examine the title to find a performing artist.\n"
+            "   - If the channel name is a streaming service or generic publisher "
+            '(e.g., "Prime Video", "Netflix", "Crunchyroll", "Sony Music"), do NOT use it as the artist.\n'
+            "   - For OST/soundtrack content: If you can identify the actual voice actor or performer, use that. "
+            "Otherwise, set artist to null - do NOT use fictional placeholders like '[Franchise] Cast'. "
+            "The system will use primary_entity for recommendation fetching.\n"
             '7. **Featuring artists**: Look for markers like "ft.", "feat.", "featuring", "with" '
             'in the title. Extract the names following these markers into the "featuring_artists" array. '
             "The main artist remains the primary one identified earlier.\n"
@@ -815,6 +862,18 @@ class GeminiService:
             '  "featuring_artists": [],\n'
             '  "track_type": "music",\n'
             '  "primary_entity": null\n'
+            "}\n\n"
+            "Example 3:\n"
+            "Input:\n"
+            'YouTube Title: "Poison Full Song | Hazbin Hotel | Prime Video"\n'
+            'Channel Name: "Prime Video"\n\n'
+            "Output:\n"
+            "{\n"
+            '  "artist": null,\n'
+            '  "title": "Poison",\n'
+            '  "featuring_artists": [],\n'
+            '  "track_type": "ost",\n'
+            '  "primary_entity": "Hazbin Hotel"\n'
             "}\n\n"
             "Now parse the provided input and return JSON only."
         )

@@ -39,9 +39,10 @@ For non-music tracks, extract `primary_entity`:
 
 **Branch A (Entity-Based):** IF track_type != "music" AND primary_entity exists
 
-- Pool A: `tag.getTopTracks(tag=entity, 40)` - Real artists from franchise
-- Pool B: `track.getSimilar(seed, 30)` - Musical continuity
-- Pool C: `artist.getTopTracks(recent_artists, 30)` - Safe harbor
+- Prong 1: `tag.getTopTracks(tag=entity, 40)` - Real artists from franchise
+- Prong 2: `track.getSimilar(seed, 30)` when a real artist exists, else `tag.getTopTracks(focus_genres[0] or "soundtrack", 30)` for continuity
+- Prong 3: `artist.getTopTracks(recent_artists, 30)` when recent artists are genuine performers, else `tag.getTopTracks(focus_genres[1] or "musical", 30)` for safe harbor
+- Prong 4: `tag.getSimilar(entity)` → pick musical-adjacent tags (e.g., "musical theatre") and fetch `tag.getTopTracks(tag, 20)` for discovery
 
 **Branch B (Artist-Based):** Standard music flow
 
