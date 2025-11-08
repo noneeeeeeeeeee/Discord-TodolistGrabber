@@ -19,7 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, cast
 
 import aiohttp
 
@@ -714,7 +714,8 @@ class LastFMAutoplayV2:
 
         # Phase 4: Stochastic selection with safe gate
         results: List[Tuple[str, Any]] = []
-        max_retries = 3
+        max_retries = 5
+        quality_thresholds = [8.0, 7.4, 7.0, 6.8, 6.5]
         retry_count = 0
 
         while (
@@ -785,9 +786,8 @@ class LastFMAutoplayV2:
                 continue
 
             # Safe gate quality check
-            quality_threshold = (
-                8.0 if retry_count == 0 else 7.0
-            )  # Lower threshold on retries
+            threshold_index = min(retry_count, len(quality_thresholds) - 1)
+            quality_threshold = quality_thresholds[threshold_index]
             if (
                 selected_candidate.score < quality_threshold
                 and retry_count < max_retries
@@ -894,10 +894,11 @@ class LastFMAutoplayV2:
 
         if use_entity_branch:
             # Branch A: Entity-based fetch for OST content
+            entity_key = cast(str, seed_entity)
             return await self._fetch_entity_based_pools(
                 seed_artist=seed_artist,
                 seed_title=seed_title,
-                seed_entity=seed_entity,
+                seed_entity=entity_key,
                 context=context,
                 tracker=tracker,
             )

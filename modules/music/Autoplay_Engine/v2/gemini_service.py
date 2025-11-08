@@ -30,6 +30,8 @@ ENRICHMENT_BATCH_TIMEOUT_SECONDS = 15.0
 REQUESTS_PER_MINUTE_LIMIT = 15
 RATE_LIMIT_WINDOW_SECONDS = 60.0
 RATE_LIMIT_SAFETY_MARGIN = 0.25
+MAX_GENERATE_ATTEMPTS = 5
+GROUNDING_MODEL_NAME = "gemini-2.5-flash"
 
 
 @dataclass
@@ -115,13 +117,13 @@ class GeminiService:
         if not response:
             return None
 
-        payload = self._extract_json_dict(response)
-        if not isinstance(payload, dict):
+        raw_payload = self._extract_json_dict(response)
+        if not isinstance(raw_payload, dict):
             return None
 
         # DEBUG: Log raw Gemini response for OST detection debugging
-        raw_track_type = payload.get("track_type")
-        raw_entity = payload.get("primary_entity")
+        raw_track_type = raw_payload.get("track_type")
+        raw_entity = raw_payload.get("primary_entity")
         if raw_track_type and raw_track_type != "music":
             LOG.info(
                 f"🎬 [OST Detection Debug] Track: '{raw_title}' | "
@@ -130,16 +132,16 @@ class GeminiService:
             )
 
         # Extract artist and title
-        raw_artist = payload.get("artist")
+        raw_artist = raw_payload.get("artist")
         artist = str(raw_artist).strip() if raw_artist else None
-        title = str(payload.get("title", "")).strip()
+        title = str(raw_payload.get("title", "")).strip()
 
         # Title is required, artist can be null for OST content
         if not title:
             return None
 
         # Extract and validate track_type
-        track_type = str(payload.get("track_type", "music")).strip().lower()
+        track_type = str(raw_payload.get("track_type", "music")).strip().lower()
         if track_type not in {"music", "ost", "game_soundtrack", "anime_opening"}:
             LOG.warning(
                 f"⚠️ [OST Detection] Invalid track_type '{track_type}' returned by Gemini for '{raw_title}', "
@@ -150,7 +152,7 @@ class GeminiService:
         # Extract primary_entity (only valid if track_type is NOT "music")
         primary_entity = None
         if track_type != "music":
-            raw_entity = payload.get("primary_entity")
+            raw_entity = raw_payload.get("primary_entity")
             if raw_entity and isinstance(raw_entity, str):
                 primary_entity = raw_entity.strip() or None
             # If OST but no entity, fallback to "music"
@@ -172,12 +174,14 @@ class GeminiService:
                 f"primary_entity='{primary_entity}'"
             )
 
-        return {
-            "artist": artist,
+        payload: Dict[str, str] = {
+            "artist": artist or "",
             "title": title,
             "track_type": track_type,
-            "primary_entity": primary_entity,
         }
+        if primary_entity:
+            payload["primary_entity"] = primary_entity
+        return payload
 
     async def classify_mood_vector(
         self,
@@ -243,12 +247,17 @@ class GeminiService:
                 future.set_result({})
             return {}
 
-    async def query_gemini(self, prompt: str) -> Optional[str]:
+    async def query_gemini(
+        self,
+        prompt: str,
+        *,
+        allow_grounding: bool = False,
+    ) -> Optional[str]:
         """
         Simple query method for Gemini. Returns the text response.
         Used for non-enrichment tasks like track selection.
         """
-        response = await self._generate(prompt)
+        response = await self._generate(prompt, allow_grounding=allow_grounding)
         if not response:
             return None
 
@@ -375,7 +384,9 @@ class GeminiService:
 
         allow_grounding = any(entry.allow_grounding for entry in batch_entries)
         prompt = self._build_enrichment_prompt(batch_entries, allow_grounding)
-        response = await self._generate(prompt)
+        response = await self._generate(
+            prompt, allow_grounding=allow_grounding
+        )
         if not response:
             return {entry.key: {} for entry in batch_entries}
 
@@ -597,38 +608,87 @@ class GeminiService:
             self._active_key = None
             return False
 
-    async def _generate(self, prompt: str) -> Optional[Any]:
-        async with self._lock:
-            if not self._ensure_client():
-                return None
+    async def _generate(
+        self,
+        prompt: str,
+        *,
+        allow_grounding: bool = False,
+    ) -> Optional[Any]:
+        last_error: Optional[Exception] = None
 
-            await self._throttle_requests()
+        for attempt in range(1, MAX_GENERATE_ATTEMPTS + 1):
+            should_retry = False
+            backoff = 0.0
 
-            try:
-                self._reserve_quota(1)
-            except GeminiQuotaExceeded:
-                LOG.warning("⚠️ Gemini daily quota exhausted")
-                self._status = "quota"
-                return None
+            async with self._lock:
+                if not self._ensure_client():
+                    return None
 
-            client = self._client
-            if client is None:
-                self._status = "error"
-                self._available = False
-                return None
+                await self._throttle_requests()
 
-            try:
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=self._model,
-                    contents=prompt,
-                )
-            except Exception as exc:  # pragma: no cover - network failure path
-                self._handle_api_exception(exc)
-                return None
-            else:
-                self._status = "ready"
-                return response
+                try:
+                    self._reserve_quota(1)
+                except GeminiQuotaExceeded:
+                    LOG.warning("⚠️ Gemini daily quota exhausted")
+                    self._status = "quota"
+                    return None
+
+                client = self._client
+                if client is None:
+                    self._status = "error"
+                    self._available = False
+                    return None
+
+                model_name = self._model_for_attempt(attempt)
+                use_grounding = allow_grounding and attempt >= 4
+                request_kwargs: Dict[str, Any] = {
+                    "model": model_name,
+                    "contents": prompt,
+                }
+                if use_grounding:
+                    request_kwargs["grounding_config"] = {"google_search": {}}
+
+                try:
+                    if LOG.isEnabledFor(logging.DEBUG):
+                        LOG.debug(
+                            "🧠 Gemini attempt %d/%d using model '%s'%s",
+                            attempt,
+                            MAX_GENERATE_ATTEMPTS,
+                            model_name,
+                            " with grounding" if use_grounding else "",
+                        )
+                    response = await asyncio.to_thread(
+                        client.models.generate_content,
+                        **request_kwargs,
+                    )
+                except Exception as exc:  # pragma: no cover - network failure path
+                    last_error = exc
+                    should_retry = True
+                    backoff = min(2.5, 0.6 * attempt)
+                    self._handle_api_exception(exc)
+                else:
+                    self._status = "ready"
+                    return response
+
+            if should_retry and attempt < MAX_GENERATE_ATTEMPTS:
+                if backoff > 0:
+                    await asyncio.sleep(backoff)
+                continue
+            if not should_retry:
+                break
+
+        if last_error:
+            LOG.error(
+                "❌ Gemini generation failed after %d attempts: %s",
+                MAX_GENERATE_ATTEMPTS,
+                last_error,
+            )
+        return None
+
+    def _model_for_attempt(self, attempt: int) -> str:
+        if attempt >= 4:
+            return GROUNDING_MODEL_NAME
+        return self._model
 
     async def _throttle_requests(self) -> None:
         """Throttle per-minute request rate to avoid API 429 responses."""

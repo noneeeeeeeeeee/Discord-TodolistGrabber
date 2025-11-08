@@ -337,7 +337,7 @@ class ContextTracker:
                 for i in range(dim_count)
             ]
 
-        # Task 2.2: Safe Anchor - liked_mood_vector
+        # Safe Anchor - liked_mood_vector
         # Filter tracks with ANY likes (num_likes > 0), not just consensus='liked'
         liked_tracks = [
             (idx, t) for idx, t in enumerate(self._history) if t.num_likes > 0
@@ -359,7 +359,6 @@ class ContextTracker:
                         liked_mood_weights.append(recency_weights[idx])
 
             if liked_mood_vectors and liked_mood_weights:
-                # Weighted average of liked tracks' moods
                 dim_count = len(liked_mood_vectors[0])
                 total_weight = sum(liked_mood_weights)
                 liked_mood_vector = [
@@ -392,7 +391,7 @@ class ContextTracker:
             else:
                 break
 
-        # Task 2.3: Fast Rollback - disliked tags with temporal-weighted penalties
+        # Fast Rollback - disliked tags with temporal-weighted penalties
         disliked_tags: Dict[str, float] = {}
 
         for idx, track in enumerate(self._history):
@@ -454,7 +453,7 @@ class ContextTracker:
             last_activity=self._last_activity,
             disliked_tags=disliked_tags,
             liked_mood_vector=liked_mood_vector,
-            artist_diversity_pool=[],  # Will be populated in Phase 2
+            artist_diversity_pool=[],  
             energy_trend=energy_trend,
         )
 

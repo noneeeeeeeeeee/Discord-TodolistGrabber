@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import math
 import re
@@ -310,7 +311,7 @@ class TrackResolver:
                             )
                         return rebuilt
 
-        search_result = await self._search_with_pomice(
+        search_result = await self._multi_stage_pomice_search(
             artist,
             title,
             expected_duration_ms=expected_duration_ms,
@@ -372,18 +373,18 @@ class TrackResolver:
 
         # High confidence or Gemini unavailable - use heuristic result
         metadata = self._extract_track_metadata(track_obj)
-        youtube_id_val = metadata["youtube_id"]
-        url_val = metadata["url"]
+        youtube_id_val = (metadata.get("youtube_id") or "").strip()
+        url_val = (metadata.get("url") or "").strip()
         if youtube_id_val and url_val:
-            duration_val = metadata.get("duration_ms")
-            if expected_duration_ms and duration_val:
+            duration_val = self._safe_int(metadata.get("duration_ms"))
+            if expected_duration_ms and duration_val is not None:
                 duration_val = int(duration_val)
 
             entry = MappingEntry(
                 youtube_id=str(youtube_id_val),
                 url=str(url_val),
                 timestamp=time.time(),
-                channel_name=metadata.get("channel_name"),
+                channel_name=(metadata.get("channel_name") or None),
                 verified=bool(metadata.get("verified", False)),
                 duration_ms=duration_val,
                 track_identifier=metadata.get("track_identifier"),
@@ -402,7 +403,7 @@ class TrackResolver:
                 content_penalty=self._safe_float(heuristics.get("content_penalty")),
                 spam_penalty=self._safe_float(heuristics.get("spam_penalty")),
                 spam_flags=list(heuristics.get("spam_flags", [])),
-                search_rank=int(heuristics.get("search_rank", 0) or 0),
+                search_rank=self._safe_int(heuristics.get("search_rank")) or 0,
                 heuristic_version=int(heuristics.get("heuristic_version", 2) or 2),
             )
             await self._cache.set_mapping(artist, title, entry)
@@ -427,6 +428,7 @@ class TrackResolver:
                         "spam_penalty": entry.spam_penalty,
                         "spam_flags": entry.spam_flags,
                         "heuristic_version": entry.heuristic_version,
+                        "search_query": heuristics.get("search_query"),
                     },
                 )
         if LOG.isEnabledFor(logging.DEBUG):
@@ -450,6 +452,7 @@ class TrackResolver:
                     "content_penalty": heuristics.get("content_penalty"),
                     "spam_penalty": heuristics.get("spam_penalty"),
                     "spam_flags": heuristics.get("spam_flags"),
+                    "search_query": heuristics.get("search_query"),
                 },
             )
         return track_obj
@@ -610,14 +613,14 @@ class TrackResolver:
 
                 # Cache the Gemini-selected mapping (with high confidence score)
                 entry = MappingEntry(
-                    youtube_id=metadata.get("youtube_id", ""),
-                    url=metadata.get("url", ""),
+                    youtube_id=str(metadata.get("youtube_id") or ""),
+                    url=str(metadata.get("url") or ""),
                     timestamp=time.time(),
                     track_identifier=getattr(track_obj, "identifier", None),
-                    title=metadata.get("title", ""),
-                    channel_name=metadata.get("channel_name", ""),
-                    duration_ms=metadata.get("duration_ms"),
-                    verified=metadata.get("verified", False),
+                    title=str(metadata.get("title") or ""),
+                    channel_name=metadata.get("channel_name") or None,
+                    duration_ms=self._safe_int(metadata.get("duration_ms")),
+                    verified=bool(metadata.get("verified", False)),
                     heuristic_score=10.0,  # High score for Gemini selection
                     title_similarity=1.0,
                     artist_similarity=1.0,
@@ -627,7 +630,7 @@ class TrackResolver:
                     content_penalty=0.0,
                     spam_penalty=0.0,
                     spam_flags=[],
-                    search_rank=selected_index,
+                    search_rank=int(selected_index),
                     heuristic_version=3,  # Version 3 = Gemini-powered
                 )
                 await self._cache.set_mapping(artist, title, entry)
@@ -780,6 +783,15 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             return None
 
     @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        try:
+            if value is None:
+                return None
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _normalize_text(value: str) -> str:
         if not value:
             return ""
@@ -812,7 +824,7 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             base_ratio = max(base_ratio, overlap)
         return max(0.0, min(base_ratio, 1.0))
 
-    async def _search_with_pomice(
+    async def _multi_stage_pomice_search(
         self,
         artist: str,
         title: str,
@@ -823,9 +835,254 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         if not node:
             return None
 
-        query = f"ytsearch: {artist} {title}"
+        attempted_queries: List[str] = []
+        best_candidate: Optional[Tuple[Any, Dict[str, Any]]] = None
+        best_score = float("-inf")
+
+        primary_queries = self._build_primary_search_queries(artist, title)
+        for attempt_index, query in enumerate(primary_queries):
+            attempted_queries.append(query)
+            result = await self._search_with_pomice(
+                artist,
+                title,
+                expected_duration_ms=expected_duration_ms,
+                search_query=query,
+                node=node,
+            )
+            if not result:
+                continue
+
+            track_obj, features = result
+            if "search_query" not in features:
+                features["search_query"] = query
+
+            score = float(features.get("score", 0.0) or 0.0)
+            if not best_candidate or score > best_score:
+                best_candidate = (track_obj, features)
+                best_score = score
+
+            if self._should_accept_candidate(features, attempt_index):
+                if LOG.isEnabledFor(logging.DEBUG):
+                    LOG.debug(
+                        "✅ [Search Pipeline] Accepted candidate via '%s' (score=%.2f, engagement=%.2f)",
+                        query,
+                        score,
+                        float(features.get("engagement_score", 0.0) or 0.0),
+                    )
+                return track_obj, features
+
+            if LOG.isEnabledFor(logging.DEBUG):
+                LOG.debug(
+                    "🔁 [Search Pipeline] Candidate via '%s' scored %.2f (engagement=%.2f); trying next strategy",
+                    query,
+                    score,
+                    float(features.get("engagement_score", 0.0) or 0.0),
+                )
+
+        if self._gemini_service:
+            gemini_queries = await self._generate_gemini_search_queries(
+                artist, title, attempted_queries
+            )
+            for extra_index, query in enumerate(
+                gemini_queries, start=len(attempted_queries)
+            ):
+                attempted_queries.append(query)
+                result = await self._search_with_pomice(
+                    artist,
+                    title,
+                    expected_duration_ms=expected_duration_ms,
+                    search_query=query,
+                    node=node,
+                )
+                if not result:
+                    continue
+
+                track_obj, features = result
+                if "search_query" not in features:
+                    features["search_query"] = query
+
+                score = float(features.get("score", 0.0) or 0.0)
+                if not best_candidate or score > best_score:
+                    best_candidate = (track_obj, features)
+                    best_score = score
+
+                if self._should_accept_candidate(features, extra_index):
+                    LOG.info(
+                        "🤖 [Search Pipeline] Gemini-refined query '%s' produced acceptable candidate (score=%.2f)",
+                        query,
+                        score,
+                    )
+                    return track_obj, features
+
+                if LOG.isEnabledFor(logging.DEBUG):
+                    LOG.debug(
+                        "🔍 [Search Pipeline] Gemini query '%s' scored %.2f; continuing",
+                        query,
+                        score,
+                    )
+
+        return best_candidate
+
+    def _build_primary_search_queries(self, artist: str, title: str) -> List[str]:
+        artist_clean = artist.replace("\"", "").strip()
+        title_clean = title.replace("\"", "").strip()
+        base_query = f"{artist_clean} {title_clean}".strip()
+
+        candidates = [f"ytsearch: {base_query}"] if base_query else []
+        if artist_clean and title_clean:
+            candidates.extend(
+                [
+                    f'ytsearch: "{artist_clean}" "{title_clean}" official audio',
+                    f'ytsearch: "{artist_clean}" "{title_clean}" official video',
+                    f"ytsearch: {artist_clean} - {title_clean}",
+                ]
+            )
+
+        if base_query:
+            candidates.append(f"ytmsearch: {base_query}")
+
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for query in candidates:
+            key = query.lower()
+            if key in seen or not query.strip():
+                continue
+            ordered.append(query.strip())
+            seen.add(key)
+        return ordered
+
+    def _should_accept_candidate(
+        self, features: Dict[str, Any], attempt_index: int
+    ) -> bool:
+        score = float(features.get("score", 0.0) or 0.0)
+        engagement = float(features.get("engagement_score", 0.0) or 0.0)
+        verified = bool(features.get("verified", False))
+        title_similarity = float(features.get("title_similarity", 0.0) or 0.0)
+        artist_similarity = float(features.get("artist_similarity", 0.0) or 0.0)
+
+        if verified and score >= 6.3:
+            return True
+        if score >= 7.25:
+            return True
+        if score >= 6.8 and engagement >= 0.35:
+            return True
+        if attempt_index >= 2 and score >= 6.6 and engagement >= 0.25:
+            return True
+        if (
+            attempt_index >= 3
+            and score >= 6.5
+            and title_similarity >= 0.7
+            and artist_similarity >= 0.7
+        ):
+            return True
+        return False
+
+    async def _generate_gemini_search_queries(
+        self,
+        artist: str,
+        title: str,
+        attempted_queries: List[str],
+        limit: int = 2,
+    ) -> List[str]:
+        if not self._gemini_service or not self._gemini_service.is_available:
+            return []
+
         try:
-            results = await node.get_tracks(query)
+            plain_attempts = [
+                query.split(":", 1)[1].strip() if ":" in query else query
+                for query in attempted_queries
+            ]
+        except Exception:
+            plain_attempts = attempted_queries
+
+        prompt = (
+            "You help resolve the best official YouTube upload for a song.\n"
+            f"Song: Artist='{artist}', Title='{title}'.\n"
+            "Existing search attempts: "
+            + ", ".join(f"'{item}'" for item in plain_attempts[:5])
+            + "\nProvide up to "
+            + str(limit)
+            + (
+                " refined search queries targeting official or high-quality uploads. "
+                "Return STRICT JSON: {\"queries\": [\"query1\", ...]} without explanations."
+                " If unsure, return {\"queries\": []}."
+            )
+        )
+
+        response = await self._gemini_service.query_gemini(
+            prompt, allow_grounding=True
+        )
+        if not response:
+            return []
+
+        text = response.strip()
+        if "```" in text:
+            parts = text.split("```")
+            if len(parts) >= 2:
+                text = parts[1].strip()
+
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            LOG.warning(
+                "⚠️ [Search Pipeline] Gemini returned unparsable payload for '%s - %s'", artist, title
+            )
+            return []
+
+        raw_queries: List[str] = []
+        if isinstance(payload, dict):
+            candidate_list = payload.get("queries") or payload.get("search_queries")
+            if isinstance(candidate_list, list):
+                raw_queries = [str(item).strip() for item in candidate_list]
+        elif isinstance(payload, list):
+            raw_queries = [str(item).strip() for item in payload]
+
+        deduped: List[str] = []
+        seen_lower = {query.lower() for query in attempted_queries}
+        for raw in raw_queries:
+            if not raw:
+                continue
+            normalized = raw.strip()
+            if not normalized:
+                continue
+
+            lowered = normalized.lower()
+            if lowered.startswith("ytsearch:") or lowered.startswith("ytmsearch:"):
+                full_query = normalized
+            else:
+                full_query = f"ytsearch: {normalized}"
+
+            if full_query.lower() in seen_lower:
+                continue
+            deduped.append(full_query)
+            seen_lower.add(full_query.lower())
+            if len(deduped) >= limit:
+                break
+
+        if deduped and LOG.isEnabledFor(logging.DEBUG):
+            LOG.debug(
+                "🤖 [Search Pipeline] Gemini proposed fallback queries: %s",
+                deduped,
+            )
+
+        return deduped
+
+    async def _search_with_pomice(
+        self,
+        artist: str,
+        title: str,
+        *,
+        expected_duration_ms: Optional[int] = None,
+        search_query: Optional[str] = None,
+        node: Optional[Any] = None,
+    ) -> Optional[Tuple[Any, Dict[str, Any]]]:
+        local_node = node or await self._get_node()
+        if not local_node:
+            return None
+
+        query = search_query or f"ytsearch: {artist} {title}"
+        try:
+            results = await local_node.get_tracks(query)
         except Exception as exc:
             LOG.warning("Pomice search failed for %s: %s", query, exc)
             return None
@@ -834,11 +1091,12 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             LOG.debug("No Pomice results for %s", query)
             return None
 
-        # Get banned tracks for this artist/title combination
         ban_key = (artist.strip().lower(), title.strip().lower())
-        banned_ids = set()
-        if ban_key in self._banned_tracks:
-            banned_ids = {entry[0] for entry in self._banned_tracks[ban_key]}
+        banned_ids = (
+            {entry[0] for entry in self._banned_tracks.get(ban_key, [])}
+            if ban_key in self._banned_tracks
+            else set()
+        )
 
         best_track: Optional[Any] = None
         best_score = float("-inf")
@@ -856,7 +1114,6 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         for index, candidate in enumerate(results):
             metadata = self._extract_track_metadata(candidate)
 
-            # Skip banned tracks
             youtube_id = metadata.get("youtube_id", "")
             if youtube_id in banned_ids:
                 if LOG.isEnabledFor(logging.DEBUG):
@@ -883,6 +1140,7 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
                 expected_duration_ms=duration_target if duration_target else None,
                 search_rank=index,
             )
+            features["search_query"] = query
             features_by_id[id(candidate)] = features
 
             score, should_reject, rejection_reasons = self._compose_candidate_score(
@@ -937,6 +1195,7 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
                             float(best_features.get("engagement_score", 0.0) or 0.0), 3
                         ),
                         "verified": best_features.get("verified", False),
+                        "query": best_features.get("search_query"),
                     },
                 )
             return best_track, best_features
@@ -944,28 +1203,26 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         if fallback_track and fallback_features:
             fallback_metadata = self._extract_track_metadata(fallback_track)
             LOG.warning(
-                "⚠️ All candidates filtered out for '%s - %s', using best fallback (score=%.2f, views=%d, subs=%d, channel='%s')",
+                "⚠️ All candidates filtered out for '%s - %s', using best fallback (score=%.2f, views=%d, subs=%d, channel='%s', query='%s')",
                 artist,
                 title,
                 fallback_score,
                 fallback_metadata.get("view_count", None),
                 fallback_metadata.get("subscriber_count", None),
                 fallback_metadata.get("channel_name", "Unknown"),
+                fallback_features.get("search_query"),
             )
             return fallback_track, fallback_features
 
-        # Final Failure - Use highest engagement as last resort
         if results:
-            # Find track with highest engagement score
             best_engagement_track = None
             best_engagement_score = 0.0
             best_engagement_features = None
 
             for candidate in results:
                 metadata = self._extract_track_metadata(candidate)
-                # Calculate simple engagement score based on views and subs
-                view_count = metadata.get("view_count", 0)
-                subscriber_count = metadata.get("subscriber_count", 0)
+                view_count = metadata.get("view_count") or 0
+                subscriber_count = metadata.get("subscriber_count") or 0
 
                 engagement = 0.0
                 if view_count > 0:
@@ -983,13 +1240,14 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
                     best_engagement_track
                 )
                 LOG.warning(
-                    "⚠️ No valid candidates found for '%s - %s', using highest engagement as last resort (channel='%s', views=%d, subs=%d, engagement=%.2f)",
+                    "⚠️ No valid candidates found for '%s - %s', using highest engagement as last resort (channel='%s', views=%d, subs=%d, engagement=%.2f, query='%s')",
                     artist,
                     title,
                     engagement_metadata.get("channel_name", "Unknown"),
                     engagement_metadata.get("view_count", 0),
                     engagement_metadata.get("subscriber_count", 0),
                     best_engagement_score,
+                    (best_engagement_features or {}).get("search_query"),
                 )
                 return best_engagement_track, best_engagement_features or {}
 
@@ -1128,6 +1386,13 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             engagement_ratio = (like_count + (comment_count * 2)) / view_count
             engagement_components.append(min(engagement_ratio * 12.0, 1.0))
         engagement_score = min(sum(engagement_components), 1.2)
+        if engagement_score <= 0.05:
+            if is_verified:
+                engagement_score = max(engagement_score, 0.27)
+            elif channel_official_hint_score >= 0.6:
+                engagement_score = max(engagement_score, 0.19)
+            elif search_rank <= 2:
+                engagement_score = max(engagement_score, 0.14 - 0.03 * search_rank)
 
         spam_penalty = 0.0
         spam_flags: List[str] = []
