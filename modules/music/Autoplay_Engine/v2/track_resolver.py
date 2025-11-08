@@ -18,7 +18,7 @@ DURATION_TOLERANCE_MIN_MS = 30000  # 30 seconds minimum tolerance
 SHORT_CLIP_THRESHOLD_MS = 30000  # clips shorter than 30s are likely YouTube Shorts/spam
 
 # Confidence threshold for hybrid resolution
-LOW_CONFIDENCE_THRESHOLD = 7.0
+LOW_CONFIDENCE_THRESHOLD = 6.6
 
 # High-quality channel indicators (boost priority)
 GOOD_CHANNEL_HINTS = [
