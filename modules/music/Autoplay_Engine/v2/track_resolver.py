@@ -19,7 +19,7 @@ DURATION_TOLERANCE_MIN_MS = 30000  # 30 seconds minimum tolerance
 SHORT_CLIP_THRESHOLD_MS = 30000  # clips shorter than 30s are likely YouTube Shorts/spam
 
 # Confidence threshold for hybrid resolution
-LOW_CONFIDENCE_THRESHOLD = 6.6
+LOW_CONFIDENCE_THRESHOLD = 7.0
 
 # High-quality channel indicators (boost priority)
 GOOD_CHANNEL_HINTS = [
@@ -265,8 +265,22 @@ class TrackResolver:
         if prefer_cache:
             mapping = await self._cache.get_mapping(artist, title)
             if mapping:
+                # Check for cache poisoning (artist/title mismatch)
+                title_sim = self._token_ratio(title, mapping.title or "")
+                artist_sim = self._token_ratio(artist, mapping.channel_name or "")
+                
+                # If cached title/artist is less than 60% similar, it's poisoned
+                if title_sim < 0.6 or artist_sim < 0.6:
+                    LOG.warning(
+                        "🚫 [Cache Poisoning] Invalidating stale mapping for '%s - %s' "
+                        "(cached: '%s' / '%s', title_sim=%.2f, artist_sim=%.2f)",
+                        artist, title, mapping.title, mapping.channel_name,
+                        title_sim, artist_sim
+                    )
+                    await self._cache.delete_mapping(artist, title)
+                    mapping = None  
                 # Validate cached mapping against spam filters
-                if self._is_spam_mapping(mapping, expected_duration_ms):
+                elif self._is_spam_mapping(mapping, expected_duration_ms):
                     LOG.warning(
                         "🚫 [CACHE SPAM] Invalidating cached mapping for '%s - %s' (youtube_id=%s, reason=spam detected)",
                         artist,
@@ -275,7 +289,10 @@ class TrackResolver:
                     )
                     # Delete bad mapping from cache
                     await self._cache.delete_mapping(artist, title)
-                else:
+                    mapping = None 
+                
+                # Only proceed with cache hit if mapping is still valid
+                if mapping:
                     rebuilt = await self._create_track_obj_from_mapping(mapping)
                     if rebuilt:
                         LOG.info(
@@ -621,7 +638,7 @@ class TrackResolver:
                     channel_name=metadata.get("channel_name") or None,
                     duration_ms=self._safe_int(metadata.get("duration_ms")),
                     verified=bool(metadata.get("verified", False)),
-                    heuristic_score=10.0,  # High score for Gemini selection
+                    heuristic_score=10.0, 
                     title_similarity=1.0,
                     artist_similarity=1.0,
                     channel_similarity=1.0,
@@ -1488,16 +1505,12 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
     def _compose_candidate_score(
         self, features: Dict[str, Any]
     ) -> Tuple[float, bool, List[str]]:
-        score = 0.0
-
+        # --- 1. Get all features ---
         title_similarity = float(features.get("title_similarity") or 0.0)
         artist_similarity = float(features.get("artist_similarity") or 0.0)
         channel_similarity = float(features.get("channel_similarity") or 0.0)
         engagement_score = float(features.get("engagement_score") or 0.0)
-        duration_score = features.get("duration_score")
-        duration_score_val = (
-            float(duration_score) if duration_score is not None else 0.7
-        )
+        duration_score = features.get("duration_score")  # Can be None
         content_penalty = float(features.get("content_penalty") or 0.0)
         spam_penalty = float(features.get("spam_penalty") or 0.0)
         channel_official_hint_score = float(
@@ -1508,23 +1521,34 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         search_rank = int(features.get("search_rank", 0) or 0)
         episode_like = bool(features.get("episode_like", False))
 
+        # --- 2. Calculate base score from what we ALWAYS have ---
+        score = 0.0
         score += 2.0 * title_similarity
-        score += (
-            3.0 * artist_similarity
-        )  
+        score += 3.0 * artist_similarity
         score += 1.2 * channel_similarity
-        score += 1.8 * engagement_score
         score += 0.9 * channel_official_hint_score
         score += 0.6 * positive_hint_score
-        score += 1.0 * duration_score_val
 
+        # High bonus for verified channels
         if verified:
             score += 2.5
 
+        # --- 3. Add weighted scores ONLY IF data is present and meaningful ---
+        
+        # Add engagement score ONLY if it's meaningful (not 0)
+        if engagement_score > 0.01:
+            score += 1.8 * engagement_score
+        
+        # Add duration score ONLY if it was calculated (not None)
+        if duration_score is not None:
+            score += 1.0 * float(duration_score)
+
+        # --- 4. Apply penalties ---
         score -= 0.85 * spam_penalty
         score -= 1.1 * content_penalty
         score -= search_rank * 0.18
 
+        # --- 5. Rejection logic ---
         rejection_reasons: List[str] = []
         should_reject = False
 
@@ -1538,7 +1562,7 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         if (
             not duration_within_tolerance
             and (duration_score is not None)
-            and duration_score_val < 0.35
+            and float(duration_score) < 0.35
         ):
             should_reject = True
             rejection_reasons.append("duration_mismatch")

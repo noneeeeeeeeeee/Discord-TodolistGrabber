@@ -50,6 +50,7 @@ _PUBLISHER_KEYWORDS = {
 _DEFAULT_PRIMARY_GENRE = "soundtrack"
 _DEFAULT_SECONDARY_GENRE = "musical"
 _DISCOVERY_TAG_FALLBACKS = ["musical theatre", "show tunes", "broadway"]
+_SAFE_PICK_SCORE_THRESHOLD = 0.7
 
 # Phase 5: Telemetry configuration
 _TELEMETRY_DIR = Path("cache/music/telemetry")
@@ -297,10 +298,10 @@ class LastFMAutoplayV2:
         """
         try:
             # Create telemetry directory if needed
-            telemetry_dir = _CACHE_DIR / "telemetry"
+            telemetry_dir = _TELEMETRY_DIR
             telemetry_dir.mkdir(parents=True, exist_ok=True)
             
-            telemetry_file = telemetry_dir / "v3_training_data.jsonl"
+            telemetry_file = telemetry_dir / _TELEMETRY_FILE
             
             # Append event as JSON line
             event_dict = event.to_dict()
@@ -505,8 +506,6 @@ class LastFMAutoplayV2:
         elif event_type == "skip":
             skip_type = "medium" if ratio < 0.5 else "soft"
 
-        # More/Less Like This are NOT skips - they're explicit user preference signals
-        # They get recorded separately with their own weighting based on VC participant count
 
         # Try to get enrichment data from cache for accurate genre/mood tracking
         enrichment = await self._engine.enrich_track(artist, title)
@@ -514,17 +513,12 @@ class LastFMAutoplayV2:
         mood_vector = enrichment.get("mood_vector") if enrichment else None
         mood_label = enrichment.get("mood") if enrichment else None
 
-        # Phase 0.5: Try to get track_type and primary_entity from parsing cache
-        # We need to match the track by artist/title from cache
-        track_type = "music"  # Default fallback
+        # Try to get track_type and primary_entity from parsing cache
+        track_type = "music" 
         primary_entity = None
 
         # Attempt to retrieve from cache by checking the most recent parsing entries
-        # (This is a best-effort approach since we don't have raw_title/channel_name here)
-        # In future, we should pass these through the call chain
         try:
-            # Check if we have this track in cache
-            # For now, we'll default to "music" type unless we find evidence otherwise
             # TODO: Pass raw_title/channel_name through track_end_event signature for cache lookup
             pass
         except Exception as e:
@@ -621,7 +615,7 @@ class LastFMAutoplayV2:
             "num_active_listeners": final_num_active_listeners,
         }
 
-        # Estimate quality (we don't have full mapping quality here, use heuristics)
+        # Estimate quality 
         # High progress ratio + likes suggest good quality
         estimated_quality = 0.0
         if ratio >= 0.85:
@@ -919,19 +913,11 @@ class LastFMAutoplayV2:
                     tracker.reset_novelty_counter()
                 else:
                     tracker.increment_novelty_counter()
-
-            # Phase 4: Stochastic selection with safe gate
+            # Stochastic selection without additional safe gate retries
             results: List[Tuple[str, Any]] = []
-            max_retries = 5
-            quality_thresholds = [8.0, 7.4, 7.0, 6.8, 6.5]
-            retry_count = 0
 
-            while (
-                len(results) < max(1, limit)
-                and selection_pool
-                and retry_count <= max_retries
-            ):
-                # Phase 4 Task 5.3: Stochastic selection from top 5
+            while len(results) < max(1, limit) and selection_pool:
+                # Stochastic selection from top 5
                 top_k = min(5, len(selection_pool))
                 top_candidates = selection_pool[:top_k]
 
@@ -958,7 +944,7 @@ class LastFMAutoplayV2:
                         top_k,
                     )
 
-                # Phase 4 Task 5.4: Safe gate - check quality threshold
+                # Safe gate - check quality threshold
                 meta = metadata_index.get(selected_candidate.track_id)
                 if not meta:
                     # Remove from pool and retry
@@ -967,14 +953,13 @@ class LastFMAutoplayV2:
                         for c in selection_pool
                         if c.track_id != selected_candidate.track_id
                     ]
-                    retry_count += 1
                     continue
 
                 # Resolve track
                 track_obj = await self._engine.resolve_track(
                     meta["artist"],
                     meta["title"],
-                    expected_duration_ms=expected_duration_ms,
+                    expected_duration_ms=None,
                 )
 
                 if not track_obj:
@@ -984,47 +969,19 @@ class LastFMAutoplayV2:
                         for c in selection_pool
                         if c.track_id != selected_candidate.track_id
                     ]
-                    retry_count += 1
                     if self._verbose:
                         LOG.debug(
-                            "❌ [Safe Gate] Track resolution failed for '%s', retrying (%d/%d)",
+                            "❌ [Resolution] Track resolution failed for '%s'", 
                             selected_candidate.title,
-                            retry_count,
-                            max_retries,
                         )
                     continue
 
-                # Safe gate quality check
-                threshold_index = min(retry_count, len(quality_thresholds) - 1)
-                quality_threshold = quality_thresholds[threshold_index]
-                if (
-                    selected_candidate.score < quality_threshold
-                    and retry_count < max_retries
-                ):
-                    # Score too low, remove and retry
-                    selection_pool = [
-                        c
-                        for c in selection_pool
-                        if c.track_id != selected_candidate.track_id
-                    ]
-                    retry_count += 1
-                    if self._verbose:
-                        LOG.info(
-                            "⚠️ [Safe Gate] Score %.3f below threshold %.1f for '%s', retrying (%d/%d)",
-                            selected_candidate.score,
-                            quality_threshold,
-                            selected_candidate.title,
-                            retry_count,
-                            max_retries,
-                        )
-                    continue
-
-                # Track passed safe gate
+                # Track accepted after resolution
                 self._note_recommendation(guild_id, meta["artist"], meta["title"])
                 results.append((selected_candidate.track_id, track_obj))
 
-                # Phase 4 Task 5.1/5.2: Update diversity injection counter
-                if selected_candidate.score >= 8.0:
+                # Update diversity injection counter
+                if selected_candidate.score >= _SAFE_PICK_SCORE_THRESHOLD:
                     self._consecutive_safe_picks[guild_id] = consecutive_safe + 1
                     if self._verbose >= 2:
                         LOG.debug(
@@ -1043,18 +1000,18 @@ class LastFMAutoplayV2:
                 selection_pool = [
                     c for c in selection_pool if c.track_id != selected_candidate.track_id
                 ]
-                retry_count = 0  # Reset retry count for next track
 
             if not results:
                 LOG.debug("Autoplay V2 produced no playable tracks after resolution")
             return results
             
         finally:
-            # V2.5+: Release processing lock and cancel warning timer
+            # Release processing lock and cancel warning timer
             self._is_processing[guild_id] = False
             self._cancel_warning_timer(guild_id)
             if self._verbose >= 2:
-                LOG.debug("🔓 [Guild %d] Processing lock released", guild_id)    # ------------------------------------------------------------------
+                LOG.debug("🔓 [Guild %d] Processing lock released", guild_id)    
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
     async def _ensure_collaborative_ready(self) -> None:
@@ -1752,7 +1709,6 @@ class LastFMAutoplayV2:
         max_per_artist: int = 3,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
-        Task 3.6: Enforce artist diversity by limiting tracks per artist.
 
         Groups tracks by artist, keeps max 3 per artist (sorted by playcount),
         stores remaining in artist_diversity_pool for future use.
@@ -2247,12 +2203,12 @@ class LastFMAutoplayV2:
         pending_enrichments: Dict[str, asyncio.Future] = {}
         tracks_needing_enrichment: List[Tuple[str, str, str]] = (
             []
-        )  # track_id, artist, title
+        )  
 
         # Store clean metadata for later use
         parsed_metadata: Dict[str, Tuple[str, str]] = (
             {}
-        )  # track_id -> (clean_artist, clean_title)
+        ) 
 
         # Reset cache stats for this round
         self._cache_stats = {
@@ -2298,7 +2254,6 @@ class LastFMAutoplayV2:
         if tracks_needing_enrichment:
             for track_id, artist, title in tracks_needing_enrichment:
                 try:
-                    # Enqueue enrichment (returns future, doesn't start task yet)
                     future = await self._engine._gemini._enqueue_enrichment_future(
                         artist,
                         title,
@@ -2381,7 +2336,6 @@ class LastFMAutoplayV2:
         tasks: List[asyncio.Task[Optional[PreparedCandidate]]] = []
         for index, track_id, raw_artist, raw_title, record in candidates_to_prepare:
             enrichment = enrichment_cache.get(track_id)
-            # Use clean keys from parsed metadata
             clean_artist, clean_title = parsed_metadata.get(
                 track_id, (raw_artist, raw_title)
             )
@@ -2403,7 +2357,7 @@ class LastFMAutoplayV2:
         for task in tasks:
             try:
                 result = await task
-            except Exception as exc:  # pragma: no cover - defensive
+            except Exception as exc: 
                 LOG.debug("Candidate preparation failed: %s", exc)
                 continue
             if result is not None:
@@ -2453,7 +2407,6 @@ class LastFMAutoplayV2:
                 continue
 
             try:
-                # Build enrichment entry (same logic as enrich_track)
                 tags = [
                     str(tag).lower()
                     for tag in payload.get("tags", [])
@@ -2796,7 +2749,7 @@ class LastFMAutoplayV2:
         return False
 
     # ------------------------------------------------------------------
-    # Phase 5: Telemetry logging for v3 ML training data
+    # Telemetry logging for v3 ML training data
     # ------------------------------------------------------------------
     def _log_telemetry(
         self,

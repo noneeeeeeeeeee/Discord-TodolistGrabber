@@ -739,8 +739,13 @@ class AutoplayEngineV2:
                                 LOG.debug(f"⚡ [Stage 1] Query {idx}/9: '{query}'")
                             
                             # Search Deezer and get best match
+                            # Compare results against the original YouTube title for validation
                             search_results = await deezer_client.search_track(query)
-                            match = deezer_client.get_best_match(search_results, threshold=0.85)
+                            match = deezer_client.get_best_match(
+                                search_results,
+                                threshold=0.85,
+                                expected_title=youtube_title,  # Use YouTube title for fuzzy validation
+                            )
                             if match and match.confidence >= 0.85:
                                 if self._verbose:
                                     LOG.info(
@@ -808,7 +813,11 @@ class AutoplayEngineV2:
                             
                             # Search Deezer and get best match
                             search_results = await deezer_client.search_track(query)
-                            match = deezer_client.get_best_match(search_results, threshold=0.75)
+                            match = deezer_client.get_best_match(
+                                search_results, 
+                                threshold=0.75,
+                                expected_title=youtube_title
+                            )
                             if match and match.confidence >= 0.75:
                                 if self._verbose:
                                     LOG.info(

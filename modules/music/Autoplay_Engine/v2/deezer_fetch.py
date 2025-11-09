@@ -259,6 +259,8 @@ class DeezerClient:
         self,
         results: List[DeezerTrack],
         threshold: float = 0.75,
+        expected_artist: Optional[str] = None,
+        expected_title: Optional[str] = None,
         expected_duration_ms: Optional[int] = None,
     ) -> Optional[MatchResult]:
         """
@@ -272,6 +274,8 @@ class DeezerClient:
         Args:
             results: List of DeezerTrack search results
             threshold: Minimum confidence score (0.0-1.0)
+            expected_artist: Expected artist name for comparison
+            expected_title: Expected track title for comparison
             expected_duration_ms: Expected track duration for scoring
             
         Returns:
@@ -286,7 +290,9 @@ class DeezerClient:
         for track in results:
             confidence, components = self._calculate_match_confidence(
                 track,
-                expected_duration_ms,
+                expected_artist=expected_artist,
+                expected_title=expected_title,
+                expected_duration_ms=expected_duration_ms,
             )
 
             if confidence > best_score:
@@ -318,6 +324,8 @@ class DeezerClient:
     def _calculate_match_confidence(
         self,
         track: DeezerTrack,
+        expected_artist: Optional[str] = None,
+        expected_title: Optional[str] = None,
         expected_duration_ms: Optional[int] = None,
     ) -> tuple[float, Dict[str, float]]:
         """
@@ -332,16 +340,24 @@ class DeezerClient:
             Tuple of (overall_confidence, component_scores_dict)
         """
         # Title similarity (50% weight)
-        title_score = self._string_similarity(
-            self.normalize_music_title(track.title),
-            self.normalize_music_title(track.title),  # Comparing to itself for now
-        )
+        if expected_title:
+            title_score = self._string_similarity(
+                self.normalize_music_title(track.title),
+                self.normalize_music_title(expected_title),
+            )
+        else:
+            # No expected title to compare - assume perfect match
+            title_score = 1.0
 
         # Artist similarity (30% weight)
-        artist_score = self._string_similarity(
-            self.normalize_music_title(track.artist),
-            self.normalize_music_title(track.artist),  # Comparing to itself for now
-        )
+        if expected_artist:
+            artist_score = self._string_similarity(
+                self.normalize_music_title(track.artist),
+                self.normalize_music_title(expected_artist),
+            )
+        else:
+            # No expected artist to compare - assume perfect match
+            artist_score = 1.0
 
         # Duration matching (20% weight)
         duration_score = 1.0
