@@ -336,15 +336,15 @@ class GeminiService:
 
 Return 3 sets of 3 variations each:
 
-Set A - Artist-focused (assume artist is PERSON, not franchise):
-1. [canonical_artist] [clean_title]
-2. [canonical_artist] [clean_title] [album_hint]
-3. [main_artist_if_collab] [clean_title]
+Set A - Artist-focused (if artist is a real person/band, not a franchise):
+1. [real_artist_name] [clean_title]
+2. [real_artist_name] [clean_title] [album_hint]
+3. [primary_artist_if_collaboration] [clean_title]
 
-Set B - Entity-focused (assume artist is FRANCHISE):
-1. [franchise] [clean_title] soundtrack
-2. [franchise] OST [clean_title]
-3. [franchise] [clean_title] original
+Set B - Entity-focused (if artist is a franchise/anime/game):
+1. [franchise_name] [clean_title] soundtrack
+2. [franchise_name] OST [clean_title]
+3. [franchise_name] [clean_title] original
 
 Set C - Title-focused (clean title variations):
 1. [clean_title] [year_if_known]
@@ -352,6 +352,7 @@ Set C - Title-focused (clean title variations):
 3. [clean_title] official
 
 Rules:
+- Extract actual artist/band names, NOT placeholders like "PERSON" or "ARTIST"
 - Remove YouTube suffixes (Official Audio, Lyric Video, Nightcore, etc.)
 - Expand acronyms (JJK → Jujutsu Kaisen)
 - For covers, use original artist
@@ -469,7 +470,8 @@ Return JSON: {{"queries": ["query1", "query2", "query3"], "confidence": "high|me
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         tools=[grounding_tool],
-                        response_mime_type="application/json",
+                        # NOTE: response_mime_type="application/json" is incompatible with tools (grounding)
+                        # _extract_json_dict() will parse JSON from text response instead
                         thinking_config=types.ThinkingConfig(thinking_budget=-1),
                     ),
                 )
@@ -572,7 +574,8 @@ Return the BEST GUESS metadata for Last.fm scrobbling:
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         tools=[grounding_tool],
-                        response_mime_type="application/json",
+                        # NOTE: response_mime_type="application/json" is incompatible with tools (grounding)
+                        # _extract_json_dict() will parse JSON from text response instead
                         thinking_config=types.ThinkingConfig(thinking_budget=-1),
                     ),
                 )

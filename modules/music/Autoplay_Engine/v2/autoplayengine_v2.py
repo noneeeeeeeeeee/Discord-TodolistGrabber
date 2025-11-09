@@ -687,7 +687,11 @@ class AutoplayEngineV2:
                 else:
                     # FALLBACK entries use adaptive TTL (retry_after_days)
                     retry_after_days = getattr(cached, "retry_after_days", 1)
-                    should_refresh = cached.is_expired(retry_after_days * 24 * 3600)
+                    if not isinstance(retry_after_days, (int, float)) or retry_after_days <= 0:
+                        # Ensure a sane default even if old cache lacks this field
+                        retry_after_days = 1
+                    ttl_seconds = int(retry_after_days * 24 * 3600)
+                    should_refresh = cached.is_expired(ttl_seconds)
                 
                 if not should_refresh:
                     if self._verbose:
