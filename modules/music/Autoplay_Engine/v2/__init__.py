@@ -59,6 +59,70 @@ _TELEMETRY_MAX_FILES = 5
 _TELEMETRY_QUALITY_THRESHOLD = 8.0
 
 
+@dataclass
+@dataclass(slots=True)
+class AutoplayTelemetryEvent:
+    """
+    Phase 5: Telemetry event for autoplay recommendation tracking.
+    
+    Tracks detailed metrics for each autoplay round to enable:
+    - Pool composition analysis
+    - Consensus breakdown monitoring
+    - Diversity injection effectiveness
+    - Deezer canonical verification rates
+    - API health monitoring
+    """
+    timestamp: float
+    guild_id: int
+    seed_artist: str
+    seed_title: str
+    selected_artist: str
+    selected_title: str
+    
+    # Pool composition: number of tracks from each pool
+    pool_composition: Dict[str, int]  # {pool_a: 30, pool_b: 30, degraded_pool_a: 40, ...}
+    
+    # Consensus breakdown: distribution of consensus signals in session
+    consensus_breakdown: Dict[str, int]  # {liked: 5, disliked: 2, weak_like: 3, neutral: 10}
+    
+    # Diversity tracking
+    diversity_injection_count: int  # Number of forced discovery picks
+    consecutive_safe_picks: int  # Current safe pick streak before this round
+    
+    # Deezer verification metrics
+    deezer_canonical_rate: float  # % of tracks in session with is_canonical=True
+    is_canonical: bool  # Whether seed track was Deezer-verified
+    is_degraded_path: bool  # Whether degraded pools were used
+    
+    # API health
+    deezer_api_errors: int  # Number of Deezer errors in this session
+    gemini_quota_remaining: int  # Remaining grounding quota
+    
+    # Quality metrics
+    selected_score: float  # Final score of selected track
+    pool_size: int  # Total candidate pool size
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to JSON-serializable dict for telemetry logging."""
+        return {
+            "timestamp": self.timestamp,
+            "guild_id": self.guild_id,
+            "seed": f"{self.seed_artist} - {self.seed_title}",
+            "selected": f"{self.selected_artist} - {self.selected_title}",
+            "pool_composition": self.pool_composition,
+            "consensus_breakdown": self.consensus_breakdown,
+            "diversity_injection_count": self.diversity_injection_count,
+            "consecutive_safe_picks": self.consecutive_safe_picks,
+            "deezer_canonical_rate": self.deezer_canonical_rate,
+            "is_canonical": self.is_canonical,
+            "is_degraded_path": self.is_degraded_path,
+            "deezer_api_errors": self.deezer_api_errors,
+            "gemini_quota_remaining": self.gemini_quota_remaining,
+            "selected_score": self.selected_score,
+            "pool_size": self.pool_size,
+        }
+
+
 @dataclass(slots=True)
 class PreparedCandidate:
     features: CandidateFeatures
@@ -99,6 +163,18 @@ class LastFMAutoplayV2:
         self._telemetry_dir = _TELEMETRY_DIR
         self._telemetry_dir.mkdir(parents=True, exist_ok=True)
         self._telemetry_enabled = os.getenv("AUTOPLAY_TELEMETRY_ENABLED", "1") == "1"
+        
+        # Processing lock and UX improvements (per-guild)
+        self._is_processing: Dict[int, bool] = defaultdict(bool)
+        self._warning_timer_expired: Dict[int, bool] = defaultdict(bool)
+        self._warning_tasks: Dict[int, asyncio.Task] = {}
+        
+        # Deezer canonical rate tracking (per-guild)
+        self._canonical_tracks: Dict[int, int] = defaultdict(int)
+        self._total_tracks: Dict[int, int] = defaultdict(int)
+        
+        # Pool composition tracking (per-guild, reset each round)
+        self._pool_composition: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
     # ------------------------------------------------------------------
     # Internal helpers for context tracking (Issue #3)
@@ -120,6 +196,45 @@ class LastFMAutoplayV2:
         return tracker
 
     # ------------------------------------------------------------------
+    # V2.5+: Warning Timer Management
+    # ------------------------------------------------------------------
+    async def _start_warning_timer(self, guild_id: int, delay: float = 5.0) -> None:
+        """
+        Start a warning timer for slow recommendations.
+        
+        After `delay` seconds, sets a flag that MusicPlayer can check
+        to show a "please wait" message.
+        
+        Args:
+            guild_id: Discord guild ID
+            delay: Seconds to wait before flagging (default: 5.0)
+        """
+        try:
+            await asyncio.sleep(delay)
+            self._warning_timer_expired[guild_id] = True
+            if self._verbose:
+                LOG.info(
+                    "⏰ [Guild %d] Warning timer expired after %.1fs",
+                    guild_id,
+                    delay,
+                )
+        except asyncio.CancelledError:
+            # Timer was cancelled because recommendation finished quickly
+            if self._verbose >= 2:
+                LOG.debug(
+                    "⏰ [Guild %d] Warning timer cancelled (fast recommendation)",
+                    guild_id,
+                )
+    
+    def _cancel_warning_timer(self, guild_id: int) -> None:
+        """Cancel the warning timer if recommendation finished quickly."""
+        if guild_id in self._warning_tasks:
+            task = self._warning_tasks[guild_id]
+            if not task.done():
+                task.cancel()
+            del self._warning_tasks[guild_id]
+
+    # ------------------------------------------------------------------
     # Public API expected by ``MusicPlayer``
     # ------------------------------------------------------------------
     def is_available(self) -> bool:
@@ -133,6 +248,89 @@ class LastFMAutoplayV2:
         recommendations even when Gemini is temporarily rate-limited.
         """
         return self._engine.can_recommend
+
+    # ------------------------------------------------------------------
+    # V2.5+: Processing Lock & Warning Status API
+    # ------------------------------------------------------------------
+    def is_processing(self, guild_id: int) -> bool:
+        """
+        Check if autoplay is currently processing a recommendation for this guild.
+        
+        The MusicPlayer can use this to:
+        - Queue user-added tracks instead of playing immediately
+        - Show "recommendation in progress" status
+        
+        Args:
+            guild_id: Discord guild ID
+            
+        Returns:
+            True if recommendation is in progress, False otherwise
+        """
+        return self._is_processing.get(guild_id, False)
+    
+    def should_show_warning(self, guild_id: int) -> bool:
+        """
+        Check if the warning timer has expired for this guild.
+        
+        The MusicPlayer should check this periodically and show:
+        "Autoplay is taking longer than usual as it's analyzing your preferences. 
+        Thank you for waiting."
+        
+        Args:
+            guild_id: Discord guild ID
+            
+        Returns:
+            True if warning should be shown (5+ seconds elapsed), False otherwise
+        """
+        return self._warning_timer_expired.get(guild_id, False)
+    
+    def clear_warning(self, guild_id: int) -> None:
+        """Clear the warning flag after message is shown."""
+        self._warning_timer_expired[guild_id] = False
+
+    async def _write_telemetry_event(self, event: AutoplayTelemetryEvent) -> None:
+        """
+        Write telemetry event to JSONL file asynchronously.
+        
+        This runs in the background and won't block recommendation flow.
+        Writes to: cache/music/telemetry/v3_training_data.jsonl
+        """
+        try:
+            # Create telemetry directory if needed
+            telemetry_dir = _CACHE_DIR / "telemetry"
+            telemetry_dir.mkdir(parents=True, exist_ok=True)
+            
+            telemetry_file = telemetry_dir / "v3_training_data.jsonl"
+            
+            # Append event as JSON line
+            event_dict = event.to_dict()
+            event_json = json.dumps(event_dict)
+            
+            # Use aiofiles for async file writing if available, else use sync
+            try:
+                import aiofiles
+                async with aiofiles.open(telemetry_file, mode='a', encoding='utf-8') as f:
+                    await f.write(event_json + '\n')
+            except ImportError:
+                # Fallback to sync write in thread pool
+                import asyncio
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: telemetry_file.write_text(
+                        telemetry_file.read_text(encoding='utf-8') + event_json + '\n'
+                        if telemetry_file.exists()
+                        else event_json + '\n',
+                        encoding='utf-8'
+                    )
+                )
+            
+            if self._verbose >= 2:
+                LOG.debug("📊 [Telemetry] Wrote event for guild %d", event.guild_id)
+                
+        except Exception as e:
+            LOG.error("Failed to write telemetry event: %s", e)
+            # Don't raise - telemetry failures shouldn't break recommendations
 
     def clear_history(self, guild_id: Optional[int] = None) -> None:
         if guild_id is None:
@@ -193,7 +391,7 @@ class LastFMAutoplayV2:
             num_dislikes: Count of dislike reactions (v2.5)
             num_active_listeners: Total active listeners (v2.5)
         """
-        if not self.is_available():
+        if not self.can_recommend():
             return
 
         track_id = self._track_id(artist, title)
@@ -456,7 +654,7 @@ class LastFMAutoplayV2:
         track_info: Dict[str, Any],
         limit: int = 10,
     ) -> List[Tuple[str, Any]]:
-        if not self.is_available():
+        if not self.can_recommend():
             LOG.debug("Autoplay V2 unavailable; skipping recommendation lookup")
             return []
 
@@ -465,382 +663,398 @@ class LastFMAutoplayV2:
         expected_duration_ms = track_info.get("length")
         guild_id = int(track_info.get("guild_id", 0) or 0)
 
-        if not raw_title:
-            LOG.debug("Missing seed title; aborting autoplay round")
-            return []
-
-        parsed = await self._engine.parse_track(raw_title, channel_name)
-        if self._engine._verbose:
-            LOG.debug(
-                "[AutoplayV2][seed] raw_title=%r channel=%r -> artist=%s title=%s",
-                raw_title,
-                channel_name,
-                (parsed or {}).get("artist") or channel_name,
-                (parsed or {}).get("title") or raw_title,
-            )
-        seed_artist = parsed["artist"] if parsed else channel_name
-        seed_title = parsed["title"] if parsed else raw_title
-
-        if not seed_artist or not seed_title:
-            LOG.debug("Unable to resolve seed metadata; aborting autoplay round")
-            return []
-
-        # Issue #3: Get session context for adaptive recommendation
-        tracker = self._get_context_tracker(guild_id)
-        context = tracker.get_context()
-
-        if self._verbose >= 1:
-            phase = self._novelty_controller.detect_exploration_phase(
-                skip_rate=context.skip_rate,
-                songs_since_novelty=context.songs_since_novelty,
-                session_duration_minutes=(context.last_activity - context.session_start)
-                / 60,
-            )
-            LOG.info(
-                "🎯 [Context] Session state: focus=%s, skip_rate=%.0f%%, streak=%d, phase=%s",
-                context.focus_genres[:2] if context.focus_genres else ["none"],
-                context.skip_rate * 100,
-                context.consecutive_skips,
-                phase.value,
-            )
-
-        await self._ensure_collaborative_ready()
-
-        seed_track_id = self._track_id(seed_artist, seed_title)
-        seed_mood = await self._engine.get_mood_vector(seed_artist, seed_title)
-        session_vector: Optional[Sequence[float]] = None
-        target_mood: Optional[str] = None
-        if seed_mood:
-            session_vector = seed_mood.get("vector")
-            target_mood = seed_mood.get("mood")
-
-        # Phase 2: Get seed track metadata for OST branching
-        seed_track_type = parsed.get("track_type", "music") if parsed else "music"
-        seed_entity = parsed.get("primary_entity") if parsed else None
-
-        candidate_records = await self._fetch_candidate_records(
-            guild_id=guild_id,
-            seed_artist=seed_artist,
-            seed_title=seed_title,
-            seed_track_type=seed_track_type,
-            seed_entity=seed_entity,
-            context=context,
-            tracker=tracker,
+        # V2.5+: Set processing lock and start warning timer
+        self._is_processing[guild_id] = True
+        self._warning_timer_expired[guild_id] = False
+        self._warning_tasks[guild_id] = asyncio.create_task(
+            self._start_warning_timer(guild_id, delay=5.0)
         )
-        if not candidate_records:
-            return []
+        
+        try:
+            if not raw_title:
+                LOG.debug("Missing seed title; aborting autoplay round")
+                return []
 
-        # Task 3.6: Apply artist diversity filter
-        candidate_records, artist_diversity_pool = self._apply_artist_diversity_filter(
-            candidate_records, max_per_artist=3
-        )
-
-        if self._engine._verbose:
-            LOG.debug(
-                "[AutoplayV2][diversity] Kept %d candidates (filtered %d for artist echo prevention)",
-                len(candidate_records),
-                len(artist_diversity_pool),
-            )
-
-        prepared_candidates = await self._prepare_candidates(
-            guild_id,
-            candidate_records,
-        )
-        if not prepared_candidates:
-            LOG.debug("No viable candidates after enrichment step")
-            return []
-
-        features = [entry.features for entry in prepared_candidates]
-        metadata_index = {
-            entry.features.track_id: entry.metadata for entry in prepared_candidates
-        }
-
-        # Phase 3: Extract last track's energy for flow scoring
-        last_energy = None
-        if tracker._history:
-            last_track = tracker._history[-1]
-            last_energy = last_track.energy
-
-        scored = self._engine.score_candidates(
-            guild_id,
-            features,
-            seed_track_ids=[seed_track_id],
-            session_mood_vector=session_vector,
-            target_mood=target_mood,
-            # Phase 3: Enhanced scoring context
-            session_focus_genres=context.focus_genres,
-            liked_mood_vector=context.liked_mood_vector,
-            energy_trend=context.energy_trend,
-            last_energy=last_energy,
-        )
-
-        # Issue #3: Apply novelty controller adjustments
-        # Apply repetition penalties based on recent history
-        for candidate in scored:
-            repetition_penalty = tracker.compute_repetition_penalty(
-                candidate.track_id, tau=6
-            )
-            candidate.score *= repetition_penalty
-            if self._verbose >= 2 and repetition_penalty < 0.9:
+            parsed = await self._engine.parse_track(raw_title, channel_name)
+            if self._engine._verbose:
                 LOG.debug(
-                    "🔄 [Novelty] Repetition penalty %.2f for '%s' (recently played)",
-                    repetition_penalty,
-                    candidate.title,
+                    "[AutoplayV2][seed] raw_title=%r channel=%r -> artist=%s title=%s",
+                    raw_title,
+                    channel_name,
+                    (parsed or {}).get("artist") or channel_name,
+                    (parsed or {}).get("title") or raw_title,
+                )
+            seed_artist = parsed["artist"] if parsed else channel_name
+            seed_title = parsed["title"] if parsed else raw_title
+
+            if not seed_artist or not seed_title:
+                LOG.debug("Unable to resolve seed metadata; aborting autoplay round")
+                return []
+
+            # Issue #3: Get session context for adaptive recommendation
+            tracker = self._get_context_tracker(guild_id)
+            context = tracker.get_context()
+
+            if self._verbose >= 1:
+                phase = self._novelty_controller.detect_exploration_phase(
+                    skip_rate=context.skip_rate,
+                    songs_since_novelty=context.songs_since_novelty,
+                    session_duration_minutes=(context.last_activity - context.session_start)
+                    / 60,
+                )
+                LOG.info(
+                    "🎯 [Context] Session state: focus=%s, skip_rate=%.0f%%, streak=%d, phase=%s",
+                    context.focus_genres[:2] if context.focus_genres else ["none"],
+                    context.skip_rate * 100,
+                    context.consecutive_skips,
+                    phase.value,
                 )
 
-            # Phase 3 Task 4.5: Apply temporal-weighted genre/tag penalties for recently skipped content
-            if context.disliked_tags:
-                # Get candidate features to access genres
-                candidate_features = next(
-                    (f for f in features if f.track_id == candidate.track_id), None
+            await self._ensure_collaborative_ready()
+
+            seed_track_id = self._track_id(seed_artist, seed_title)
+            seed_mood = await self._engine.get_mood_vector(seed_artist, seed_title)
+            session_vector: Optional[Sequence[float]] = None
+            target_mood: Optional[str] = None
+            if seed_mood:
+                session_vector = seed_mood.get("vector")
+                target_mood = seed_mood.get("mood")
+
+            # Phase 2: Get seed track metadata for OST branching and canonical routing
+            seed_track_type = parsed.get("track_type", "music") if parsed else "music"
+            seed_entity = parsed.get("primary_entity") if parsed else None
+            is_canonical = parsed.get("is_canonical", False) if parsed else False
+
+            candidate_records = await self._fetch_candidate_records(
+                guild_id=guild_id,
+                seed_artist=seed_artist,
+                seed_title=seed_title,
+                seed_track_type=seed_track_type,
+                seed_entity=seed_entity,
+                is_canonical=is_canonical,
+                context=context,
+                tracker=tracker,
+            )
+            if not candidate_records:
+                return []
+
+            # Task 3.6: Apply artist diversity filter
+            candidate_records, artist_diversity_pool = self._apply_artist_diversity_filter(
+                candidate_records, max_per_artist=3
+            )
+
+            if self._engine._verbose:
+                LOG.debug(
+                    "[AutoplayV2][diversity] Kept %d candidates (filtered %d for artist echo prevention)",
+                    len(candidate_records),
+                    len(artist_diversity_pool),
                 )
 
-                if candidate_features and candidate_features.genres:
-                    # Calculate tag penalty (average of all matching disliked tags)
-                    tag_penalties = [
-                        context.disliked_tags.get(genre, 0.0)
-                        for genre in candidate_features.genres
-                        if genre in context.disliked_tags
-                    ]
+            prepared_candidates = await self._prepare_candidates(
+                guild_id,
+                candidate_records,
+            )
+            if not prepared_candidates:
+                LOG.debug("No viable candidates after enrichment step")
+                return []
 
-                    if tag_penalties:
-                        avg_penalty = sum(tag_penalties) / len(tag_penalties)
-                        tag_multiplier = (
-                            1.0 - avg_penalty
-                        )  # Convert penalty to multiplier
-                        candidate.score *= tag_multiplier
+            features = [entry.features for entry in prepared_candidates]
+            metadata_index = {
+                entry.features.track_id: entry.metadata for entry in prepared_candidates
+            }
 
-                        if self._verbose >= 2 and avg_penalty > 0.1:
-                            LOG.debug(
-                                "👎 [Skip Penalty] Reducing score by %.1f%% for '%s' (disliked tags: %s)",
-                                avg_penalty * 100,
-                                candidate.title,
-                                [
-                                    g
-                                    for g in candidate_features.genres
-                                    if g in context.disliked_tags
-                                ][:3],
+            # Phase 3: Extract last track's energy for flow scoring
+            last_energy = None
+            if tracker._history:
+                last_track = tracker._history[-1]
+                last_energy = last_track.energy
+
+            scored = self._engine.score_candidates(
+                guild_id,
+                features,
+                    seed_track_ids=[seed_track_id],
+                session_mood_vector=session_vector,
+                target_mood=target_mood,
+                # Phase 3: Enhanced scoring context
+                session_focus_genres=context.focus_genres,
+                liked_mood_vector=context.liked_mood_vector,
+                energy_trend=context.energy_trend,
+                last_energy=last_energy,
+            )
+
+            # Issue #3: Apply novelty controller adjustments
+            # Apply repetition penalties based on recent history
+            for candidate in scored:
+                repetition_penalty = tracker.compute_repetition_penalty(
+                    candidate.track_id, tau=6
+                )
+                candidate.score *= repetition_penalty
+                if self._verbose >= 2 and repetition_penalty < 0.9:
+                    LOG.debug(
+                        "🔄 [Novelty] Repetition penalty %.2f for '%s' (recently played)",
+                        repetition_penalty,
+                        candidate.title,
+                    )
+
+                # Phase 3 Task 4.5: Apply temporal-weighted genre/tag penalties for recently skipped content
+                if context.disliked_tags:
+                    # Get candidate features to access genres
+                    candidate_features = next(
+                        (f for f in features if f.track_id == candidate.track_id), None
+                    )
+
+                    if candidate_features and candidate_features.genres:
+                        # Calculate tag penalty (average of all matching disliked tags)
+                        tag_penalties = [
+                            context.disliked_tags.get(genre, 0.0)
+                            for genre in candidate_features.genres
+                            if genre in context.disliked_tags
+                        ]
+
+                        if tag_penalties:
+                            avg_penalty = sum(tag_penalties) / len(tag_penalties)
+                            tag_multiplier = (
+                                1.0 - avg_penalty
+                            )  # Convert penalty to multiplier
+                            candidate.score *= tag_multiplier
+
+                            if self._verbose >= 2 and avg_penalty > 0.1:
+                                LOG.debug(
+                                    "👎 [Skip Penalty] Reducing score by %.1f%% for '%s' (disliked tags: %s)",
+                                    avg_penalty * 100,
+                                    candidate.title,
+                                    [
+                                        g
+                                        for g in candidate_features.genres
+                                        if g in context.disliked_tags
+                                    ][:3],
+                                )
+
+            # Re-sort after applying all penalties
+            scored.sort(key=lambda c: c.score, reverse=True)
+
+            # Phase 4: Diversity injection - check if we need to force exploration
+            consecutive_safe = self._consecutive_safe_picks.get(guild_id, 0)
+            force_diversity = consecutive_safe >= 5
+
+            if force_diversity and self._verbose:
+                LOG.info(
+                    "🌈 [Diversity Injection] Forcing discovery pick after %d safe picks",
+                    consecutive_safe,
+                )
+
+            # Phase 4: Apply diversity injection filter if needed
+            selection_pool = scored
+            if force_diversity:
+                # Filter to pool_d_discovery candidates with score >= 7.0
+                discovery_candidates = [
+                    c
+                    for c in scored
+                    if metadata_index.get(c.track_id, {}).get("pool_source")
+                    == "pool_d_discovery"
+                    and c.score >= 7.0
+                ]
+
+                if discovery_candidates:
+                    selection_pool = discovery_candidates
+                    if self._verbose:
+                        LOG.info(
+                            "🌈 [Diversity Injection] Filtered to %d discovery candidates (from %d total)",
+                            len(discovery_candidates),
+                            len(scored),
+                        )
+                else:
+                    # Fallback: use any candidate with score >= 7.0
+                    fallback_pool = [c for c in scored if c.score >= 7.0]
+                    if fallback_pool:
+                        selection_pool = fallback_pool
+                        if self._verbose:
+                            LOG.warning(
+                                "🌈 [Diversity Injection] No discovery candidates, using fallback pool of %d",
+                                len(fallback_pool),
                             )
 
-        # Re-sort after applying all penalties
-        scored.sort(key=lambda c: c.score, reverse=True)
+            if self._engine._verbose and selection_pool:
+                top = selection_pool[0]
+                top_meta = metadata_index.get(top.track_id, {})
+                # Try to find mood label from the prepared candidate features
+                top_feat = next(
+                    (
+                        e.features
+                        for e in prepared_candidates
+                        if e.features.track_id == top.track_id
+                    ),
+                    None,
+                )
+                mood_desc = (
+                    top_feat.mood_label if top_feat and top_feat.mood_label else target_mood
+                ) or "unknown"
 
-        # Phase 4: Diversity injection - check if we need to force exploration
-        consecutive_safe = self._consecutive_safe_picks.get(guild_id, 0)
-        force_diversity = consecutive_safe >= 5
-
-        if force_diversity and self._verbose:
-            LOG.info(
-                "🌈 [Diversity Injection] Forcing discovery pick after %d safe picks",
-                consecutive_safe,
-            )
-
-        # Phase 4: Apply diversity injection filter if needed
-        selection_pool = scored
-        if force_diversity:
-            # Filter to pool_d_discovery candidates with score >= 7.0
-            discovery_candidates = [
-                c
-                for c in scored
-                if metadata_index.get(c.track_id, {}).get("pool_source")
-                == "pool_d_discovery"
-                and c.score >= 7.0
-            ]
-
-            if discovery_candidates:
-                selection_pool = discovery_candidates
-                if self._verbose:
-                    LOG.info(
-                        "🌈 [Diversity Injection] Filtered to %d discovery candidates (from %d total)",
-                        len(discovery_candidates),
-                        len(scored),
-                    )
-            else:
-                # Fallback: use any candidate with score >= 7.0
-                fallback_pool = [c for c in scored if c.score >= 7.0]
-                if fallback_pool:
-                    selection_pool = fallback_pool
-                    if self._verbose:
-                        LOG.warning(
-                            "🌈 [Diversity Injection] No discovery candidates, using fallback pool of %d",
-                            len(fallback_pool),
-                        )
-
-        if self._engine._verbose and selection_pool:
-            top = selection_pool[0]
-            top_meta = metadata_index.get(top.track_id, {})
-            # Try to find mood label from the prepared candidate features
-            top_feat = next(
-                (
-                    e.features
-                    for e in prepared_candidates
-                    if e.features.track_id == top.track_id
-                ),
-                None,
-            )
-            mood_desc = (
-                top_feat.mood_label if top_feat and top_feat.mood_label else target_mood
-            ) or "unknown"
-
-            # Issue #3: Show exploration phase and reasoning
-            phase = self._novelty_controller.detect_exploration_phase(
-                skip_rate=context.skip_rate,
-                songs_since_novelty=context.songs_since_novelty,
-                session_duration_minutes=(context.last_activity - context.session_start)
-                / 60,
-            )
-
-            # Check if this is a novelty pick or core pick
-            artist_plays = tracker.get_artist_play_count(top_meta.get("artist", ""))
-            is_new_artist = artist_plays == 0
-            exploration_marker = "🔍 NEW" if is_new_artist else "✨ FAMILIAR"
-
-            LOG.info(
-                "🎯 [Next Pick] %s: '%s' by '%s' (score=%.3f, mood=%s, phase=%s) after '%s'",
-                exploration_marker,
-                top_meta.get("title", "Unknown"),
-                top_meta.get("artist", "Unknown"),
-                top.score,
-                mood_desc,
-                phase.value,
-                f"{seed_artist} - {seed_title}",
-            )
-
-            # Increment novelty counter if this is exploration
-            if is_new_artist:
-                tracker.reset_novelty_counter()
-            else:
-                tracker.increment_novelty_counter()
-
-        # Phase 4: Stochastic selection with safe gate
-        results: List[Tuple[str, Any]] = []
-        max_retries = 5
-        quality_thresholds = [8.0, 7.4, 7.0, 6.8, 6.5]
-        retry_count = 0
-
-        while (
-            len(results) < max(1, limit)
-            and selection_pool
-            and retry_count <= max_retries
-        ):
-            # Phase 4 Task 5.3: Stochastic selection from top 5
-            top_k = min(5, len(selection_pool))
-            top_candidates = selection_pool[:top_k]
-
-            # Calculate weights as score^2 for non-linear preference
-            weights = [c.score**2 for c in top_candidates]
-            total_weight = sum(weights)
-
-            if total_weight <= 0:
-                # Fallback to uniform if all scores are 0 or negative
-                selected_candidate = top_candidates[0]
-            else:
-                # Weighted random selection
-                selected_candidate = random.choices(
-                    top_candidates, weights=weights, k=1
-                )[0]
-
-            # Log stochastic selection if verbose
-            if self._verbose >= 2 and top_k > 1:
-                LOG.debug(
-                    "🎲 [Stochastic Selection] Picked '%s' (score=%.3f) from top %d candidates",
-                    selected_candidate.title,
-                    selected_candidate.score,
-                    top_k,
+                # Issue #3: Show exploration phase and reasoning
+                phase = self._novelty_controller.detect_exploration_phase(
+                    skip_rate=context.skip_rate,
+                    songs_since_novelty=context.songs_since_novelty,
+                    session_duration_minutes=(context.last_activity - context.session_start)
+                    / 60,
                 )
 
-            # Phase 4 Task 5.4: Safe gate - check quality threshold
-            meta = metadata_index.get(selected_candidate.track_id)
-            if not meta:
-                # Remove from pool and retry
-                selection_pool = [
-                    c
-                    for c in selection_pool
-                    if c.track_id != selected_candidate.track_id
-                ]
-                retry_count += 1
-                continue
+                # Check if this is a novelty pick or core pick
+                artist_plays = tracker.get_artist_play_count(top_meta.get("artist", ""))
+                is_new_artist = artist_plays == 0
+                exploration_marker = "🔍 NEW" if is_new_artist else "✨ FAMILIAR"
 
-            # Resolve track
-            track_obj = await self._engine.resolve_track(
-                meta["artist"],
-                meta["title"],
-                expected_duration_ms=expected_duration_ms,
-            )
+                LOG.info(
+                    "🎯 [Next Pick] %s: '%s' by '%s' (score=%.3f, mood=%s, phase=%s) after '%s'",
+                    exploration_marker,
+                    top_meta.get("title", "Unknown"),
+                    top_meta.get("artist", "Unknown"),
+                    top.score,
+                    mood_desc,
+                    phase.value,
+                    f"{seed_artist} - {seed_title}",
+                )
 
-            if not track_obj:
-                # Track resolution failed, remove and retry
-                selection_pool = [
-                    c
-                    for c in selection_pool
-                    if c.track_id != selected_candidate.track_id
-                ]
-                retry_count += 1
-                if self._verbose:
-                    LOG.debug(
-                        "❌ [Safe Gate] Track resolution failed for '%s', retrying (%d/%d)",
-                        selected_candidate.title,
-                        retry_count,
-                        max_retries,
-                    )
-                continue
+                # Increment novelty counter if this is exploration
+                if is_new_artist:
+                    tracker.reset_novelty_counter()
+                else:
+                    tracker.increment_novelty_counter()
 
-            # Safe gate quality check
-            threshold_index = min(retry_count, len(quality_thresholds) - 1)
-            quality_threshold = quality_thresholds[threshold_index]
-            if (
-                selected_candidate.score < quality_threshold
-                and retry_count < max_retries
+            # Phase 4: Stochastic selection with safe gate
+            results: List[Tuple[str, Any]] = []
+            max_retries = 5
+            quality_thresholds = [8.0, 7.4, 7.0, 6.8, 6.5]
+            retry_count = 0
+
+            while (
+                len(results) < max(1, limit)
+                and selection_pool
+                and retry_count <= max_retries
             ):
-                # Score too low, remove and retry
-                selection_pool = [
-                    c
-                    for c in selection_pool
-                    if c.track_id != selected_candidate.track_id
-                ]
-                retry_count += 1
-                if self._verbose:
-                    LOG.info(
-                        "⚠️ [Safe Gate] Score %.3f below threshold %.1f for '%s', retrying (%d/%d)",
-                        selected_candidate.score,
-                        quality_threshold,
-                        selected_candidate.title,
-                        retry_count,
-                        max_retries,
-                    )
-                continue
+                # Phase 4 Task 5.3: Stochastic selection from top 5
+                top_k = min(5, len(selection_pool))
+                top_candidates = selection_pool[:top_k]
 
-            # Track passed safe gate
-            self._note_recommendation(guild_id, meta["artist"], meta["title"])
-            results.append((selected_candidate.track_id, track_obj))
+                # Calculate weights as score^2 for non-linear preference
+                weights = [c.score**2 for c in top_candidates]
+                total_weight = sum(weights)
 
-            # Phase 4 Task 5.1/5.2: Update diversity injection counter
-            if selected_candidate.score >= 8.0:
-                self._consecutive_safe_picks[guild_id] = consecutive_safe + 1
-                if self._verbose >= 2:
+                if total_weight <= 0:
+                    # Fallback to uniform if all scores are 0 or negative
+                    selected_candidate = top_candidates[0]
+                    selected_candidate = top_candidates[0]
+                else:
+                    # Weighted random selection
+                    selected_candidate = random.choices(
+                        top_candidates, weights=weights, k=1
+                    )[0]
+
+                # Log stochastic selection if verbose
+                if self._verbose >= 2 and top_k > 1:
                     LOG.debug(
-                        "📈 [Diversity Counter] Incremented to %d after safe pick",
-                        self._consecutive_safe_picks[guild_id],
-                    )
-            elif force_diversity:
-                # Reset counter on diversity injection
-                self._consecutive_safe_picks[guild_id] = 0
-                if self._verbose:
-                    LOG.info(
-                        "🔄 [Diversity Counter] Reset to 0 after diversity injection"
+                        "🎲 [Stochastic Selection] Picked '%s' (score=%.3f) from top %d candidates",
+                        selected_candidate.title,
+                        selected_candidate.score,
+                        top_k,
                     )
 
-            # Remove selected candidate from pool for next iteration
-            selection_pool = [
-                c for c in selection_pool if c.track_id != selected_candidate.track_id
-            ]
-            retry_count = 0  # Reset retry count for next track
+                # Phase 4 Task 5.4: Safe gate - check quality threshold
+                meta = metadata_index.get(selected_candidate.track_id)
+                if not meta:
+                    # Remove from pool and retry
+                    selection_pool = [
+                        c
+                        for c in selection_pool
+                        if c.track_id != selected_candidate.track_id
+                    ]
+                    retry_count += 1
+                    continue
 
-        if not results:
-            LOG.debug("Autoplay V2 produced no playable tracks after resolution")
-        return results
+                # Resolve track
+                track_obj = await self._engine.resolve_track(
+                    meta["artist"],
+                    meta["title"],
+                    expected_duration_ms=expected_duration_ms,
+                )
 
-    # ------------------------------------------------------------------
+                if not track_obj:
+                    # Track resolution failed, remove and retry
+                    selection_pool = [
+                        c
+                        for c in selection_pool
+                        if c.track_id != selected_candidate.track_id
+                    ]
+                    retry_count += 1
+                    if self._verbose:
+                        LOG.debug(
+                            "❌ [Safe Gate] Track resolution failed for '%s', retrying (%d/%d)",
+                            selected_candidate.title,
+                            retry_count,
+                            max_retries,
+                        )
+                    continue
+
+                # Safe gate quality check
+                threshold_index = min(retry_count, len(quality_thresholds) - 1)
+                quality_threshold = quality_thresholds[threshold_index]
+                if (
+                    selected_candidate.score < quality_threshold
+                    and retry_count < max_retries
+                ):
+                    # Score too low, remove and retry
+                    selection_pool = [
+                        c
+                        for c in selection_pool
+                        if c.track_id != selected_candidate.track_id
+                    ]
+                    retry_count += 1
+                    if self._verbose:
+                        LOG.info(
+                            "⚠️ [Safe Gate] Score %.3f below threshold %.1f for '%s', retrying (%d/%d)",
+                            selected_candidate.score,
+                            quality_threshold,
+                            selected_candidate.title,
+                            retry_count,
+                            max_retries,
+                        )
+                    continue
+
+                # Track passed safe gate
+                self._note_recommendation(guild_id, meta["artist"], meta["title"])
+                results.append((selected_candidate.track_id, track_obj))
+
+                # Phase 4 Task 5.1/5.2: Update diversity injection counter
+                if selected_candidate.score >= 8.0:
+                    self._consecutive_safe_picks[guild_id] = consecutive_safe + 1
+                    if self._verbose >= 2:
+                        LOG.debug(
+                            "📈 [Diversity Counter] Incremented to %d after safe pick",
+                            self._consecutive_safe_picks[guild_id],
+                        )
+                elif force_diversity:
+                    # Reset counter on diversity injection
+                    self._consecutive_safe_picks[guild_id] = 0
+                    if self._verbose:
+                        LOG.info(
+                            "🔄 [Diversity Counter] Reset to 0 after diversity injection"
+                        )
+
+                # Remove selected candidate from pool for next iteration
+                selection_pool = [
+                    c for c in selection_pool if c.track_id != selected_candidate.track_id
+                ]
+                retry_count = 0  # Reset retry count for next track
+
+            if not results:
+                LOG.debug("Autoplay V2 produced no playable tracks after resolution")
+            return results
+            
+        finally:
+            # V2.5+: Release processing lock and cancel warning timer
+            self._is_processing[guild_id] = False
+            self._cancel_warning_timer(guild_id)
+            if self._verbose >= 2:
+                LOG.debug("🔓 [Guild %d] Processing lock released", guild_id)    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
     async def _ensure_collaborative_ready(self) -> None:
@@ -858,14 +1072,17 @@ class LastFMAutoplayV2:
         seed_title: str,
         seed_track_type: str = "music",
         seed_entity: Optional[str] = None,
+        is_canonical: bool = False,
         context: Any,  # SessionContext from context_tracker
-        tracker: Any,  # ContextTracker instance
+        tracker: Any,  
     ) -> List[Dict[str, Any]]:
         """
         Fetch candidate pool using Phase 2 diversification strategy.
 
-        Branch A (OST/Entity-based): For OST/anime/game soundtracks with entity
-        Branch B (Artist-based): For standard music
+        Routing Logic (Phase 2 Update):
+        - If is_canonical=False (Deezer failed) → use degraded genre-based pools
+        - Else if OST/Entity-based → use entity pools
+        - Else if Artist-based:
             - Cold Start: < 3 songs history
             - Warm Start: >= 3 songs history
 
@@ -875,6 +1092,7 @@ class LastFMAutoplayV2:
             seed_title: Seed track title
             seed_track_type: Track type from parsing (ost, anime_opening, game_soundtrack, music)
             seed_entity: Primary entity for OST content (e.g., "Hazbin Hotel")
+            is_canonical: Whether Deezer verified the artist/title (from waterfall)
             context: SessionContext with history and focus_genres
             tracker: ContextTracker instance for accessing _history
 
@@ -885,7 +1103,21 @@ class LastFMAutoplayV2:
             LOG.warning("Last.fm API key missing; cannot fetch candidates")
             return []
 
-        # Task 3.1: OST branch detection
+        # Priority routing based on is_canonical flag
+        if not is_canonical:
+            # Deezer failed to verify artist/title → use degraded genre-based pools
+            if self._verbose:
+                LOG.info(
+                    "🔻 [Degraded Path] Deezer verification failed for '%s', using genre-based pools",
+                    seed_title,
+                )
+            return await self._fetch_degraded_pools(
+                seed_artist=seed_artist,
+                seed_title=seed_title,
+                context=context,
+            )
+
+        # OST branch detection (only when canonical)
         is_ost = seed_track_type in {"ost", "game_soundtrack", "anime_opening"}
         use_entity_branch = is_ost and seed_entity is not None
 
@@ -903,20 +1135,50 @@ class LastFMAutoplayV2:
                 tracker=tracker,
             )
         elif history_size < 3:
-            # Branch B: Cold start
+            # Branch A: Cold start
             return await self._fetch_cold_start_pools(
                 seed_artist=seed_artist,
                 seed_title=seed_title,
                 context=context,
             )
         else:
-            # Branch B: Warm start
-            return await self._fetch_warm_start_pools(
-                seed_artist=seed_artist,
-                seed_title=seed_title,
-                context=context,
-                tracker=tracker,
+            # V2.5+: Check exploration phase for Hot Pool vs Warm Pool
+            phase = self._novelty_controller.detect_exploration_phase(
+                skip_rate=context.skip_rate,
+                songs_since_novelty=context.songs_since_novelty,
+                session_duration_minutes=(context.last_activity - context.session_start) / 60,
             )
+            
+            # Import ExplorationPhase for comparison
+            from .novelty_controller import ExplorationPhase
+            
+            if phase == ExplorationPhase.STABLE:
+                # Branch B: Hot Pool (user satisfied, low diversity)
+                if self._verbose:
+                    LOG.info(
+                        "🔥 [Branch B: Hot Pool] User in STABLE phase (skip_rate=%.1f%%), using high-familiarity pool",
+                        context.skip_rate * 100,
+                    )
+                return await self._fetch_hot_pool(
+                    seed_artist=seed_artist,
+                    seed_title=seed_title,
+                    context=context,
+                    tracker=tracker,
+                )
+            else:
+                # Branch C: Warm Pool (exploration/boredom, high diversity)
+                if self._verbose:
+                    LOG.info(
+                        "🌈 [Branch C: Warm Pool] User in %s phase (skip_rate=%.1f%%), using high-diversity pool",
+                        phase.value,
+                        context.skip_rate * 100,
+                    )
+                return await self._fetch_warm_start_pools(
+                    seed_artist=seed_artist,
+                    seed_title=seed_title,
+                    context=context,
+                    tracker=tracker,
+                )
 
     async def _fetch_entity_based_pools(
         self,
@@ -928,7 +1190,7 @@ class LastFMAutoplayV2:
         tracker: Any,
     ) -> List[Dict[str, Any]]:
         """
-        Task 3.2: Fetch Branch A (entity-based) pools for OST content.
+        Fetch Branch A (entity-based) pools for OST content.
 
         Prong 1: tag.getTopTracks(entity) - 40 tracks
         Prong 2: track.getSimilar(seed) or fallback tag continuity - 30 tracks
@@ -1084,6 +1346,135 @@ class LastFMAutoplayV2:
 
         return all_pools
 
+    async def _fetch_hot_pool(
+        self,
+        *,
+        seed_artist: str,
+        seed_title: str,
+        context: Any,
+        tracker: Any,
+    ) -> List[Dict[str, Any]]:
+        """
+        V2.5+: Fetch "Hot Pool" for STABLE phase (user is satisfied).
+        
+        This is a low-diversity, high-familiarity pool used when the user
+        is in a flow state (low skip rate, long session). Emphasizes:
+        - Strong similarity to current track (40 tracks)
+        - Familiar artists from recent history (30 tracks)  
+        - Core genre stability (30 tracks)
+        - Minimal discovery (10 tracks, 10% novelty)
+        
+        Pool Strategy:
+        - Prong 1: track.getSimilar(seed, 40) - HIGH similarity
+        - Prong 2: artist.getTopTracks(recent_artists, 30) - HIGH familiarity
+        - Prong 3: tag.getTopTracks(primary_genre, 30) - HIGH coherence
+        - Prong 4: tag.getSimilar(primary_genre) -> topTracks(10) - MINIMAL discovery
+        Total: ~110 tracks (90% familiarity + 10% novelty)
+        
+        Args:
+            seed_artist: Current track artist
+            seed_title: Current track title
+            context: SessionContext with focus_genres
+            tracker: ContextTracker for recent artists
+            
+        Returns:
+            List of track records with pool_source='hot_pool_*'
+        """
+        if self._engine._verbose:
+            LOG.info(
+                "🔥 [Hot Pool] High-familiarity fetch for STABLE session: '%s'",
+                seed_title,
+            )
+
+        focus_genres = getattr(context, "focus_genres", []) or []
+        primary_genre = focus_genres[0] if len(focus_genres) > 0 else "rock"
+        recent_artists = self._extract_recent_artists(tracker, max_artists=3)
+
+        # Parallel fetch all prongs
+        prong_1_task = self._fetch_track_similar(seed_artist, seed_title, limit=40)
+        prong_2_tasks = [
+            self._fetch_artist_top_tracks(artist, limit=10) for artist in recent_artists[:3]
+        ]
+        prong_3_task = self._fetch_tag_top_tracks(primary_genre, limit=30)
+        
+        # Prong 4: Minimal discovery via similar tags
+        prong_4_similar_tags_task = self._fetch_similar_tags(primary_genre, limit=3)
+
+        base_results = await asyncio.gather(
+            prong_1_task,
+            *prong_2_tasks,
+            prong_3_task,
+            prong_4_similar_tags_task,
+            return_exceptions=True,
+        )
+
+        # Extract and filter pool_1 (ensure only dicts)
+        pool_1_result = base_results[0] if isinstance(base_results[0], list) else []
+        pool_1: List[Dict[str, Any]] = []
+        if isinstance(pool_1_result, list):
+            for item in pool_1_result:
+                if isinstance(item, dict):
+                    pool_1.append(item)
+        
+        # Combine Prong 2 results (recent artists) - ensure only dicts
+        pool_2: List[Dict[str, Any]] = []
+        for i in range(1, min(len(recent_artists) + 1, len(base_results))):
+            result = base_results[i]
+            if isinstance(result, list):
+                for item in result:
+                    if isinstance(item, dict):
+                        pool_2.append(item)
+        
+        # Extract and filter pool_3 (ensure only dicts)
+        pool_3_idx = len(recent_artists) + 1
+        pool_3_result = base_results[pool_3_idx] if pool_3_idx < len(base_results) else []
+        pool_3: List[Dict[str, Any]] = []
+        if isinstance(pool_3_result, list):
+            for item in pool_3_result:
+                if isinstance(item, dict):
+                    pool_3.append(item)
+        
+        similar_tags_idx = pool_3_idx + 1
+        similar_tags_result = base_results[similar_tags_idx] if similar_tags_idx < len(base_results) else []
+        similar_tags = similar_tags_result if isinstance(similar_tags_result, list) else []
+
+        # Prong 4: Fetch minimal discovery from first similar tag
+        pool_4: List[Dict[str, Any]] = []
+        if similar_tags and len(similar_tags) > 0:
+            discovery_tag = similar_tags[0]
+            if isinstance(discovery_tag, str):
+                pool_4_result = await self._fetch_tag_top_tracks(discovery_tag, limit=10)
+                if isinstance(pool_4_result, list):
+                    pool_4 = pool_4_result
+
+        # Tag pool sources
+        for record in pool_1:
+            if isinstance(record, dict):
+                record["pool_source"] = "hot_pool_similarity"
+        for record in pool_2:
+            if isinstance(record, dict):
+                record["pool_source"] = "hot_pool_familiarity"
+        for record in pool_3:
+            if isinstance(record, dict):
+                record["pool_source"] = "hot_pool_coherence"
+        for record in pool_4:
+            if isinstance(record, dict):
+                record["pool_source"] = "hot_pool_discovery"
+
+        all_pools = pool_1 + pool_2 + pool_3 + pool_4
+
+        if self._engine._verbose:
+            LOG.info(
+                "🔥 [Hot Pool] Fetched %d tracks (Similarity:%d, Familiarity:%d, Coherence:%d, Discovery:%d)",
+                len(all_pools),
+                len(pool_1),
+                len(pool_2),
+                len(pool_3),
+                len(pool_4),
+            )
+
+        return all_pools
+
     async def _fetch_warm_start_pools(
         self,
         *,
@@ -1186,6 +1577,102 @@ class LastFMAutoplayV2:
                 len(pool_b),
                 len(pool_c),
                 len(pool_d),
+            )
+
+        return all_pools
+
+    async def _fetch_degraded_pools(
+        self,
+        *,
+        seed_artist: str,
+        seed_title: str,
+        context: Any,
+    ) -> List[Dict[str, Any]]:
+        """
+        Phase 2 Task 2.2: Fetch degraded genre-based pools when Deezer verification fails.
+
+        This is used when is_canonical=False (waterfall couldn't verify artist on Deezer).
+        Falls back to pure genre-based recommendations without artist similarity.
+
+        Pool A: tag.getTopTracks(primary_genre, 40)
+        Pool B: tag.getTopTracks(secondary_genre, 20) 
+        Pool C: tag.getSimilar(primary_genre) + tag.getTopTracks(20)
+        Total: ~80 tracks
+
+        Args:
+            seed_artist: Seed track artist (unverified)
+            seed_title: Seed track title (unverified)
+            context: SessionContext with focus_genres
+
+        Returns:
+            List of track records with pool_source tags
+        """
+        if self._engine._verbose:
+            LOG.info(
+                "🔻 [Degraded Pools] Fetching genre-based pools for unverified track: %s - %s",
+                seed_artist,
+                seed_title,
+            )
+
+        focus_genres = getattr(context, "focus_genres", []) or []
+        primary_genre = focus_genres[0] if len(focus_genres) > 0 else "rock"
+        secondary_genre = focus_genres[1] if len(focus_genres) > 1 else "pop"
+
+        # Parallel fetch all pools
+        pool_a_task = self._fetch_tag_top_tracks(primary_genre, limit=40)
+        pool_b_task = self._fetch_tag_top_tracks(secondary_genre, limit=20)
+        
+        # Pool C: Similar tags → top tracks from first similar tag
+        pool_c_similar_tags_task = self._fetch_similar_tags(primary_genre, limit=5)
+        pool_c_top_task = self._fetch_tag_top_tracks(primary_genre, limit=20)
+
+        base_results = await asyncio.gather(
+            pool_a_task,
+            pool_b_task,
+            pool_c_similar_tags_task,
+            pool_c_top_task,
+            return_exceptions=True,
+        )
+
+        pool_a = base_results[0] if isinstance(base_results[0], list) else []
+        pool_b = base_results[1] if isinstance(base_results[1], list) else []
+        similar_tags = base_results[2] if isinstance(base_results[2], list) else []
+        pool_c_top = base_results[3] if isinstance(base_results[3], list) else []
+
+        # Fetch top tracks from first similar tag for Pool C discovery
+        pool_c_similar = []
+        if similar_tags:
+            first_similar_tag = similar_tags[0]
+            pool_c_similar = await self._fetch_tag_top_tracks(first_similar_tag, limit=10)
+
+        # Combine Pool C
+        pool_c = []
+        for track in pool_c_similar:
+            if len(pool_c) < 10:
+                pool_c.append(track)
+        for track in pool_c_top:
+            if len(pool_c) < 20:
+                # Avoid duplicates
+                if not any(t.get("name") == track.get("name") and t.get("artist") == track.get("artist") for t in pool_c):
+                    pool_c.append(track)
+
+        # Tag pools
+        for record in pool_a:
+            record["pool_source"] = "degraded_pool_a"
+        for record in pool_b:
+            record["pool_source"] = "degraded_pool_b"
+        for record in pool_c:
+            record["pool_source"] = "degraded_pool_c"
+
+        all_pools = pool_a + pool_b + pool_c
+
+        if self._engine._verbose:
+            LOG.info(
+                "🔻 [Degraded Pools] Fetched %d tracks (A:%d, B:%d, C:%d)",
+                len(all_pools),
+                len(pool_a),
+                len(pool_b),
+                len(pool_c),
             )
 
         return all_pools
@@ -1405,7 +1892,7 @@ class LastFMAutoplayV2:
         return trimmed
 
     # ------------------------------------------------------------------
-    # Last.fm API Helper Methods (Phase 2: Task 3.7)
+    # Last.fm API Helper Methods 
     # ------------------------------------------------------------------
 
     async def _fetch_track_similar(

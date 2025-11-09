@@ -148,6 +148,25 @@ class AutoplayEngineV2:
     async def parse_track(
         self, raw_title: str, channel_name: str
     ) -> Optional[Dict[str, Any]]:
+        """
+        Parse track metadata with resilient waterfall.
+        
+        Uses parse_with_resilient_waterfall() for new 3-stage escalation.
+        Falls back to legacy _try_gemini_parse() if waterfall unavailable.
+        """
+        # Use YouTube ID as cache key (channel_name serves as secondary key)
+        youtube_id = channel_name 
+        
+        # Try Phase 0.5 waterfall first
+        if self._gemini.is_available:
+            try:
+                parsed = await self.parse_with_resilient_waterfall(raw_title, youtube_id)
+                if parsed:
+                    return parsed
+            except Exception as exc:
+                LOG.warning(f"⚠️ Waterfall parse failed, falling back to legacy: {exc}")
+        
+        # Fallback to legacy parsing with cache check
         cached = await self._cache.get_parsing(raw_title, channel_name)
         if cached:
             schema_version = getattr(cached, "schema_version", 1)
@@ -585,6 +604,10 @@ class AutoplayEngineV2:
         raw_title: str,
         channel_name: str,
     ) -> Optional[Dict[str, Any]]:
+        """
+        LEGACY METHOD - Deprecated in favor of parse_with_resilient_waterfall.
+        Kept for backward compatibility during migration.
+        """
         if not self._gemini.is_available:
             LOG.debug("Gemini unavailable; skipping AI parse")
             return None
@@ -610,6 +633,340 @@ class AutoplayEngineV2:
             }
             return payload
         return None
+
+    async def parse_with_resilient_waterfall(
+        self,
+        youtube_title: str,
+        youtube_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Phase 0.5: Multi-stage resilient parsing with Deezer canonical verification.
+        
+        Stage 0: Cache check with self-healing TTL
+        Stage 1: Flash-Lite → 9 Deezer queries (85% confidence threshold)
+        Stage 2: Flash + Grounding + Thinking → 3 refined queries (75% threshold)
+        Stage 3: Flash + Grounding + Thinking → Direct extraction (best_guess)
+        Emergency: Regex fallback (retry_after_days=1)
+        
+        Args:
+            youtube_title: Raw YouTube video title
+            youtube_id: YouTube video ID for cache key
+            
+        Returns:
+            Dictionary with artist, title, confidence, track_type, primary_entity, 
+            is_canonical, is_best_guess, deezer_id (if verified)
+        """
+        import re
+        from modules.music.Autoplay_Engine.v2.deezer_fetch import DeezerClient
+        
+        # Stage 0: Cache check with self-healing TTL
+        cached = await self._cache.get_parsing(youtube_title, youtube_id)
+        if cached:
+            # Backward compatibility: Check schema version for old cache entries
+            schema_version = getattr(cached, "schema_version", 1)
+            if schema_version < PARSING_SCHEMA_VERSION:
+                if self._verbose:
+                    LOG.info(
+                        f"🔄 [Stage 0: Schema Upgrade] Old cache entry (v{schema_version}) for '{youtube_title[:50]}...', refreshing with waterfall"
+                    )
+                # Delete old entry and proceed with waterfall
+                await self._cache.delete_parsing(youtube_title, youtube_id)
+            else:
+                # Check if cache entry has expired based on type
+                should_refresh = False
+                cache_type = "CANONICAL" if getattr(cached, "is_canonical", False) else \
+                            "BEST_GUESS" if getattr(cached, "is_best_guess", False) else \
+                            "FALLBACK"
+                
+                if cache_type == "CANONICAL":
+                    # Canonical entries never expire (Deezer-verified)
+                    should_refresh = False
+                elif cache_type == "BEST_GUESS":
+                    # Best guess entries expire after 7 days
+                    should_refresh = cached.is_expired(7 * 24 * 3600)
+                else:
+                    # FALLBACK entries use adaptive TTL (retry_after_days)
+                    retry_after_days = getattr(cached, "retry_after_days", 1)
+                    should_refresh = cached.is_expired(retry_after_days * 24 * 3600)
+                
+                if not should_refresh:
+                    if self._verbose:
+                        LOG.info(
+                            f"📁 [Stage 0: Cache Hit] {cache_type} entry for '{youtube_title[:50]}...' "
+                            f"-> {cached.artist} - {cached.title}"
+                        )
+                    return {
+                        "artist": cached.artist,
+                        "title": cached.title,
+                        "confidence": cached.confidence,
+                        "track_type": getattr(cached, "track_type", "music"),
+                        "primary_entity": getattr(cached, "primary_entity", None),
+                        "is_canonical": getattr(cached, "is_canonical", False),
+                        "is_best_guess": getattr(cached, "is_best_guess", False),
+                        "deezer_id": getattr(cached, "deezer_id", None),
+                    }
+                else:
+                    if self._verbose:
+                        LOG.info(
+                            f"🔄 [Stage 0: Cache Expired] {cache_type} entry expired for '{youtube_title[:50]}...', refreshing"
+                        )
+        
+        if self._verbose:
+            LOG.info(f"🔍 [Stage 0: Cache Miss] Starting waterfall for '{youtube_title[:60]}...'")
+        
+        # Initialize Deezer client with async context manager
+        async with DeezerClient() as deezer_client:
+            # Stage 1: Flash-Lite → 9 Deezer queries (85% threshold)
+            if self._gemini.is_available:
+                if self._verbose:
+                    LOG.info("⚡ [Stage 1: Flash-Lite] Generating 9 Deezer queries...")
+                
+                try:
+                    queries_response = await self._gemini.generate_deezer_queries_lite(youtube_title)
+                    if queries_response and "queries" in queries_response:
+                        queries = queries_response["queries"][:9]  # Ensure max 9
+                        
+                        if self._verbose >= 2:
+                            LOG.debug(f"⚡ [Stage 1] Generated queries: {queries}")
+                        
+                        # Try each query against Deezer
+                        for idx, query in enumerate(queries, 1):
+                            if self._verbose >= 2:
+                                LOG.debug(f"⚡ [Stage 1] Query {idx}/9: '{query}'")
+                            
+                            # Search Deezer and get best match
+                            search_results = await deezer_client.search_track(query)
+                            match = deezer_client.get_best_match(search_results, threshold=0.85)
+                            if match and match.confidence >= 0.85:
+                                if self._verbose:
+                                    LOG.info(
+                                        f"✅ [Stage 1: SUCCESS] Deezer match on query {idx}/9: "
+                                        f"{match.track.artist} - {match.track.title} "
+                                        f"(confidence={match.confidence:.2f}, deezer_id={match.track.id})"
+                                    )
+                                
+                                # Cache as canonical (indefinite TTL)
+                                entry = ParsingEntry(
+                                    artist=match.track.artist,
+                                    title=match.track.title,
+                                    confidence=match.confidence,
+                                    parsed_at=time.time(),
+                                    track_type="music",  # Deezer verified = commercial music
+                                    primary_entity=None,
+                                    is_canonical=True,
+                                    is_best_guess=False,
+                                    deezer_id=match.track.id,
+                                    schema_version=PARSING_SCHEMA_VERSION,
+                                )
+                                await self._cache.set_parsing(youtube_title, youtube_id, entry)
+                                
+                                return {
+                                    "artist": match.track.artist,
+                                    "title": match.track.title,
+                                    "confidence": match.confidence,
+                                    "track_type": "music",
+                                    "primary_entity": None,
+                                    "is_canonical": True,
+                                    "is_best_guess": False,
+                                    "deezer_id": match.track.id,
+                                }
+                        
+                        if self._verbose:
+                            LOG.info("⚠️ [Stage 1: FAIL] All 9 queries failed to meet 85% threshold")
+                
+                except Exception as exc:
+                    LOG.warning(f"⚠️ [Stage 1: ERROR] Flash-Lite failed: {exc}")
+            
+            # Stage 2: Flash + Grounding + Thinking → 3 refined queries (75% threshold)
+            if self._gemini.is_available and self._gemini.can_use_grounding():
+                if self._verbose:
+                    LOG.info("🧠 [Stage 2: Flash+Grounding+Thinking] Generating 3 refined queries...")
+                
+                try:
+                    # Pass failed Stage 1 queries for context awareness
+                    context = queries_response.get("queries", []) if queries_response else []
+                    grounded_response = await self._gemini.generate_deezer_queries_grounded(
+                        youtube_title, 
+                        failed_queries=context[:3]  # Pass first 3 failed attempts
+                    )
+                    
+                    if grounded_response and "queries" in grounded_response:
+                        queries = grounded_response["queries"][:3]  # Max 3 refined
+                        
+                        if self._verbose >= 2:
+                            reasoning = grounded_response.get("reasoning", "N/A")
+                            LOG.debug(f"🧠 [Stage 2] Reasoning: {reasoning}")
+                            LOG.debug(f"🧠 [Stage 2] Refined queries: {queries}")
+                        
+                        for idx, query in enumerate(queries, 1):
+                            if self._verbose >= 2:
+                                LOG.debug(f"🧠 [Stage 2] Query {idx}/3: '{query}'")
+                            
+                            # Search Deezer and get best match
+                            search_results = await deezer_client.search_track(query)
+                            match = deezer_client.get_best_match(search_results, threshold=0.75)
+                            if match and match.confidence >= 0.75:
+                                if self._verbose:
+                                    LOG.info(
+                                        f"✅ [Stage 2: SUCCESS] Deezer match on query {idx}/3: "
+                                        f"{match.track.artist} - {match.track.title} "
+                                        f"(confidence={match.confidence:.2f}, deezer_id={match.track.id})"
+                                    )
+                                
+                                # Cache as canonical (indefinite TTL)
+                                entry = ParsingEntry(
+                                    artist=match.track.artist,
+                                    title=match.track.title,
+                                    confidence=match.confidence,
+                                    parsed_at=time.time(),
+                                    track_type="music",
+                                    primary_entity=None,
+                                    is_canonical=True,
+                                    is_best_guess=False,
+                                    deezer_id=match.track.id,
+                                    schema_version=PARSING_SCHEMA_VERSION,
+                                )
+                                await self._cache.set_parsing(youtube_title, youtube_id, entry)
+                                
+                                return {
+                                    "artist": match.track.artist,
+                                    "title": match.track.title,
+                                    "confidence": match.confidence,
+                                    "track_type": "music",
+                                    "primary_entity": None,
+                                    "is_canonical": True,
+                                    "is_best_guess": False,
+                                    "deezer_id": match.track.id,
+                                }
+                        
+                        if self._verbose:
+                            LOG.info("⚠️ [Stage 2: FAIL] All 3 grounded queries failed to meet 75% threshold")
+                
+                except Exception as exc:
+                    LOG.warning(f"⚠️ [Stage 2: ERROR] Flash+Grounding failed: {exc}")
+            elif self._verbose:
+                grounding_status = "quota exhausted" if not self._gemini.can_use_grounding() else "Gemini unavailable"
+                LOG.info(f"⏭️ [Stage 2: SKIPPED] {grounding_status}")
+            
+            # Stage 3: Flash + Grounding + Thinking → Direct extraction (best_guess)
+            if self._gemini.is_available and self._gemini.can_use_grounding():
+                if self._verbose:
+                    LOG.info("🎯 [Stage 3: Fallback Extraction] Extracting metadata directly...")
+                
+                try:
+                    # Collect all failed queries for context
+                    failed_queries_context = []
+                    if queries_response and "queries" in queries_response:
+                        failed_queries_context.extend(queries_response["queries"][:9])
+                    if grounded_response and "queries" in grounded_response:
+                        failed_queries_context.extend(grounded_response["queries"][:3])
+                    
+                    fallback_response = await self._gemini.generate_fallback_metadata(
+                        youtube_title,
+                        failed_queries=failed_queries_context[:5]  # Pass top 5 failures
+                    )
+                    
+                    if fallback_response:
+                        artist = fallback_response.get("artist", "").strip()
+                        title = fallback_response.get("title", "").strip()
+                        track_type = fallback_response.get("track_type", "music")
+                        primary_entity = fallback_response.get("primary_entity")
+                        
+                        if artist and title:
+                            if self._verbose:
+                                reasoning = fallback_response.get("reasoning", "N/A")
+                                LOG.info(
+                                    f"✅ [Stage 3: SUCCESS] Extracted: {artist} - {title} "
+                                    f"(track_type={track_type}, entity={primary_entity or 'N/A'})"
+                                )
+                                if self._verbose >= 2:
+                                    LOG.debug(f"🎯 [Stage 3] Reasoning: {reasoning}")
+                            
+                            # Cache as best_guess (7-day TTL)
+                            entry = ParsingEntry(
+                                artist=artist,
+                                title=title,
+                                confidence=0.65,  # Medium confidence for unverified
+                                parsed_at=time.time(),
+                                track_type=track_type,
+                                primary_entity=primary_entity,
+                                is_canonical=False,
+                                is_best_guess=True,
+                                retry_after_days=7,  # Retry after 7 days
+                                schema_version=PARSING_SCHEMA_VERSION,
+                            )
+                            await self._cache.set_parsing(youtube_title, youtube_id, entry)
+                            
+                            return {
+                                "artist": artist,
+                                "title": title,
+                                "confidence": 0.65,
+                                "track_type": track_type,
+                                "primary_entity": primary_entity,
+                                "is_canonical": False,
+                                "is_best_guess": True,
+                                "deezer_id": None,
+                            }
+                
+                except Exception as exc:
+                    LOG.warning(f"⚠️ [Stage 3: ERROR] Fallback extraction failed: {exc}")
+            elif self._verbose:
+                grounding_status = "quota exhausted" if not self._gemini.can_use_grounding() else "Gemini unavailable"
+                LOG.info(f"⏭️ [Stage 3: SKIPPED] {grounding_status}")
+            
+            # Emergency: Regex fallback (retry after 1 day)
+            if self._verbose:
+                LOG.warning("🚨 [Emergency: Regex Fallback] All AI stages failed, using regex...")
+            
+            # Simple regex to extract "Artist - Title" or "Title by Artist"
+            patterns = [
+                r"^(.+?)\s*-\s*(.+?)(?:\s*\[.*\]|\s*\(.*\)|$)",  # "Artist - Title [...]"
+                r"^(.+?)\s+by\s+(.+?)(?:\s*\[.*\]|\s*\(.*\)|$)",  # "Title by Artist"
+            ]
+            
+            for pattern in patterns:
+                match = re.match(pattern, youtube_title, re.IGNORECASE)
+                if match:
+                    artist = match.group(1).strip()
+                    title = match.group(2).strip()
+                    
+                    if artist and title:
+                        if self._verbose:
+                            LOG.warning(
+                                f"🚨 [Emergency: Regex] Extracted: {artist} - {title} "
+                                f"(retry after 1 day)"
+                            )
+                        
+                        # Cache as fallback (1-day TTL for quota_exhausted)
+                        entry = ParsingEntry(
+                            artist=artist,
+                            title=title,
+                            confidence=0.3,  # Low confidence for regex
+                            parsed_at=time.time(),
+                            track_type="music",
+                            primary_entity=None,
+                            is_canonical=False,
+                            is_best_guess=False,
+                            failure_reason="quota_exhausted",
+                            retry_after_days=1,  # Retry tomorrow when quota resets
+                            schema_version=PARSING_SCHEMA_VERSION,
+                        )
+                        await self._cache.set_parsing(youtube_title, youtube_id, entry)
+                        
+                        return {
+                            "artist": artist,
+                            "title": title,
+                            "confidence": 0.3,
+                            "track_type": "music",
+                            "primary_entity": None,
+                            "is_canonical": False,
+                            "is_best_guess": False,
+                            "deezer_id": None,
+                        }
+            
+            # Total failure - return None
+            LOG.error(f"❌ [TOTAL FAILURE] Could not parse '{youtube_title[:60]}...'")
+            return None
 
     async def get_mood_vector(
         self,

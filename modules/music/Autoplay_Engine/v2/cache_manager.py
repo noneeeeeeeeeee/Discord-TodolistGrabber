@@ -114,6 +114,11 @@ class EnrichmentEntry:
     activity_affinity: Optional[str] = None  # e.g., "workout", "study", "party"
     emotional_intensity: Optional[float] = None  # 0.0-1.0
     daypart_affinity: Optional[str] = None  # e.g., "morning", "evening", "night"
+    
+    # Phase 0.5: Deezer-sourced metadata (integrated here, NOT separate cache)
+    canonical_duration_ms: Optional[int] = None  # From Deezer API (more accurate)
+    genres: List[str] = field(default_factory=list)  # Deezer genres
+    deezer_popularity: Optional[int] = None  # Deezer rank score
 
     def is_expired(self, ttl_seconds: float) -> bool:
         return (time.time() - self.fetched_at) > ttl_seconds
@@ -125,6 +130,11 @@ class EnrichmentEntry:
     def from_dict(cls, payload: Dict[str, Any]) -> "EnrichmentEntry":
         tags_raw = payload.get("tags") or []
         tags = [str(tag).lower() for tag in tags_raw if str(tag).strip()]
+        
+        # Parse genres (Phase 0.5)
+        genres_raw = payload.get("genres") or []
+        genres = [str(genre).strip() for genre in genres_raw if str(genre).strip()]
+        
         return cls(
             tags=tags,
             mood=(str(payload["mood"]).strip() if payload.get("mood") else None),
@@ -155,6 +165,18 @@ class EnrichmentEntry:
                 if payload.get("daypart_affinity")
                 else None
             ),
+            # Phase 0.5 fields
+            canonical_duration_ms=(
+                int(payload["canonical_duration_ms"])
+                if payload.get("canonical_duration_ms")
+                else None
+            ),
+            genres=genres,
+            deezer_popularity=(
+                int(payload["deezer_popularity"])
+                if payload.get("deezer_popularity")
+                else None
+            ),
         )
 
 
@@ -166,7 +188,18 @@ class ParsingEntry:
     parsed_at: float
     track_type: str = "music"  # "music", "ost", "game_soundtrack", "anime_opening"
     primary_entity: Optional[str] = None  # Franchise/show/game name for OST content
-    schema_version: int = 1
+    
+    # Phase 0.5: Resilient Parsing with Deezer-First Strategy
+    is_canonical: bool = False  # Deezer verified (HIGH confidence, indefinite TTL)
+    is_best_guess: bool = False  # Grounding verified (MEDIUM confidence, 7-day TTL)
+    deezer_id: Optional[str] = None  # Deezer track ID for future enrichment
+    
+    # Self-healing cache fields
+    retry_after_days: Optional[int] = None  # Adaptive TTL (1-30 days for fallback entries)
+    failure_reason: Optional[str] = None  # "deezer_timeout", "no_match", "quota_exhausted", etc.
+    last_retry_attempt: Optional[float] = None  # Timestamp of last retry attempt
+    
+    schema_version: int = 2  # Bumped to v2 for Phase 0.5
 
     def is_expired(self, ttl_seconds: float) -> bool:
         return (time.time() - self.parsed_at) > ttl_seconds
@@ -186,6 +219,15 @@ class ParsingEntry:
         }:
             track_type = "music"
 
+        # Schema v2 fields (Phase 0.5)
+        is_canonical = bool(payload.get("is_canonical", False))
+        is_best_guess = bool(payload.get("is_best_guess", False))
+        deezer_id = payload.get("deezer_id")
+        retry_after_days = payload.get("retry_after_days")
+        failure_reason = payload.get("failure_reason")
+        last_retry_attempt = payload.get("last_retry_attempt")
+        schema_version = int(payload.get("schema_version", 1))
+
         return cls(
             artist=str(payload.get("artist", "")),
             title=str(payload.get("title", "")),
@@ -197,7 +239,13 @@ class ParsingEntry:
                 if payload.get("primary_entity")
                 else None
             ),
-            schema_version=int(payload.get("schema_version", 1) or 1),
+            is_canonical=is_canonical,
+            is_best_guess=is_best_guess,
+            deezer_id=str(deezer_id).strip() if deezer_id else None,
+            retry_after_days=int(retry_after_days) if retry_after_days else None,
+            failure_reason=str(failure_reason).strip() if failure_reason else None,
+            last_retry_attempt=float(last_retry_attempt) if last_retry_attempt else None,
+            schema_version=schema_version,
         )
 
 
@@ -349,19 +397,92 @@ class CacheManager:
                 self._save_map(self._enrichment_file, self._enrichment_cache)
 
     # ------------------------------------------------------------------
-    # Parsing cache (Gemini)
+    # Parsing cache (Gemini) - Phase 0.5: Self-Healing with Adaptive TTL
     # ------------------------------------------------------------------
     async def get_parsing(
         self, raw_title: str, channel_name: str
     ) -> Optional[ParsingEntry]:
+        """
+        Retrieve parsing entry with self-healing TTL logic.
+        
+        TTL Strategy:
+        - Canonical (Deezer verified): Never expire (indefinite TTL)
+        - Best guess (Grounding verified): 7-day TTL
+        - Fallback (unverified): Adaptive 1-30 day TTL based on failure_reason
+        """
         key = self._normalize_parse_key(raw_title, channel_name)
         entry = self._parsing_cache.get(key)
         if not entry:
             return None
+
+        # Canonical entries never expire (indefinite TTL)
+        if entry.is_canonical:
+            return entry
+
+        # Best guess entries expire after 7 days
+        if entry.is_best_guess:
+            age_days = (time.time() - entry.parsed_at) / _SECONDS_PER_DAY
+            if age_days > 7:
+                # Log self-healing retry trigger
+                import logging
+                LOG = logging.getLogger(__name__)
+                LOG.info(
+                    f"🔄 Best guess entry stale ({age_days:.1f} days), re-parsing: "
+                    f"'{raw_title}' (channel: {channel_name})"
+                )
+                await self._delete_parsing(key)
+                return None  # Trigger re-parse
+            return entry
+
+        # Fallback entries use adaptive TTL based on failure reason
+        if entry.retry_after_days is not None:
+            age_days = (time.time() - entry.parsed_at) / _SECONDS_PER_DAY
+            if age_days > entry.retry_after_days:
+                # Log self-healing retry trigger
+                import logging
+                LOG = logging.getLogger(__name__)
+                LOG.info(
+                    f"🔄 Fallback entry stale (TTL {entry.retry_after_days} days, age {age_days:.1f} days), "
+                    f"re-parsing: '{raw_title}' (failure_reason: {entry.failure_reason})"
+                )
+                await self._delete_parsing(key)
+                return None  # Trigger self-healing retry
+            return entry
+
+        # Legacy entries (no retry_after_days) default to 120 days
         if entry.is_expired(self._parsing_ttl):
             await self._delete_parsing(key)
             return None
         return entry
+
+    def calculate_adaptive_ttl(self, failure_reason: str) -> int:
+        """
+        Calculate TTL in days based on failure type for self-healing.
+        
+        TTL Map:
+        - deezer_timeout: 1 day (network issue, retry soon)
+        - no_match: 7 days (might get indexed later)
+        - quota_exhausted: 1 day (grounding resets daily)
+        - grounding_failed: 3 days
+        - unofficial_content: 30 days (unlikely to change)
+        - nightcore/mashup: 30 days (remixes don't get canonical metadata)
+        - cover: 14 days (covers might get official releases)
+        
+        Returns:
+            Number of days until retry
+        """
+        ttl_map = {
+            "deezer_timeout": 1,
+            "no_match": 7,
+            "quota_exhausted": 1,
+            "grounding_failed": 3,
+            "unofficial_content": 30,
+            "nightcore": 30,
+            "mashup": 30,
+            "cover": 14,
+            "fan_made": 30,
+        }
+        return ttl_map.get(failure_reason, 7)  # Default 7 days
 
     async def set_parsing(
         self,

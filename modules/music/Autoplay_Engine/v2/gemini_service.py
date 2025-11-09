@@ -14,8 +14,10 @@ from typing import Any, Dict, List, Optional
 # google-genai provides the official Gemini client.
 try:
     from google import genai
+    from google.genai import types
 except Exception:
     genai = None
+    types = None
 
 LOG = logging.getLogger(__name__)
 
@@ -32,6 +34,84 @@ RATE_LIMIT_WINDOW_SECONDS = 60.0
 RATE_LIMIT_SAFETY_MARGIN = 0.25
 MAX_GENERATE_ATTEMPTS = 5
 GROUNDING_MODEL_NAME = "gemini-2.5-flash"
+
+
+class GroundingQuotaManager:
+    """
+    Manages Google Grounding quota across multiple API keys.
+    
+    FREE tier: 500 grounding requests per day per key.
+    With 3 keys: 1,500 grounding requests per day total.
+    Quota resets at midnight Pacific Time.
+    """
+
+    def __init__(self, api_keys: List[str], quota_per_key: int = 500):
+        """
+        Initialize quota manager.
+        
+        Args:
+            api_keys: List of Gemini API keys for rotation
+            quota_per_key: Daily grounding quota per key (default: 500 for FREE tier)
+        """
+        self.api_keys = api_keys
+        self.quota_per_key = quota_per_key
+        self.daily_quota = quota_per_key * len(api_keys)
+        self.used_today = 0
+        self.current_key_index = 0
+        self.reset_time = self._get_next_midnight_pacific()
+        
+        LOG.info(
+            f"🔑 GroundingQuotaManager initialized: {len(api_keys)} keys, "
+            f"{self.daily_quota} total grounding requests/day"
+        )
+
+    def can_use_grounding(self) -> bool:
+        """Check if grounding quota is available."""
+        if datetime.now() >= self.reset_time:
+            self._reset_quota()
+        return self.used_today < self.daily_quota
+
+    def get_next_api_key(self) -> str:
+        """
+        Rotate through API keys for load balancing.
+        
+        Returns:
+            Next API key in rotation
+        """
+        key = self.api_keys[self.current_key_index]
+        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+        return key
+
+    def increment_usage(self) -> None:
+        """Track grounding usage."""
+        self.used_today += 1
+        LOG.info(f"📊 Grounding quota: {self.used_today}/{self.daily_quota} used today")
+
+    def _get_next_midnight_pacific(self) -> datetime:
+        """Calculate next midnight Pacific Time for quota reset."""
+        from datetime import timezone, timedelta
+        
+        # Pacific Time is UTC-8 (PST) or UTC-7 (PDT)
+        # For simplicity, use UTC-8 as baseline
+        pacific_offset = timedelta(hours=-8)
+        pacific_tz = timezone(pacific_offset)
+        
+        now_pacific = datetime.now(pacific_tz)
+        midnight_pacific = now_pacific.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) + timedelta(days=1)
+        
+        # Convert back to local time for comparison
+        return midnight_pacific.astimezone().replace(tzinfo=None)
+
+    def _reset_quota(self) -> None:
+        """Reset quota at midnight Pacific Time."""
+        self.used_today = 0
+        self.reset_time = self._get_next_midnight_pacific()
+        LOG.info(
+            f"🔄 Grounding quota reset: {self.daily_quota} requests available, "
+            f"next reset at {self.reset_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
 
 @dataclass
@@ -87,6 +167,16 @@ class GeminiService:
         self._rpm_limit = REQUESTS_PER_MINUTE_LIMIT
         self._rate_window = RATE_LIMIT_WINDOW_SECONDS
         self._request_history = deque()
+        
+        # Phase 0.5: Initialize grounding quota manager with multi-API-key support
+        self._grounding_quota_manager = GroundingQuotaManager(
+            api_keys=self._keys,
+            quota_per_key=500  # FREE tier: 500 grounding requests/day/key
+        )
+        LOG.info(
+            f"🔑 [GeminiService] Initialized with {len(self._keys)} API key(s), "
+            f"{self._grounding_quota_manager.daily_quota} grounding requests/day total"
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -104,6 +194,14 @@ class GeminiService:
         self._reset_usage_if_needed()
         remaining = self._daily_limit - int(self._usage_state.get("count", 0))
         return max(0, remaining)
+    
+    def can_use_grounding(self) -> bool:
+        """Check if grounding quota is available (Phase 0.5)."""
+        return self._grounding_quota_manager.can_use_grounding()
+    
+    def use_grounding_quota(self) -> None:
+        """Increment grounding usage counter (Phase 0.5)."""
+        self._grounding_quota_manager.increment_usage()
 
     async def parse_track_metadata(
         self,
@@ -213,6 +311,305 @@ class GeminiService:
             "tempo": tempo,
             "confidence": confidence,
         }
+
+    async def generate_deezer_queries_lite(
+        self,
+        title: str,
+        failed_queries: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Stage 1: Use Flash-Lite (no thinking) to generate 9 Deezer queries.
+
+        Returns 3 sets of 3 variations:
+        - Set A (Artist-focused): Focus on canonical artist name
+        - Set B (Entity-focused): Focus on franchise/anime/game name
+        - Set C (Title-focused): Focus on clean title without suffixes
+
+        Args:
+            title: Raw YouTube title to parse
+            failed_queries: Optional list of previously failed queries (for retry logic)
+
+        Returns:
+            Dict with 'queries' (list of 9 strings) and 'track_type' (str)
+        """
+        prompt = f"""Generate 9 Deezer search queries for: "{title}"
+
+Return 3 sets of 3 variations each:
+
+Set A - Artist-focused (assume artist is PERSON, not franchise):
+1. [canonical_artist] [clean_title]
+2. [canonical_artist] [clean_title] [album_hint]
+3. [main_artist_if_collab] [clean_title]
+
+Set B - Entity-focused (assume artist is FRANCHISE):
+1. [franchise] [clean_title] soundtrack
+2. [franchise] OST [clean_title]
+3. [franchise] [clean_title] original
+
+Set C - Title-focused (clean title variations):
+1. [clean_title] [year_if_known]
+2. [clean_title] [language] version
+3. [clean_title] official
+
+Rules:
+- Remove YouTube suffixes (Official Audio, Lyric Video, Nightcore, etc.)
+- Expand acronyms (JJK → Jujutsu Kaisen)
+- For covers, use original artist
+- Remove pipes, season markers, "ft.", "sing-along"
+
+Return JSON: {{"queries": ["query1", "query2", ...], "track_type": "music|ost|anime_opening|game_soundtrack"}}
+"""
+
+        # Use Flash-Lite model directly (no thinking capability)
+        async with self._lock:
+            if not self._ensure_client():
+                return None
+
+            try:
+                self._reserve_quota(1)
+            except GeminiQuotaExceeded:
+                LOG.warning("⚠️ Gemini daily quota exhausted")
+                return None
+
+            if self._client is None:
+                LOG.error("❌ Gemini client not available")
+                return None
+
+            try:
+                response = await asyncio.to_thread(
+                    self._client.models.generate_content,
+                    model="gemini-2.5-flash-lite",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    ) if types else None,
+                )
+            except Exception as e:
+                LOG.error(f"❌ Flash-Lite query generation failed: {e}")
+                return None
+
+        payload = self._extract_json_dict(response)
+        if not isinstance(payload, dict):
+            return None
+
+        queries = payload.get("queries", [])
+        track_type = str(payload.get("track_type", "music")).strip().lower()
+
+        # Validate we got 9 queries
+        if not isinstance(queries, list) or len(queries) != 9:
+            LOG.warning(
+                f"⚠️ Flash-Lite returned {len(queries) if isinstance(queries, list) else 0} queries "
+                f"instead of 9 for '{title}'"
+            )
+            return None
+
+        LOG.info(f"✅ Flash-Lite generated 9 Deezer queries for '{title}' (track_type={track_type})")
+        return {"queries": queries, "track_type": track_type}
+
+    async def generate_deezer_queries_grounded(
+        self,
+        title: str,
+        failed_queries: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Stage 2: Use Flash + Google Grounding + Thinking to generate 3 refined queries.
+        
+        Grounding provides web-sourced canonical names for OST/anime content.
+        Thinking enables multi-step reasoning about artist attribution.
+
+        Args:
+            title: Raw YouTube title to parse
+            failed_queries: List of queries that failed in Stage 1
+
+        Returns:
+            Dict with 'queries' (list of 3 strings), 'confidence', and 'reasoning'
+        """
+        if genai is None or types is None:
+            LOG.error("google-genai not available, cannot use grounding")
+            return None
+
+        prompt = f"""Previous Deezer queries failed: {failed_queries}
+
+Use Google Search to find the CANONICAL artist/album for: "{title}"
+
+Think through:
+1. Is this OST (game/anime soundtrack)?
+2. Is this a cover/remix (use original artist)?
+3. Is this a collaboration (who's the primary artist)?
+4. Are there multiple artists with this name?
+
+Then generate 3 refined Deezer queries:
+1. [canonical_artist_from_web] [canonical_title_from_web]
+2. [canonical_artist] [canonical_title] [album_from_web]
+3. [canonical_artist] album:[album_name_from_web]
+
+Return JSON: {{"queries": ["query1", "query2", "query3"], "confidence": "high|medium|low", "reasoning": "brief explanation"}}
+"""
+
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+        
+        async with self._lock:
+            if not self._ensure_client():
+                return None
+
+            try:
+                self._reserve_quota(1)
+            except GeminiQuotaExceeded:
+                LOG.warning("⚠️ Gemini daily quota exhausted")
+                return None
+
+            if self._client is None:
+                LOG.error("❌ Gemini client not available")
+                return None
+
+            try:
+                response = await asyncio.to_thread(
+                    self._client.models.generate_content,
+                    model=GROUNDING_MODEL_NAME,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[grounding_tool],
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(thinking_budget=-1),
+                    ),
+                )
+            except Exception as e:
+                LOG.error(f"❌ Grounding query failed for '{title}': {e}")
+                return None
+
+            payload = self._extract_json_dict(response)
+            if not isinstance(payload, dict):
+                return None
+
+            queries = payload.get("queries", [])
+            confidence = str(payload.get("confidence", "low")).strip().lower()
+            reasoning = str(payload.get("reasoning", "")).strip()
+
+            # Validate we got 3 queries
+            if not isinstance(queries, list) or len(queries) != 3:
+                LOG.warning(
+                    f"⚠️ Flash+Grounding returned {len(queries) if isinstance(queries, list) else 0} queries "
+                    f"instead of 3 for '{title}'"
+                )
+                return None
+
+            LOG.info(
+                f"✅ Flash+Grounding+Thinking generated 3 queries for '{title}' "
+                f"(confidence={confidence})\n   Reasoning: {reasoning}"
+            )
+            return {
+                "queries": queries,
+                "confidence": confidence,
+                "reasoning": reasoning,
+            }
+
+    async def generate_fallback_metadata(
+        self,
+        title: str,
+        failed_queries: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Stage 3 Fallback: Use Flash + Grounding + Thinking to extract best guess metadata.
+        
+        Reuses the same Flash+Grounding+Thinking connection from Stage 2, but instead of
+        generating Deezer queries, directly extracts artist/title from web sources.
+        
+        Sets is_best_guess=True (7-day TTL) for adaptive expiration.
+
+        Args:
+            title: Raw YouTube title to parse
+            failed_queries: List of all queries that failed
+
+        Returns:
+            Dict with artist, title, album, confidence, reasoning, track_type, is_best_guess
+        """
+        if genai is None or types is None:
+            LOG.error("google-genai not available, cannot use grounding")
+            return None
+
+        prompt = f"""All Deezer searches failed for: "{title}"
+Failed queries: {failed_queries}
+
+Use Google Search to find the MOST LIKELY canonical metadata.
+
+Think through:
+1. What type of content is this (music/OST/anime/game)?
+2. Who is the ACTUAL artist (person vs franchise)?
+3. What is the CLEAN title (remove YouTube suffixes)?
+4. Is this official or fan-made?
+
+Return the BEST GUESS metadata for Last.fm scrobbling:
+{{
+    "artist": "canonical artist name",
+    "title": "clean track title",
+    "album": "album name if known, else empty string",
+    "confidence": "high|medium|low",
+    "reasoning": "why this is the best guess",
+    "track_type": "music|ost|anime_opening|game_soundtrack|cover|fan_made"
+}}
+"""
+
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+        
+        async with self._lock:
+            if not self._ensure_client():
+                return None
+
+            try:
+                self._reserve_quota(1)
+            except GeminiQuotaExceeded:
+                LOG.warning("⚠️ Gemini daily quota exhausted")
+                return None
+
+            if self._client is None:
+                LOG.error("❌ Gemini client not available")
+                return None
+
+            try:
+                response = await asyncio.to_thread(
+                    self._client.models.generate_content,
+                    model=GROUNDING_MODEL_NAME,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[grounding_tool],
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(thinking_budget=-1),
+                    ),
+                )
+            except Exception as e:
+                LOG.error(f"❌ Fallback metadata extraction failed for '{title}': {e}")
+                return None
+
+            payload = self._extract_json_dict(response)
+            if not isinstance(payload, dict):
+                return None
+
+            artist = str(payload.get("artist", "")).strip()
+            track_title = str(payload.get("title", "")).strip()
+            album = str(payload.get("album", "")).strip()
+            confidence = str(payload.get("confidence", "low")).strip().lower()
+            reasoning = str(payload.get("reasoning", "")).strip()
+            track_type = str(payload.get("track_type", "music")).strip().lower()
+
+            if not artist or not track_title:
+                LOG.warning(f"⚠️ Fallback extraction missing artist or title for '{title}'")
+                return None
+
+            LOG.info(
+                f"✅ Fallback metadata extracted: '{artist} - {track_title}' "
+                f"(confidence={confidence}, track_type={track_type})\n   Reasoning: {reasoning}"
+            )
+            
+            result = {
+                "artist": artist,
+                "title": track_title,
+                "album": album,
+                "confidence": confidence,
+                "reasoning": reasoning,
+                "track_type": track_type,
+                "is_best_guess": True,  # Mark for 7-day TTL
+            }
+            return result
 
     def refresh_keys(self) -> None:
         """Reload API keys from environment and reset state."""
@@ -555,10 +952,35 @@ class GeminiService:
         self._available = False
 
     def _load_api_keys(self) -> List[str]:
-        raw = os.getenv(GEMINI_KEYS_ENV)
+        """
+        Load Gemini API keys from environment.
+        
+        Supports two formats:
+        1. GeminiApiKeys: JSON array or comma-separated string (legacy)
+        2. GEMINI_API_KEY_1, GEMINI_API_KEY_2, GEMINI_API_KEY_3 (Phase 0.5, preferred)
+        
+        Phase 0.5 multi-key format takes precedence if both are present.
+        """
         keys: List[str] = []
+        
+        # Phase 0.5: Check for individual API keys (GEMINI_API_KEY_1/2/3)
+        for i in range(1, 4):  # Support up to 3 keys
+            key_env_name = f"GEMINI_API_KEY_{i}"
+            key_value = os.getenv(key_env_name, "").strip()
+            if key_value:
+                keys.append(key_value)
+                LOG.info(f"🔑 Loaded Gemini API key #{i} from {key_env_name}")
+        
+        # If Phase 0.5 keys found, use them (preferred)
+        if keys:
+            LOG.info(f"✅ Using {len(keys)} Gemini API key(s) from GEMINI_API_KEY_1/2/3 format")
+            return self._deduplicate_keys(keys)
+        
+        # Fallback: Legacy GeminiApiKeys format
+        raw = os.getenv(GEMINI_KEYS_ENV)
         if not raw:
-            return keys
+            LOG.warning("⚠️ No Gemini API keys found. Set GEMINI_API_KEY_1/2/3 or GeminiApiKeys")
+            return []
 
         try:
             parsed = json.loads(raw)
@@ -569,6 +991,11 @@ class GeminiService:
         except json.JSONDecodeError:
             keys = [part.strip() for part in raw.split(",") if part.strip()]
 
+        LOG.info(f"✅ Using {len(keys)} Gemini API key(s) from GeminiApiKeys (legacy format)")
+        return self._deduplicate_keys(keys)
+    
+    def _deduplicate_keys(self, keys: List[str]) -> List[str]:
+        """Remove duplicate keys while preserving order."""
         seen: set[str] = set()
         unique: List[str] = []
         for key in keys:
