@@ -868,51 +868,6 @@ class LastFMAutoplayV2:
                                 len(fallback_pool),
                             )
 
-            if self._engine._verbose and selection_pool:
-                top = selection_pool[0]
-                top_meta = metadata_index.get(top.track_id, {})
-                # Try to find mood label from the prepared candidate features
-                top_feat = next(
-                    (
-                        e.features
-                        for e in prepared_candidates
-                        if e.features.track_id == top.track_id
-                    ),
-                    None,
-                )
-                mood_desc = (
-                    top_feat.mood_label if top_feat and top_feat.mood_label else target_mood
-                ) or "unknown"
-
-                # Issue #3: Show exploration phase and reasoning
-                phase = self._novelty_controller.detect_exploration_phase(
-                    skip_rate=context.skip_rate,
-                    songs_since_novelty=context.songs_since_novelty,
-                    session_duration_minutes=(context.last_activity - context.session_start)
-                    / 60,
-                )
-
-                # Check if this is a novelty pick or core pick
-                artist_plays = tracker.get_artist_play_count(top_meta.get("artist", ""))
-                is_new_artist = artist_plays == 0
-                exploration_marker = "🔍 NEW" if is_new_artist else "✨ FAMILIAR"
-
-                LOG.info(
-                    "🎯 [Next Pick] %s: '%s' by '%s' (score=%.3f, mood=%s, phase=%s) after '%s'",
-                    exploration_marker,
-                    top_meta.get("title", "Unknown"),
-                    top_meta.get("artist", "Unknown"),
-                    top.score,
-                    mood_desc,
-                    phase.value,
-                    f"{seed_artist} - {seed_title}",
-                )
-
-                # Increment novelty counter if this is exploration
-                if is_new_artist:
-                    tracker.reset_novelty_counter()
-                else:
-                    tracker.increment_novelty_counter()
             # Stochastic selection without additional safe gate retries
             results: List[Tuple[str, Any]] = []
 
@@ -928,7 +883,6 @@ class LastFMAutoplayV2:
                 if total_weight <= 0:
                     # Fallback to uniform if all scores are 0 or negative
                     selected_candidate = top_candidates[0]
-                    selected_candidate = top_candidates[0]
                 else:
                     # Weighted random selection
                     selected_candidate = random.choices(
@@ -943,6 +897,52 @@ class LastFMAutoplayV2:
                         selected_candidate.score,
                         top_k,
                     )
+
+                # Log the ACTUALLY selected candidate (not just the top one)
+                if self._verbose and len(results) == 0:  # Only log the first pick
+                    selected_meta = metadata_index.get(selected_candidate.track_id, {})
+                    # Try to find mood label from the prepared candidate features
+                    selected_feat = next(
+                        (
+                            e.features
+                            for e in prepared_candidates
+                            if e.features.track_id == selected_candidate.track_id
+                        ),
+                        None,
+                    )
+                    mood_desc = (
+                        selected_feat.mood_label if selected_feat and selected_feat.mood_label else target_mood
+                    ) or "unknown"
+
+                    # Issue #3: Show exploration phase and reasoning
+                    phase = self._novelty_controller.detect_exploration_phase(
+                        skip_rate=context.skip_rate,
+                        songs_since_novelty=context.songs_since_novelty,
+                        session_duration_minutes=(context.last_activity - context.session_start)
+                        / 60,
+                    )
+
+                    # Check if this is a novelty pick or core pick
+                    artist_plays = tracker.get_artist_play_count(selected_meta.get("artist", ""))
+                    is_new_artist = artist_plays == 0
+                    exploration_marker = "🔍 NEW" if is_new_artist else "✨ FAMILIAR"
+
+                    LOG.info(
+                        "🎯 [Next Pick] %s: '%s' by '%s' (score=%.3f, mood=%s, phase=%s) after '%s'",
+                        exploration_marker,
+                        selected_meta.get("title", "Unknown"),
+                        selected_meta.get("artist", "Unknown"),
+                        selected_candidate.score,
+                        mood_desc,
+                        phase.value,
+                        f"{seed_artist} - {seed_title}",
+                    )
+
+                    # Increment novelty counter if this is exploration
+                    if is_new_artist:
+                        tracker.reset_novelty_counter()
+                    else:
+                        tracker.increment_novelty_counter()
 
                 # Safe gate - check quality threshold
                 meta = metadata_index.get(selected_candidate.track_id)

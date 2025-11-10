@@ -18,8 +18,8 @@ DURATION_TOLERANCE_PERCENT = 0.20  # 20%
 DURATION_TOLERANCE_MIN_MS = 30000  # 30 seconds minimum tolerance
 SHORT_CLIP_THRESHOLD_MS = 30000  # clips shorter than 30s are likely YouTube Shorts/spam
 
-# Confidence threshold for hybrid resolution
-LOW_CONFIDENCE_THRESHOLD = 7.0
+# Confidence threshold for hybrid resolution (0-1 scale for simplified scoring)
+LOW_CONFIDENCE_THRESHOLD = 0.55  
 
 # High-quality channel indicators (boost priority)
 GOOD_CHANNEL_HINTS = [
@@ -318,8 +318,6 @@ class TrackResolver:
                                     "title_similarity": mapping.title_similarity,
                                     "artist_similarity": mapping.artist_similarity,
                                     "channel_similarity": mapping.channel_similarity,
-                                    "engagement_score": mapping.engagement_score,
-                                    "duration_score": mapping.duration_score,
                                     "content_penalty": mapping.content_penalty,
                                     "spam_penalty": mapping.spam_penalty,
                                     "spam_flags": mapping.spam_flags,
@@ -415,13 +413,11 @@ class TrackResolver:
                 channel_similarity=self._safe_float(
                     heuristics.get("channel_similarity")
                 ),
-                engagement_score=self._safe_float(heuristics.get("engagement_score")),
-                duration_score=self._safe_float(heuristics.get("duration_score")),
                 content_penalty=self._safe_float(heuristics.get("content_penalty")),
                 spam_penalty=self._safe_float(heuristics.get("spam_penalty")),
                 spam_flags=list(heuristics.get("spam_flags", [])),
                 search_rank=self._safe_int(heuristics.get("search_rank")) or 0,
-                heuristic_version=int(heuristics.get("heuristic_version", 2) or 2),
+                heuristic_version=int(heuristics.get("heuristic_version", 3) or 3),
             )
             await self._cache.set_mapping(artist, title, entry)
             if LOG.isEnabledFor(logging.DEBUG):
@@ -439,8 +435,6 @@ class TrackResolver:
                         "title_similarity": entry.title_similarity,
                         "artist_similarity": entry.artist_similarity,
                         "channel_similarity": entry.channel_similarity,
-                        "engagement_score": entry.engagement_score,
-                        "duration_score": entry.duration_score,
                         "content_penalty": entry.content_penalty,
                         "spam_penalty": entry.spam_penalty,
                         "spam_flags": entry.spam_flags,
@@ -457,15 +451,13 @@ class TrackResolver:
                     "youtube_id": metadata.get("youtube_id"),
                     "channel": metadata.get("channel_name"),
                     "verified": metadata.get("verified"),
-                    "score_duration_ms": metadata.get("duration_ms"),
+                    "duration_ms": metadata.get("duration_ms"),
                     "heuristic_score": round(
                         float(heuristics.get("score", 0.0) or 0.0), 3
                     ),
                     "title_similarity": heuristics.get("title_similarity"),
                     "artist_similarity": heuristics.get("artist_similarity"),
                     "channel_similarity": heuristics.get("channel_similarity"),
-                    "engagement_score": heuristics.get("engagement_score"),
-                    "duration_score": heuristics.get("duration_score"),
                     "content_penalty": heuristics.get("content_penalty"),
                     "spam_penalty": heuristics.get("spam_penalty"),
                     "spam_flags": heuristics.get("spam_flags"),
@@ -642,13 +634,13 @@ class TrackResolver:
                     title_similarity=1.0,
                     artist_similarity=1.0,
                     channel_similarity=1.0,
-                    engagement_score=1.0,
-                    duration_score=1.0,
+                    engagement_score=None, 
+                    duration_score=None, 
                     content_penalty=0.0,
                     spam_penalty=0.0,
                     spam_flags=[],
                     search_rank=int(selected_index),
-                    heuristic_version=3,  # Version 3 = Gemini-powered
+                    heuristic_version=3,  
                 )
                 await self._cache.set_mapping(artist, title, entry)
 
@@ -941,57 +933,47 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         return best_candidate
 
     def _build_primary_search_queries(self, artist: str, title: str) -> List[str]:
+        """
+        Simplified query builder - use flexible query like manual YouTube search.
+        Don't use exact quotes - let YouTube's fuzzy matching handle variations.
+        """
         artist_clean = artist.replace("\"", "").strip()
         title_clean = title.replace("\"", "").strip()
-        base_query = f"{artist_clean} {title_clean}".strip()
-
-        candidates = [f"ytsearch: {base_query}"] if base_query else []
-        if artist_clean and title_clean:
-            candidates.extend(
-                [
-                    f'ytsearch: "{artist_clean}" "{title_clean}" official audio',
-                    f'ytsearch: "{artist_clean}" "{title_clean}" official video',
-                    f"ytsearch: {artist_clean} - {title_clean}",
-                ]
-            )
-
-        if base_query:
-            candidates.append(f"ytmsearch: {base_query}")
-
-        seen: set[str] = set()
-        ordered: List[str] = []
-        for query in candidates:
-            key = query.lower()
-            if key in seen or not query.strip():
-                continue
-            ordered.append(query.strip())
-            seen.add(key)
-        return ordered
+        
+        if not artist_clean or not title_clean:
+            return []
+        
+        return [f'ytsearch:{title_clean} {artist_clean}']
 
     def _should_accept_candidate(
         self, features: Dict[str, Any], attempt_index: int
     ) -> bool:
+        """
+        Simplified acceptance criteria - trust similarity scores and verified status.
+        No engagement or duration requirements (data unavailable).
+        """
         score = float(features.get("score", 0.0) or 0.0)
-        engagement = float(features.get("engagement_score", 0.0) or 0.0)
         verified = bool(features.get("verified", False))
         title_similarity = float(features.get("title_similarity", 0.0) or 0.0)
         artist_similarity = float(features.get("artist_similarity", 0.0) or 0.0)
+        search_rank = int(features.get("search_rank", 0) or 0)
 
-        if verified and score >= 6.3:
+        # Accept if high overall score (>0.60 in 0-1 range)
+        if score >= 0.60:
             return True
-        if score >= 7.25:
+        
+        # Accept verified channels with good similarity (trust official uploads)
+        if verified and title_similarity >= 0.50:
             return True
-        if score >= 6.8 and engagement >= 0.35:
+        
+        # Accept top result with reasonable similarity (trust YouTube ranking)
+        if search_rank == 0 and title_similarity >= 0.55 and artist_similarity >= 0.40:
             return True
-        if attempt_index >= 2 and score >= 6.6 and engagement >= 0.25:
+        
+        # Accept good artist+title match
+        if title_similarity >= 0.60 and artist_similarity >= 0.50:
             return True
-        if (
-            attempt_index >= 3
-            and score >= 6.5
-            and title_similarity >= 0.7
-            and artist_similarity >= 0.7
-        ):
-            return True
+        
         return False
 
     async def _generate_gemini_search_queries(
@@ -1369,47 +1351,10 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
                 positive_title_hint_score += 0.2
         positive_title_hint_score = min(positive_title_hint_score, 1.0)
 
+        # Note: Duration and engagement data removed - unreliable from Lavalink
+        # Duration: No canonical source to compare against
+        # Engagement: view_count, subscriber_count, like_count all return 0
         duration_ms = metadata.get("duration_ms") or 0
-        duration_score = None
-        duration_within_tolerance = True
-        duration_delta_ms: Optional[int] = None
-        duration_tolerance_ms = None
-        if expected_duration_ms and duration_ms:
-            duration_delta_ms = abs(expected_duration_ms - int(duration_ms))
-            base_tolerance = max(
-                int(expected_duration_ms * DURATION_TOLERANCE_PERCENT),
-                DURATION_TOLERANCE_MIN_MS,
-            )
-            duration_tolerance_ms = base_tolerance
-            if is_verified or channel_official_hint_score >= 0.6:
-                duration_tolerance_ms = int(base_tolerance * 1.4)
-            duration_within_tolerance = duration_delta_ms <= duration_tolerance_ms
-            ratio = 1.0 - min(duration_delta_ms / max(expected_duration_ms, 1), 1.2)
-            duration_score = max(0.0, min(ratio, 1.0))
-
-        view_count = metadata.get("view_count") or 0
-        like_count = metadata.get("like_count") or 0
-        comment_count = metadata.get("comment_count") or 0
-        subscriber_count = metadata.get("subscriber_count") or 0
-
-        engagement_components: List[float] = []
-        if view_count > 0:
-            engagement_components.append(min(math.log10(view_count + 1) / 7.0, 1.0))
-        if subscriber_count > 0:
-            engagement_components.append(
-                min(math.log10(subscriber_count + 1) / 6.0, 1.0)
-            )
-        if view_count > 1000:
-            engagement_ratio = (like_count + (comment_count * 2)) / view_count
-            engagement_components.append(min(engagement_ratio * 12.0, 1.0))
-        engagement_score = min(sum(engagement_components), 1.2)
-        if engagement_score <= 0.05:
-            if is_verified:
-                engagement_score = max(engagement_score, 0.27)
-            elif channel_official_hint_score >= 0.6:
-                engagement_score = max(engagement_score, 0.19)
-            elif search_rank <= 2:
-                engagement_score = max(engagement_score, 0.14 - 0.03 * search_rank)
 
         spam_penalty = 0.0
         spam_flags: List[str] = []
@@ -1418,13 +1363,20 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             spam_penalty += 1.0 + 0.1 * (hashtag_count - HASHTAG_LIMIT)
             spam_flags.append("hashtags")
 
+        # Check if this is a collaboration (feat., ft., with, etc.)
+        is_collaboration = bool(
+            re.search(r'\b(feat\.|ft\.|featuring|with)\b', title_lower)
+        )
+
         allowed_keywords = {kw.lower() for kw in ALLOWED_IF_OFFICIAL}
         for keyword in BAD_TITLE_KEYWORDS:
             keyword_lower = keyword.lower()
             if keyword_lower in title_lower or keyword_lower in title_folded:
-                if (
-                    is_verified or channel_official_hint_score >= 0.6
-                ) and keyword_lower in allowed_keywords:
+                # Allow if verified, official channel, OR legitimate collaboration
+                if (is_verified or channel_official_hint_score >= 0.6) and keyword_lower in allowed_keywords:
+                    continue
+                # Allow "remix" if it's a collaboration crediting original artist
+                if keyword_lower in ("remix", "cover") and is_collaboration:
                     continue
                 penalty = 0.45
                 if keyword_lower in CRITICAL_SPAM_KEYWORDS:
@@ -1481,16 +1433,7 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             "artist_in_channel": artist_in_channel,
             "channel_official_hint_score": channel_official_hint_score,
             "positive_title_hint_score": positive_title_hint_score,
-            "engagement_score": engagement_score,
-            "view_count": view_count,
-            "subscriber_count": subscriber_count,
-            "like_count": like_count,
-            "comment_count": comment_count,
             "duration_ms": duration_ms,
-            "duration_score": duration_score,
-            "duration_within_tolerance": duration_within_tolerance,
-            "duration_delta_ms": duration_delta_ms,
-            "duration_tolerance_ms": duration_tolerance_ms,
             "content_penalty": content_penalty,
             "spam_penalty": spam_penalty,
             "spam_flags": spam_flags,
@@ -1499,103 +1442,69 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             "episode_like": episode_like,
             "title_part_penalty": title_part_penalty,
             "candidate_has_track_number": candidate_has_track_number,
-            "heuristic_version": 2,
+            "heuristic_version": 3,  # Bumped to v3 for simplified scoring
         }
 
     def _compose_candidate_score(
         self, features: Dict[str, Any]
     ) -> Tuple[float, bool, List[str]]:
-        # --- 1. Get all features ---
+        """
+        Simplified scoring that trusts YouTube's ranking (like !p command).
+        No engagement data, no duration validation - just similarity + rank + verified.
+        """
+        # Extract only the features we can actually use
         title_similarity = float(features.get("title_similarity") or 0.0)
         artist_similarity = float(features.get("artist_similarity") or 0.0)
-        channel_similarity = float(features.get("channel_similarity") or 0.0)
-        engagement_score = float(features.get("engagement_score") or 0.0)
-        duration_score = features.get("duration_score")  # Can be None
-        content_penalty = float(features.get("content_penalty") or 0.0)
         spam_penalty = float(features.get("spam_penalty") or 0.0)
-        channel_official_hint_score = float(
-            features.get("channel_official_hint_score") or 0.0
-        )
-        positive_hint_score = float(features.get("positive_title_hint_score") or 0.0)
+        content_penalty = float(features.get("content_penalty") or 0.0)
         verified = bool(features.get("verified", False))
         search_rank = int(features.get("search_rank", 0) or 0)
         episode_like = bool(features.get("episode_like", False))
 
-        # --- 2. Calculate base score from what we ALWAYS have ---
-        score = 0.0
-        score += 2.0 * title_similarity
-        score += 3.0 * artist_similarity
-        score += 1.2 * channel_similarity
-        score += 0.9 * channel_official_hint_score
-        score += 0.6 * positive_hint_score
-
-        # High bonus for verified channels
-        if verified:
-            score += 2.5
-
-        # --- 3. Add weighted scores ONLY IF data is present and meaningful ---
+        # Simple scoring formula:
+        # - 40% weight on title match
+        # - 30% weight on artist match  
+        # - 20% bonus for verified channels (official uploads)
+        # - 10% weight on search rank (prefer top results)
+        score = (title_similarity * 0.4 +
+                 artist_similarity * 0.3 +
+                 (1.0 if verified else 0.0) * 0.2 +
+                 (1.0 - search_rank / 5.0) * 0.1)
         
-        # Add engagement score ONLY if it's meaningful (not 0)
-        if engagement_score > 0.01:
-            score += 1.8 * engagement_score
-        
-        # Add duration score ONLY if it was calculated (not None)
-        if duration_score is not None:
-            score += 1.0 * float(duration_score)
+        # Apply spam/content penalties
+        score -= spam_penalty * 0.15
+        score -= content_penalty * 0.20
 
-        # --- 4. Apply penalties ---
-        score -= 0.85 * spam_penalty
-        score -= 1.1 * content_penalty
-        score -= search_rank * 0.18
-
-        # --- 5. Rejection logic ---
+        # Rejection logic - only reject obvious mismatches
         rejection_reasons: List[str] = []
         should_reject = False
 
-        if features.get("short_clip") and not verified:
-            should_reject = True
-            rejection_reasons.append("short_clip")
-
-        duration_within_tolerance = bool(
-            features.get("duration_within_tolerance", True)
-        )
-        if (
-            not duration_within_tolerance
-            and (duration_score is not None)
-            and float(duration_score) < 0.35
-        ):
-            should_reject = True
-            rejection_reasons.append("duration_mismatch")
-
-        if title_similarity < 0.35 and not verified:
+        # Reject if title/artist similarity is too low (unless verified)
+        if title_similarity < 0.50 and not verified:
             should_reject = True
             rejection_reasons.append("low_title_similarity")
 
-        if artist_similarity < 0.25 and not verified:
+        if artist_similarity < 0.40 and not verified:
             should_reject = True
             rejection_reasons.append("low_artist_similarity")
 
-        # Stricter artist matching when candidate has track numbers/multi-part titles
-        title_part_penalty = float(features.get("title_part_penalty") or 0.0)
-        if title_part_penalty > 0.3 and artist_similarity < 0.65 and not verified:
+        # For verified channels, be more lenient (trust official uploads)
+        if verified and title_similarity < 0.40:
             should_reject = True
-            rejection_reasons.append("artist_mismatch_with_track_number")
+            rejection_reasons.append("low_title_similarity_verified")
 
-        if spam_penalty >= 1.8 and not verified:
+        # Reject high spam/episode content
+        if spam_penalty >= 2.0 and not verified:
             should_reject = True
             rejection_reasons.append("spam_penalty")
 
-        if content_penalty >= 2.2 and (
-            not verified and channel_official_hint_score < 0.4
-        ):
-            should_reject = True
-            rejection_reasons.append("content_penalty")
-
-        if episode_like and positive_hint_score < 0.2:
+        if episode_like:
             should_reject = True
             rejection_reasons.append("episode_content")
-        elif episode_like:
-            score -= 2.1
+
+        if content_penalty >= 2.5 and not verified:
+            should_reject = True
+            rejection_reasons.append("content_penalty")
 
         return score, should_reject, rejection_reasons
 
