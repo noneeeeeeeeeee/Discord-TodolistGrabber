@@ -1351,9 +1351,6 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
                 positive_title_hint_score += 0.2
         positive_title_hint_score = min(positive_title_hint_score, 1.0)
 
-        # Note: Duration and engagement data removed - unreliable from Lavalink
-        # Duration: No canonical source to compare against
-        # Engagement: view_count, subscriber_count, like_count all return 0
         duration_ms = metadata.get("duration_ms") or 0
 
         spam_penalty = 0.0
