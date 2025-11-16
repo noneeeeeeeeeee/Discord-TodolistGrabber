@@ -171,6 +171,95 @@ class AutoPlaySettings(commands.Cog):
             await msg.edit(embed=timeout_embed)
 
     @commands.hybrid_command(
+        name="refreshingestqueue",
+        description="[OWNER ONLY] Rebuild the AutoPlay ingest queue from cached tracks.",
+    )
+    async def refresh_ingest_queue(self, ctx: commands.Context, limit: int = None):
+        if not _is_owner(ctx.author.id):
+            await ctx.send(":x: This command is restricted to the bot owner only.")
+            return
+
+        player = self._get_player()
+        orchestrator = getattr(player, "_lastfm_autoplay", None) if player else None
+        if not orchestrator or not hasattr(orchestrator, "refresh_ingest_queue"):
+            await ctx.send(":x: AutoPlay ingest helpers are unavailable.")
+            return
+
+        await ctx.defer()
+        try:
+            stats = await orchestrator.refresh_ingest_queue(limit=limit)
+        except Exception as exc:
+            await ctx.send(f":x: Failed to refresh ingest queue: {exc}")
+            return
+
+        embed = discord.Embed(
+            title="🔁 Ingest Queue Refreshed",
+            description="Rebuilt pending analysis jobs from cached enrichment entries.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Queued", value=str(stats.get("queued", 0)))
+        embed.add_field(name="Missing Mapping", value=str(stats.get("missing_mapping", 0)))
+        embed.add_field(name="Duplicates", value=str(stats.get("duplicates", 0)))
+        embed.add_field(name="Queue Depth", value=str(stats.get("queue_depth", 0)))
+        if limit:
+            embed.set_footer(text=f"Limit applied: {limit}")
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command(
+        name="reingest",
+        description="[OWNER ONLY] Force AutoPlay to re-enrich and analyze a specific track.",
+    )
+    async def reingest_track(
+        self,
+        ctx: commands.Context,
+        artist: str,
+        title: str,
+        youtube_id: str = None,
+    ):
+        if not _is_owner(ctx.author.id):
+            await ctx.send(":x: This command is restricted to the bot owner only.")
+            return
+
+        player = self._get_player()
+        orchestrator = getattr(player, "_lastfm_autoplay", None) if player else None
+        if not orchestrator or not hasattr(orchestrator, "reingest_track"):
+            await ctx.send(":x: AutoPlay ingest helpers are unavailable.")
+            return
+
+        await ctx.defer()
+        try:
+            result = await orchestrator.reingest_track(artist, title, youtube_id=youtube_id)
+        except Exception as exc:
+            await ctx.send(f":x: Failed to re-ingest track: {exc}")
+            return
+
+        color = discord.Color.green() if result.get("queued_analysis") else discord.Color.orange()
+        embed = discord.Embed(
+            title="🎧 Track Re-ingest Result",
+            color=color,
+        )
+        embed.add_field(name="Artist", value=artist, inline=True)
+        embed.add_field(name="Title", value=title, inline=True)
+        embed.add_field(
+            name="Enriched",
+            value="✅" if result.get("enriched") else "❌",
+            inline=True,
+        )
+        embed.add_field(
+            name="Queued Analysis",
+            value="✅" if result.get("queued_analysis") else "⚠️",
+            inline=True,
+        )
+        embed.add_field(
+            name="Mapping Found",
+            value="✅" if result.get("mapping_found") else "❌",
+            inline=True,
+        )
+        youtube_source = result.get("youtube_source") or "Unavailable"
+        embed.add_field(name="YouTube Source", value=str(youtube_source), inline=False)
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command(
         name="autoplayexport",
         description="[OWNER ONLY] Export AutoPlay preferences (history, feedback, cache) to JSON.",
     )
@@ -469,7 +558,7 @@ class AutoPlaySettings(commands.Cog):
 
         try:
             # Import heuristics from track_resolver
-            from modules.music.Autoplay_Engine.v2.track_resolver import (
+            from modules.music.Autoplay_Engine.v3.track_resolver import (
                 BAD_TITLE_KEYWORDS,
                 GOOD_CHANNEL_HINTS,
                 GOOD_TITLE_KEYWORDS,

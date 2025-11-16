@@ -407,6 +407,15 @@ class TrackResolver:
                     metadata.get("title") or heuristics.get("candidate_title") or ""
                 )
                 or None,
+                preview_url=(metadata.get("preview_url") or None),
+                preview_duration_ms=self._safe_int(
+                    metadata.get("preview_duration_ms")
+                ),
+                preview_fetched_at=self._safe_float(
+                    metadata.get("preview_fetched_at")
+                ),
+                deezer_track_id=(metadata.get("deezer_track_id") or None),
+                ingest_source=(metadata.get("ingest_source") or None),
                 heuristic_score=float(heuristics.get("score", 0.0) or 0.0),
                 title_similarity=self._safe_float(heuristics.get("title_similarity")),
                 artist_similarity=self._safe_float(heuristics.get("artist_similarity")),
@@ -630,6 +639,15 @@ class TrackResolver:
                     channel_name=metadata.get("channel_name") or None,
                     duration_ms=self._safe_int(metadata.get("duration_ms")),
                     verified=bool(metadata.get("verified", False)),
+                    preview_url=(metadata.get("preview_url") or None),
+                    preview_duration_ms=self._safe_int(
+                        metadata.get("preview_duration_ms")
+                    ),
+                    preview_fetched_at=self._safe_float(
+                        metadata.get("preview_fetched_at")
+                    ),
+                    deezer_track_id=(metadata.get("deezer_track_id") or None),
+                    ingest_source=(metadata.get("ingest_source") or None),
                     heuristic_score=10.0, 
                     title_similarity=1.0,
                     artist_similarity=1.0,
@@ -701,10 +719,8 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         if not response:
             return None
 
-        # Try to extract number from response
         response = response.strip()
 
-        # Try direct parsing
         try:
             index = int(response)
             if 0 <= index < max_index:
@@ -712,7 +728,6 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         except ValueError:
             pass
 
-        # Try to find first number in response
         import re
 
         match = re.search(r"\b(\d+)\b", response)
@@ -1540,6 +1555,32 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         track_identifier = getattr(track_obj, "track_id", None) or getattr(
             track_obj, "track", None
         )
+        preview_url = (
+            info.get("preview_url")
+            or info.get("previewUrl")
+            or getattr(track_obj, "preview_url", None)
+        )
+        preview_duration_ms = (
+            info.get("preview_duration_ms")
+            or info.get("previewDurationMs")
+            or info.get("preview_duration")
+            or getattr(track_obj, "preview_duration_ms", None)
+        )
+        preview_fetched_at = (
+            info.get("preview_fetched_at")
+            or info.get("previewFetchedAt")
+            or getattr(track_obj, "preview_fetched_at", None)
+        )
+        deezer_track_id = (
+            info.get("deezer_track_id")
+            or info.get("deezerTrackId")
+            or getattr(track_obj, "deezer_track_id", None)
+        )
+        ingest_source = (
+            info.get("ingest_source")
+            or info.get("ingestSource")
+            or getattr(track_obj, "ingest_source", None)
+        )
 
         # Extract engagement metrics (may not always be available from Lavalink/Pomice)
         view_count = info.get("viewCount") or info.get("views") or 0
@@ -1555,6 +1596,20 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
         except (TypeError, ValueError):
             duration_int = None
 
+        try:
+            preview_duration_int = (
+                int(preview_duration_ms) if preview_duration_ms is not None else None
+            )
+        except (TypeError, ValueError):
+            preview_duration_int = None
+
+        try:
+            preview_fetched_at_float = (
+                float(preview_fetched_at) if preview_fetched_at is not None else None
+            )
+        except (TypeError, ValueError):
+            preview_fetched_at_float = None
+
         if track_identifier is not None:
             track_identifier = str(track_identifier)
 
@@ -1566,6 +1621,11 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
             "duration_ms": duration_int,
             "track_identifier": track_identifier,
             "title": title,
+            "preview_url": preview_url,
+            "preview_duration_ms": preview_duration_int,
+            "preview_fetched_at": preview_fetched_at_float,
+            "deezer_track_id": deezer_track_id,
+            "ingest_source": ingest_source,
             "view_count": int(view_count) if view_count else 0,
             "like_count": int(like_count) if like_count else 0,
             "comment_count": int(comment_count) if comment_count else 0,

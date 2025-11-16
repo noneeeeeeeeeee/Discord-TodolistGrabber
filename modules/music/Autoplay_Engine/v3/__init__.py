@@ -1,9 +1,8 @@
-"""Autoplay Engine V2 entry point.
+"""Autoplay Engine V3 entry point.
 
-This module exposes ``LastFMAutoplayV2`` which mirrors the public surface of the
-legacy autoplay implementation so the existing ``MusicPlayer`` integration can
-switch between engines via ``Autoplay_Engine.config`` without additional glue
-code.
+This module exposes ``LastFMAutoplayV3`` which mirrors the public surface of the
+legacy autoplay implementation so existing callers can toggle engines through
+``Autoplay_Engine.config`` without additional glue code.
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, cast
 
 import aiohttp
 
-from .autoplayengine_v2 import AutoplayEngineV2, LASTFM_API_KEY_ENV
+from .autoplayengine_v3 import AutoplayEngineV3, LASTFM_API_KEY_ENV
 from .contextual_recommender import CandidateFeatures
 from .context_tracker import ContextTracker
 from .novelty_controller import NoveltyController, NoveltyConfig
@@ -60,7 +59,6 @@ _TELEMETRY_MAX_FILES = 5
 _TELEMETRY_QUALITY_THRESHOLD = 8.0
 
 
-@dataclass
 @dataclass(slots=True)
 class AutoplayTelemetryEvent:
     """
@@ -130,12 +128,12 @@ class PreparedCandidate:
     metadata: Dict[str, Any]
 
 
-class LastFMAutoplayV2:
-    """High-level orchestrator that feeds ``AutoplayEngineV2``."""
+class LastFMAutoplayV3:
+    """High-level orchestrator that feeds ``AutoplayEngineV3``."""
 
     def __init__(self, bot: Any) -> None:
         self._bot = bot
-        self._engine = AutoplayEngineV2()
+        self._engine = AutoplayEngineV3()
         self._lastfm_key = os.getenv(LASTFM_API_KEY_ENV, "").strip()
         self._recent_history: Dict[int, List[Dict[str, str]]] = defaultdict(list)
         self._history_limit = _HISTORY_LIMIT
@@ -176,6 +174,14 @@ class LastFMAutoplayV2:
         
         # Pool composition tracking (per-guild, reset each round)
         self._pool_composition: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        
+        # Layer 4: JIT Buffer Architecture (per-guild)
+        # _recommendation_buffer: Holds 5-slot buffer [safe, safe, safe, discovery, safe_harbor]
+        # _filling_task: Async task that fills buffer in background
+        # _buffer_fill_size: Size of buffer per guild (default: 5)
+        self._recommendation_buffer: Dict[int, List[PreparedCandidate]] = defaultdict(list)
+        self._filling_task: Dict[int, Optional[asyncio.Task]] = {}
+        self._buffer_fill_size = 5
 
     # ------------------------------------------------------------------
     # Internal helpers for context tracking (Issue #3)
@@ -288,6 +294,52 @@ class LastFMAutoplayV2:
     def clear_warning(self, guild_id: int) -> None:
         """Clear the warning flag after message is shown."""
         self._warning_timer_expired[guild_id] = False
+    
+    def _cancel_buffer_fill_task(self, guild_id: int) -> None:
+        """
+        Cancel ongoing buffer fill task for this guild due to context change.
+        
+        This should be called when user feedback significantly changes the session
+        context (e.g., skip, like, dislike) to ensure buffer is regenerated with
+        new context.
+        
+        Args:
+            guild_id: Discord guild ID
+        """
+        if guild_id in self._filling_task:
+            task = self._filling_task[guild_id]
+            if task and not task.done():
+                task.cancel()
+                if self._verbose >= 2:
+                    LOG.debug(
+                        "🚫 [JIT Buffer] Cancelled ongoing fill task for guild %d (context changed)",
+                        guild_id,
+                    )
+            del self._filling_task[guild_id]
+        
+        # Clear buffer to force fresh recommendations
+        if guild_id in self._recommendation_buffer:
+            self._recommendation_buffer[guild_id].clear()
+
+    def _queue_analysis_for_track(self, artist: str, title: str, track_obj: Any) -> None:
+        """Extract YouTube identifier from ``track_obj`` and enqueue analysis."""
+        if not self._engine or not track_obj:
+            return
+        youtube_id = None
+        info = getattr(track_obj, "info", None)
+        if isinstance(info, dict):
+            youtube_id = info.get("identifier") or info.get("id")
+        if not youtube_id:
+            youtube_id = getattr(track_obj, "identifier", None)
+        if youtube_id:
+            queued = self._engine.queue_audio_analysis(artist, title, youtube_id)
+            if queued and self._verbose >= 2:
+                LOG.debug(
+                    "🎛️ [Analysis Queue] Scheduled %s - %s for audio analysis (youtube_id=%s)",
+                    artist,
+                    title,
+                    youtube_id,
+                )
 
     async def _write_telemetry_event(self, event: AutoplayTelemetryEvent) -> None:
         """
@@ -507,8 +559,24 @@ class LastFMAutoplayV2:
             skip_type = "medium" if ratio < 0.5 else "soft"
 
 
+        # Try to get youtube_id and deezer_id from cache for EfficientAT enrichment
+        youtube_id = None
+        deezer_id = None
+        try:
+            mapping_entry = await self._engine._cache.get_mapping(artist, title)
+            if mapping_entry:
+                youtube_id = mapping_entry.youtube_id
+            
+            parsing_entry = await self._engine._cache.get_parsing(artist, title)
+            if parsing_entry:
+                deezer_id = parsing_entry.deezer_id
+        except Exception as e:
+            LOG.debug(f"Unable to retrieve youtube_id/deezer_id from cache: {e}")
+
         # Try to get enrichment data from cache for accurate genre/mood tracking
-        enrichment = await self._engine.enrich_track(artist, title)
+        enrichment = await self._engine.enrich_track(
+            artist, title, youtube_id=youtube_id, deezer_id=deezer_id
+        )
         genres = enrichment.get("tags", [])[:5] if enrichment else []
         mood_vector = enrichment.get("mood_vector") if enrichment else None
         mood_label = enrichment.get("mood") if enrichment else None
@@ -565,6 +633,17 @@ class LastFMAutoplayV2:
             track_type=track_type,
             primary_entity=primary_entity,
         )
+        
+        # Layer 4: Cancel buffer fill task if context significantly changed
+        # Skip, like, or dislike events require fresh recommendations
+        if event_type in ("skip", "hard_skip", "like", "dislike", "more_like_this", "less_like_this"):
+            self._cancel_buffer_fill_task(guild_id)
+            if self._verbose >= 2:
+                LOG.debug(
+                    "🔄 [JIT Buffer] Context changed (%s) - buffer invalidated for guild %d",
+                    event_type,
+                    guild_id,
+                )
 
         # Phase 5: Log telemetry data for ML training
         # Get session context for telemetry
@@ -643,6 +722,34 @@ class LastFMAutoplayV2:
             mapping_quality=telemetry_quality,
         )
 
+    async def refresh_ingest_queue(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Rebuild the ingest queue by scanning cached enrichment entries."""
+        if not self._engine:
+            return {
+                "queued": 0,
+                "missing_mapping": 0,
+                "duplicates": 0,
+                "queue_depth": 0,
+            }
+        return await self._engine.refresh_ingest_queue(limit=limit)
+
+    async def reingest_track(
+        self,
+        artist: str,
+        title: str,
+        *,
+        youtube_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Force a single track to re-enrich and enqueue analysis."""
+        if not self._engine:
+            return {
+                "enriched": False,
+                "queued_analysis": False,
+                "youtube_source": youtube_id,
+                "mapping_found": False,
+            }
+        return await self._engine.reingest_track(artist, title, youtube_id=youtube_id)
+
     async def get_recommendations_for_track(
         self,
         track_info: Dict[str, Any],
@@ -656,6 +763,8 @@ class LastFMAutoplayV2:
         channel_name = str(track_info.get("author", "")).strip()
         expected_duration_ms = track_info.get("length")
         guild_id = int(track_info.get("guild_id", 0) or 0)
+
+        await self._engine.start_analysis_workers()
 
         # V2.5+: Set processing lock and start warning timer
         self._is_processing[guild_id] = True
@@ -718,6 +827,92 @@ class LastFMAutoplayV2:
             seed_track_type = parsed.get("track_type", "music") if parsed else "music"
             seed_entity = parsed.get("primary_entity") if parsed else None
             is_canonical = parsed.get("is_canonical", False) if parsed else False
+            
+            # Layer 4: Check JIT buffer and manage fill task
+            buffer = self._recommendation_buffer.get(guild_id, [])
+            existing_task = self._filling_task.get(guild_id)
+            
+            # If buffer has candidates, use them immediately
+            if buffer and len(buffer) > 0:
+                if self._verbose:
+                    LOG.info(
+                        "⚡ [JIT Buffer] Using buffered recommendations (%d available)",
+                        len(buffer),
+                    )
+                
+                # Pop from buffer
+                prepared_candidate = buffer.pop(0)
+                self._recommendation_buffer[guild_id] = buffer
+                
+                # Start background fill if buffer is getting low
+                if len(buffer) <= 2 and (not existing_task or existing_task.done()):
+                    self._filling_task[guild_id] = asyncio.create_task(
+                        self._fill_recommendation_buffer(
+                            guild_id,
+                            seed_artist,
+                            seed_title,
+                            context,
+                            tracker,
+                            seed_track_type=seed_track_type,
+                            seed_entity=seed_entity,
+                            is_canonical=is_canonical,
+                        )
+                    )
+                    if self._verbose >= 2:
+                        LOG.debug("🔄 [JIT Buffer] Started background fill (buffer low)")
+                
+                # Resolve track from buffered candidate
+                meta = prepared_candidate.metadata
+                track_obj = await self._engine.resolve_track(
+                    meta["artist"],
+                    meta["title"],
+                    expected_duration_ms=None,
+                )
+                
+                if track_obj:
+                    self._queue_analysis_for_track(meta["artist"], meta["title"], track_obj)
+                    self._note_recommendation(guild_id, meta["artist"], meta["title"])
+                    return [(prepared_candidate.features.track_id, track_obj)]
+                else:
+                    # Buffered track failed resolution, fall through to normal flow
+                    if self._verbose:
+                        LOG.warning(
+                            "❌ [JIT Buffer] Buffered track resolution failed, using normal flow"
+                        )
+            
+            # Buffer empty or resolution failed - await existing task or start new one
+            if existing_task and not existing_task.done():
+                if self._verbose:
+                    LOG.info("⏳ [JIT Buffer] Waiting for ongoing fill task...")
+                try:
+                    await asyncio.wait_for(existing_task, timeout=15.0)
+                    # Check buffer again after task completes
+                    buffer = self._recommendation_buffer.get(guild_id, [])
+                    if buffer:
+                        prepared_candidate = buffer.pop(0)
+                        self._recommendation_buffer[guild_id] = buffer
+                        
+                        meta = prepared_candidate.metadata
+                        track_obj = await self._engine.resolve_track(
+                            meta["artist"],
+                            meta["title"],
+                            expected_duration_ms=None,
+                        )
+                        
+                        if track_obj:
+                            self._queue_analysis_for_track(meta["artist"], meta["title"], track_obj)
+                            self._note_recommendation(guild_id, meta["artist"], meta["title"])
+                            return [(prepared_candidate.features.track_id, track_obj)]
+                except asyncio.TimeoutError:
+                    if self._verbose:
+                        LOG.warning("⏱️ [JIT Buffer] Fill task timed out, using normal flow")
+                except Exception as exc:
+                    LOG.error("❌ [JIT Buffer] Fill task error: %s", exc)
+            
+            # Fall through to normal candidate fetching
+            # (buffer empty, task failed, or first request)
+            if self._verbose >= 2:
+                LOG.debug("📥 [JIT Buffer] Using normal flow (buffer unavailable)")
 
             candidate_records = await self._fetch_candidate_records(
                 guild_id=guild_id,
@@ -977,6 +1172,7 @@ class LastFMAutoplayV2:
                     continue
 
                 # Track accepted after resolution
+                self._queue_analysis_for_track(meta["artist"], meta["title"], track_obj)
                 self._note_recommendation(guild_id, meta["artist"], meta["title"])
                 results.append((selected_candidate.track_id, track_obj))
 
@@ -1000,6 +1196,23 @@ class LastFMAutoplayV2:
                 selection_pool = [
                     c for c in selection_pool if c.track_id != selected_candidate.track_id
                 ]
+
+            # V3: Start background buffer fill for next recommendation
+            if results and (guild_id not in self._filling_task or self._filling_task.get(guild_id, asyncio.Future()).done()):
+                self._filling_task[guild_id] = asyncio.create_task(
+                    self._fill_recommendation_buffer(
+                        guild_id,
+                        seed_artist,
+                        seed_title,
+                        context,
+                        tracker,
+                        seed_track_type=seed_track_type,
+                        seed_entity=seed_entity,
+                        is_canonical=is_canonical,
+                    )
+                )
+                if self._verbose >= 2:
+                    LOG.debug("🔄 [V3 Buffer] Started background fill for next recommendation")
 
             if not results:
                 LOG.debug("Autoplay V2 produced no playable tracks after resolution")
@@ -1277,13 +1490,16 @@ class LastFMAutoplayV2:
         # Phase 7 Task 8.1: Parallel pool fetching
         pool_a_task = self._fetch_track_similar(seed_artist, seed_title, limit=60)
 
-        # Pool C: Safe harbor from top focus genre
-        pool_c_task = asyncio.sleep(0, result=[])
+        # Pool C: Safe harbor from top focus genre (only fetch when we have a genre)
         if context.focus_genres:
             top_genre = context.focus_genres[0]
-            pool_c_task = self._fetch_tag_top_tracks(top_genre, limit=30)
-
-        pool_a, pool_c = await asyncio.gather(pool_a_task, pool_c_task)
+            pool_a, pool_c = await asyncio.gather(
+                pool_a_task,
+                self._fetch_tag_top_tracks(top_genre, limit=30),
+            )
+        else:
+            pool_a = await pool_a_task
+            pool_c: List[Dict[str, Any]] = []
 
         for record in pool_a:
             record["pool_source"] = "pool_a_continuity"
@@ -1746,6 +1962,413 @@ class LastFMAutoplayV2:
             overflow.extend(sorted_tracks[max_per_artist:])
 
         return filtered, overflow
+    
+    async def _fetch_safe_harbor_pool(
+        self,
+        guild_id: int,
+        tracker: ContextTracker,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch safe harbor tracks from hierarchical artist sources.
+        
+        Strategy:
+        1. REPLAYED artists (songs user explicitly replayed)
+        2. LIKED artists (high finish rate, no skips)
+        3. FINISHED artists (completed songs from session)
+        
+        Filter by popularity (playcount) to avoid B-sides and deep cuts.
+        
+        Args:
+            guild_id: Discord guild ID
+            tracker: ContextTracker instance for this guild
+            limit: Maximum tracks to fetch (default: 10)
+            
+        Returns:
+            List of safe harbor track records
+        """
+        safe_harbor_tracks: List[Dict[str, Any]] = []
+        
+        # Get artist pools from tracker history
+        context = tracker.get_context()
+        
+        # Priority 1: Replayed artists (super-like signal)
+        replayed_artists = []
+        for track in tracker._history:
+            if track.event_type == "replay":
+                replayed_artists.append(track.artist)
+        
+        # Priority 2: Liked artists (finished with high ratio, no skips)
+        liked_artists = []
+        artist_stats: Dict[str, Dict[str, int]] = {}
+        for track in tracker._history:
+            artist = track.artist
+            if artist not in artist_stats:
+                artist_stats[artist] = {"finished": 0, "skipped": 0, "total": 0}
+            
+            artist_stats[artist]["total"] += 1
+            if track.event_type == "finish":
+                artist_stats[artist]["finished"] += 1
+            elif track.was_skipped:
+                artist_stats[artist]["skipped"] += 1
+        
+        # Filter artists with >75% finish rate and 0 skips
+        for artist, stats in artist_stats.items():
+            if stats["total"] >= 2:  # Need at least 2 plays
+                finish_rate = stats["finished"] / stats["total"]
+                if finish_rate >= 0.75 and stats["skipped"] == 0:
+                    liked_artists.append(artist)
+        
+        # Priority 3: Finished artists (any completed song)
+        finished_artists = []
+        for track in tracker._history:
+            if track.event_type == "finish" and track.artist not in replayed_artists and track.artist not in liked_artists:
+                finished_artists.append(track.artist)
+        
+        # Deduplicate while preserving order
+        replayed_artists = list(dict.fromkeys(replayed_artists))
+        liked_artists = list(dict.fromkeys(liked_artists))
+        finished_artists = list(dict.fromkeys(finished_artists))
+        
+        if self._verbose >= 2:
+            LOG.debug(
+                "🏰 [Safe Harbor] Artist pools: %d replayed, %d liked, %d finished",
+                len(replayed_artists),
+                len(liked_artists),
+                len(finished_artists),
+            )
+        
+        # Fetch top tracks from each artist pool (hierarchical)
+        async def fetch_artist_top_tracks(artist: str, limit: int) -> List[Dict[str, Any]]:
+            """Fetch artist's top tracks and filter by popularity."""
+            tracks = await self._fetch_artist_top_tracks(artist, limit=limit)
+            
+            # Filter by playcount to avoid B-sides (keep top 50% by playcount)
+            if tracks:
+                sorted_tracks = sorted(
+                    tracks,
+                    key=lambda t: int(t.get("playcount", 0) or 0),
+                    reverse=True,
+                )
+                # Keep top half (popular tracks only)
+                cutoff = max(1, len(sorted_tracks) // 2)
+                popular_tracks = sorted_tracks[:cutoff]
+                
+                # Mark source pool for debugging
+                for track in popular_tracks:
+                    track["_safe_harbor_source"] = f"artist:{artist}"
+                
+                return popular_tracks
+            return []
+        
+        # Fetch from each pool until limit reached
+        for artist in replayed_artists[:3]:  # Top 3 replayed artists
+            if len(safe_harbor_tracks) >= limit:
+                break
+            tracks = await fetch_artist_top_tracks(artist, limit=5)
+            safe_harbor_tracks.extend(tracks)
+        
+        if len(safe_harbor_tracks) < limit:
+            for artist in liked_artists[:5]:  # Top 5 liked artists
+                if len(safe_harbor_tracks) >= limit:
+                    break
+                tracks = await fetch_artist_top_tracks(artist, limit=3)
+                safe_harbor_tracks.extend(tracks)
+        
+        if len(safe_harbor_tracks) < limit:
+            for artist in finished_artists[:10]:  # Top 10 finished artists
+                if len(safe_harbor_tracks) >= limit:
+                    break
+                tracks = await fetch_artist_top_tracks(artist, limit=2)
+                safe_harbor_tracks.extend(tracks)
+        
+        # Trim to limit
+        safe_harbor_tracks = safe_harbor_tracks[:limit]
+        
+        if self._verbose:
+            LOG.info(
+                "🏰 [Safe Harbor] Fetched %d tracks from %d artists",
+                len(safe_harbor_tracks),
+                len(set(self._extract_artist(t) for t in safe_harbor_tracks)),
+            )
+        
+        return safe_harbor_tracks
+    
+    async def _fill_recommendation_buffer(
+        self,
+        guild_id: int,
+        seed_artist: str,
+        seed_title: str,
+        context: Any,  # SessionContext
+        tracker: ContextTracker,
+        *,
+        seed_track_type: str = "music",
+        seed_entity: Optional[str] = None,
+        is_canonical: bool = False,
+    ) -> None:
+        """
+        Fill recommendation buffer with V3 Apple Music 5-slot strategy.
+        
+        V3 Buffer composition (NoveltyController-driven):
+        - CORE slot (50%): High-confidence picks (score >= 7.5)
+        - SIMILAR slot (30%): Related picks (score 7.0-7.5)
+        - BRIDGE slot (15%): Connecting picks (score 6.5-7.0)
+        - DISCOVERY slot (5%): Exploration picks (score 6.0-6.5)
+        - SAFE_HARBOR slot (20% in REDISCOVERY): Replayed/liked artists
+        
+        Proportions dynamically adjust based on exploration phase detected by NoveltyController.
+        
+        This runs in background and results are consumed by get_recommendations_for_track.
+        
+        Args:
+            guild_id: Discord guild ID
+            seed_artist: Seed track artist
+            seed_title: Seed track title
+            context: SessionContext from tracker
+            tracker: ContextTracker instance
+        """
+        try:
+            if self._verbose:
+                LOG.info(
+                    "🔄 [V3 Buffer] Starting buffer fill for guild %d (seed: %s - %s)",
+                    guild_id,
+                    seed_artist,
+                    seed_title,
+                )
+            
+            # V3: Calculate session duration for phase detection
+            session_duration_minutes = (context.last_activity - context.session_start) / 60.0
+            
+            # V3: Detect exploration phase using NoveltyController
+            phase = self._novelty_controller.detect_exploration_phase(
+                skip_rate=context.skip_rate,
+                songs_since_novelty=context.songs_since_novelty,
+                session_duration_minutes=session_duration_minutes,
+            )
+            proportions = self._novelty_controller.get_candidate_proportions(phase)
+            
+            if self._verbose:
+                LOG.info(
+                    "🔮 [V3 Buffer] Phase: %s, Proportions: core=%.0f%% similar=%.0f%% bridge=%.0f%% discovery=%.0f%% safe_harbor=%.0f%%",
+                    phase.name,
+                    proportions["core"] * 100,
+                    proportions["similar"] * 100,
+                    proportions["bridge"] * 100,
+                    proportions["discovery"] * 100,
+                    proportions["safe_harbor"] * 100,
+                )
+            
+            # Fetch candidate pool
+            seed_track_type = "music"  # Simplified for buffer fill
+            candidate_records = await self._fetch_candidate_records(
+                guild_id=guild_id,
+                seed_artist=seed_artist,
+                seed_title=seed_title,
+                seed_track_type=seed_track_type,
+                seed_entity=seed_entity,
+                is_canonical=is_canonical,
+                context=context,
+                tracker=tracker,
+            )
+            
+            if not candidate_records:
+                if self._verbose:
+                    LOG.warning("🔄 [V3 Buffer] No candidates fetched, buffer fill aborted")
+                return
+            
+            # Prepare and score candidates
+            prepared_candidates = await self._prepare_candidates(guild_id, candidate_records)
+            if not prepared_candidates:
+                if self._verbose:
+                    LOG.warning("🔄 [V3 Buffer] No viable candidates after enrichment")
+                return
+            
+            features = [entry.features for entry in prepared_candidates]
+            seed_track_id = self._track_id(seed_artist, seed_title)
+            
+            # Score candidates
+            scored = self._engine.score_candidates(
+                guild_id,
+                features,
+                seed_track_ids=[seed_track_id],
+                session_mood_vector=context.current_mood_vector,
+                target_mood=None,
+                session_focus_genres=context.focus_genres,
+                liked_mood_vector=context.liked_mood_vector,
+                energy_trend=context.energy_trend,
+                last_energy=None,
+            )
+            
+            # Create mapping from track_id to (PreparedCandidate, score)
+            # scored and prepared_candidates should be parallel lists in same order
+            candidate_map = {}
+            for scored_candidate, prepared_entry in zip(scored, prepared_candidates):
+                candidate_map[scored_candidate.track_id] = (prepared_entry, scored_candidate.score)
+            
+            if self._verbose >= 2:
+                LOG.debug(
+                    f"🔍 [V3 Buffer Debug] Created {len(candidate_map)} candidate mappings from "
+                    f"{len(scored)} scored and {len(prepared_candidates)} prepared"
+                )
+            
+            # V3: Classify candidates into 5 pools by score ranges (0-1 scale)
+            core_pool: List[PreparedCandidate] = []      # score >= 0.55 (highly compatible)
+            similar_pool: List[PreparedCandidate] = []   # 0.50 <= score < 0.55 (safe picks)
+            bridge_pool: List[PreparedCandidate] = []    # 0.45 <= score < 0.50 (moderate variety)
+            discovery_pool: List[PreparedCandidate] = [] # 0.40 <= score < 0.45 (adventurous)
+            
+            for candidate, score in candidate_map.values():
+                if score >= 0.55:
+                    core_pool.append(candidate)
+                elif score >= 0.50:
+                    similar_pool.append(candidate)
+                elif score >= 0.45:
+                    bridge_pool.append(candidate)
+                elif score >= 0.40:
+                    discovery_pool.append(candidate)
+            
+            if self._verbose >= 2:
+                LOG.debug(
+                    "🎯 [V3 Buffer] Pools: core=%d similar=%d bridge=%d discovery=%d",
+                    len(core_pool),
+                    len(similar_pool),
+                    len(bridge_pool),
+                    len(discovery_pool),
+                )
+            elif self._verbose >= 1:
+                # Show pool distribution summary at verbose=1
+                if candidate_map:
+                    max_score = max((score for _, score in candidate_map.values()))
+                    LOG.info(
+                        "🎯 [V3 Buffer] Pools: core=%d similar=%d bridge=%d discovery=%d (top_score=%.3f)",
+                        len(core_pool),
+                        len(similar_pool),
+                        len(bridge_pool),
+                        len(discovery_pool),
+                        max_score,
+                    )
+                else:
+                    LOG.warning("⚠️ [V3 Buffer] No candidates mapped (candidate_map is empty)")
+            
+            # V3: Allocate slots based on proportions
+            target_buffer_size = self._buffer_fill_size
+            buffer: List[PreparedCandidate] = []
+            
+            slot_keys = ["core", "similar", "bridge", "discovery", "safe_harbor"]
+            raw_counts = {
+                slot: target_buffer_size * proportions.get(slot, 0.0)
+                for slot in slot_keys
+            }
+            slot_counts = {slot: int(raw_counts[slot]) for slot in slot_keys}
+            assigned = sum(slot_counts.values())
+            remainder = target_buffer_size - assigned
+
+            if remainder > 0:
+                ordered = sorted(
+                    slot_keys,
+                    key=lambda slot: (raw_counts[slot] - slot_counts[slot], raw_counts[slot]),
+                    reverse=True,
+                )
+                for slot in ordered:
+                    if remainder == 0:
+                        break
+                    slot_counts[slot] += 1
+                    remainder -= 1
+
+            core_min = 1
+            discovery_min = 1 if proportions.get("discovery", 0.0) > 0 else 0
+            if slot_counts["core"] < core_min:
+                slot_counts["core"] = core_min
+            if slot_counts["discovery"] < discovery_min:
+                slot_counts["discovery"] = discovery_min
+
+            total_slots = sum(slot_counts.values())
+            if total_slots < target_buffer_size:
+                additive_order = ["core", "similar", "bridge", "discovery", "safe_harbor"]
+                while total_slots < target_buffer_size:
+                    for slot in additive_order:
+                        slot_counts[slot] += 1
+                        total_slots += 1
+                        if total_slots >= target_buffer_size:
+                            break
+            elif total_slots > target_buffer_size:
+                reducible_order = ["safe_harbor", "similar", "bridge", "discovery", "core"]
+                while total_slots > target_buffer_size:
+                    for slot in reducible_order:
+                        min_allowed = core_min if slot == "core" else discovery_min if slot == "discovery" else 0
+                        if slot_counts[slot] > min_allowed:
+                            slot_counts[slot] -= 1
+                            total_slots -= 1
+                            break
+                    else:
+                        break
+
+            core_count = slot_counts["core"]
+            similar_count = slot_counts["similar"]
+            bridge_count = slot_counts["bridge"]
+            discovery_count = slot_counts["discovery"]
+            safe_harbor_count = slot_counts["safe_harbor"]
+            
+            # Fill CORE slot
+            if core_pool:
+                buffer.extend(random.sample(core_pool, min(core_count, len(core_pool))))
+            elif similar_pool:
+                # Fallback: use similar pool if core empty
+                buffer.extend(random.sample(similar_pool, min(core_count, len(similar_pool))))
+            
+            # Fill SIMILAR slot
+            if similar_pool:
+                # Avoid duplicates from core fallback
+                available = [c for c in similar_pool if c not in buffer]
+                buffer.extend(random.sample(available, min(similar_count, len(available))))
+            
+            # Fill BRIDGE slot
+            if bridge_pool:
+                buffer.extend(random.sample(bridge_pool, min(bridge_count, len(bridge_pool))))
+            
+            # Fill DISCOVERY slot
+            if discovery_pool:
+                buffer.extend(random.sample(discovery_pool, min(discovery_count, len(discovery_pool))))
+            
+            # Fill SAFE_HARBOR slot (if phase requires it)
+            if safe_harbor_count > 0:
+                safe_harbor_records = await self._fetch_safe_harbor_pool(
+                    guild_id, tracker, limit=safe_harbor_count * 2  # Fetch extra for filtering
+                )
+                if safe_harbor_records:
+                    # Prepare safe harbor candidates
+                    safe_harbor_prepared = await self._prepare_candidates(
+                        guild_id, safe_harbor_records
+                    )
+                    if safe_harbor_prepared:
+                        # Pick randomly up to safe_harbor_count
+                        buffer.extend(
+                            random.sample(
+                                safe_harbor_prepared,
+                                min(safe_harbor_count, len(safe_harbor_prepared)),
+                            )
+                        )
+            
+            # Shuffle buffer to avoid predictable patterns
+            random.shuffle(buffer)
+            
+            # Store buffer
+            self._recommendation_buffer[guild_id] = buffer
+            
+            if self._verbose:
+                LOG.info(
+                    "✅ [V3 Buffer] Filled with %d tracks (phase: %s) for guild %d",
+                    len(buffer),
+                    phase.name,
+                    guild_id,
+                )
+        
+        except asyncio.CancelledError:
+            if self._verbose >= 2:
+                LOG.debug("🚫 [V3 Buffer] Fill task cancelled for guild %d", guild_id)
+            raise
+        except Exception as exc:
+            LOG.error("❌ [V3 Buffer] Fill task failed for guild %d: %s", guild_id, exc)
 
     # ------------------------------------------------------------------
     # Legacy fallback methods (kept for backward compatibility)
@@ -2227,13 +2850,22 @@ class LastFMAutoplayV2:
             cached = await self._engine._cache.get_enrichment(clean_artist, clean_title)
             if cached:
                 self._cache_stats["enrichment_hits"] += 1
+                # Build mood_vector dict from inline fields
+                mood_vector = None
+                if cached.mood_energy is not None:
+                    mood_vector = {
+                        "energy": cached.mood_energy,
+                        "valence": cached.mood_valence,
+                        "tempo": cached.mood_tempo,
+                        "confidence": cached.mood_confidence,
+                        "vector": [cached.mood_energy, cached.mood_valence, cached.mood_tempo],
+                    }
+                
                 enrichment_cache[track_id] = {
                     "tags": cached.tags,
                     "mood": cached.mood,
                     "energy": cached.energy,
-                    "mood_vector": await self._engine._cached_mood_vector_dict(
-                        cached.mood_vector_id
-                    ),
+                    "mood_vector": mood_vector,
                 }
             else:
                 # Collect for batch enrichment
@@ -2291,13 +2923,22 @@ class LastFMAutoplayV2:
                                     clean_artist, clean_title
                                 )
                                 if cached_entry:
+                                    # Build mood_vector dict from inline fields
+                                    mood_vector = None
+                                    if cached_entry.mood_energy is not None:
+                                        mood_vector = {
+                                            "energy": cached_entry.mood_energy,
+                                            "valence": cached_entry.mood_valence,
+                                            "tempo": cached_entry.mood_tempo,
+                                            "confidence": cached_entry.mood_confidence,
+                                            "vector": [cached_entry.mood_energy, cached_entry.mood_valence, cached_entry.mood_tempo],
+                                        }
+                                    
                                     enrichment_cache[track_id] = {
                                         "tags": cached_entry.tags,
                                         "mood": cached_entry.mood,
                                         "energy": cached_entry.energy,
-                                        "mood_vector": await self._engine._cached_mood_vector_dict(
-                                            cached_entry.mood_vector_id
-                                        ),
+                                        "mood_vector": mood_vector,
                                     }
                                 else:
                                     tags = [
@@ -2407,11 +3048,30 @@ class LastFMAutoplayV2:
                 continue
 
             try:
+                def _safe_float(value: Any) -> Optional[float]:
+                    try:
+                        if value is None or value == "":
+                            return None
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return None
+
+                def _safe_int(value: Any) -> Optional[int]:
+                    try:
+                        if value is None or value == "":
+                            return None
+                        return int(value)
+                    except (TypeError, ValueError):
+                        return None
+
                 tags = [
-                    str(tag).lower()
+                    str(tag).lower().strip()
                     for tag in payload.get("tags", [])
-                    if isinstance(tag, str)
+                    if isinstance(tag, str) and str(tag).strip()
                 ]
+                if tags:
+                    tags = list(dict.fromkeys(tags))
+
                 moods = [
                     str(m).strip()
                     for m in payload.get("moods", [])
@@ -2424,35 +3084,76 @@ class LastFMAutoplayV2:
                     else None
                 )
 
-                # Extract mood vector if present
-                mood_vector_id = None
+                # Gemini 4D mood vector (legacy) + compute fallback vibe
+                mood_energy = None
+                mood_valence = None
+                mood_tempo = None
+                mood_confidence = None
+
                 mood_vector_data = payload.get("mood_vector")
-                if mood_vector_data and isinstance(mood_vector_data, dict):
-                    try:
-                        from .cache_manager import MoodVectorEntry
+                if isinstance(mood_vector_data, dict):
+                    mood_energy = _safe_float(mood_vector_data.get("energy"))
+                    mood_valence = _safe_float(mood_vector_data.get("valence"))
+                    mood_tempo = _safe_float(mood_vector_data.get("tempo"))
+                    mood_confidence = _safe_float(mood_vector_data.get("confidence"))
+                    raw_mood_label = mood_vector_data.get("mood")
+                    if not mood_value and isinstance(raw_mood_label, str):
+                        stripped = raw_mood_label.strip()
+                        if stripped:
+                            mood_value = stripped
 
-                        mood_vector_entry = MoodVectorEntry(
-                            energy=float(mood_vector_data.get("energy", 0.0) or 0.0),
-                            valence=float(mood_vector_data.get("valence", 0.0) or 0.0),
-                            tempo=float(mood_vector_data.get("tempo", 0.0) or 0.0),
-                            confidence=float(
-                                mood_vector_data.get("confidence", 0.0) or 0.0
-                            ),
-                            mood=(
-                                str(mood_vector_data.get("mood", "")).strip() or None
-                            ),
-                            fetched_at=time.time(),
-                        )
-                        await self._engine._cache.set_mood_vector(
-                            normalized_key, mood_vector_entry
-                        )
-                        mood_vector_id = normalized_key
-                    except Exception as exc:
-                        LOG.debug(
-                            f"Failed to parse mood_vector for {normalized_key}: {exc}"
-                        )
+                raw_genres = payload.get("genres")
+                genres: List[str] = []
+                if isinstance(raw_genres, list):
+                    genres = [
+                        str(genre).strip()
+                        for genre in raw_genres
+                        if isinstance(genre, str) and str(genre).strip()
+                    ]
+                elif isinstance(raw_genres, str) and raw_genres.strip():
+                    genres = [raw_genres.strip()]
+                elif isinstance(payload.get("genre"), str) and payload["genre"].strip():
+                    genres = [payload["genre"].strip()]
 
-                # Extract extended metadata
+                raw_simple_vibe = (
+                    payload.get("computed_simple_vibe")
+                    or payload.get("computed_vibe_vector")
+                    or payload.get("vibe_vector")
+                )
+                computed_simple_vibe: Optional[List[float]] = None
+                if isinstance(raw_simple_vibe, list):
+                    sanitized: List[float] = []
+                    for value in raw_simple_vibe:
+                        parsed = _safe_float(value)
+                        if parsed is None:
+                            sanitized = []
+                            break
+                        sanitized.append(parsed)
+                    if len(sanitized) >= 5:
+                        computed_simple_vibe = sanitized[:5]
+
+                computed_loudness = _safe_float(payload.get("computed_loudness"))
+                computed_tempo = _safe_float(payload.get("computed_tempo"))
+                computed_key = _safe_int(payload.get("computed_key"))
+                computed_mode = _safe_int(payload.get("computed_mode"))
+                estimated_tempo = _safe_float(payload.get("estimated_tempo"))
+                estimated_loudness = _safe_float(payload.get("estimated_loudness"))
+                estimated_key = _safe_int(payload.get("estimated_key"))
+                estimated_mode = _safe_int(payload.get("estimated_mode"))
+
+                estimated_simple_vibe: Optional[List[float]] = None
+                vibe_guess_raw = payload.get("simple_vibe_guess") or payload.get("vibe_guess")
+                if isinstance(vibe_guess_raw, list):
+                    temp_vals: List[float] = []
+                    for val in vibe_guess_raw[:5]:
+                        parsed = _safe_float(val)
+                        if parsed is None:
+                            temp_vals = []
+                            break
+                        temp_vals.append(max(0.0, min(1.0, parsed)))
+                    if len(temp_vals) == 5:
+                        estimated_simple_vibe = temp_vals
+
                 bpm_val = payload.get("bpm")
                 key_val = payload.get("key")
                 activity_val = payload.get("activity_affinity")
@@ -2464,24 +3165,43 @@ class LastFMAutoplayV2:
                 enrichment_entry = EnrichmentEntry(
                     tags=tags,
                     mood=mood_value,
-                    listeners=0,  # TODO: Fetch from Last.fm
-                    playcount=0,  # TODO: Fetch from Last.fm
-                    duration_ms=None,  # TODO: Fetch from Last.fm
                     fetched_at=time.time(),
-                    mood_vector_id=mood_vector_id,
                     energy=energy,
-                    bpm=int(bpm_val) if bpm_val and str(bpm_val).isdigit() else None,
-                    key=str(key_val).strip() if key_val else None,
+                    bpm=_safe_int(bpm_val),
+                    key=(
+                        str(key_val).strip()
+                        if isinstance(key_val, str) and key_val.strip()
+                        else None
+                    ),
                     activity_affinity=(
-                        str(activity_val).strip() if activity_val else None
+                        str(activity_val).strip()
+                        if isinstance(activity_val, str) and activity_val.strip()
+                        else None
                     ),
-                    emotional_intensity=(
-                        float(intensity_val) if intensity_val is not None else None
-                    ),
+                    emotional_intensity=_safe_float(intensity_val),
                     daypart_affinity=(
-                        str(daypart_val).strip() if daypart_val else None
+                        str(daypart_val).strip()
+                        if isinstance(daypart_val, str) and daypart_val.strip()
+                        else None
                     ),
+                    genres=genres,
+                    mood_energy=mood_energy,
+                    mood_valence=mood_valence,
+                    mood_tempo=mood_tempo,
+                    mood_confidence=mood_confidence,
+                    computed_simple_vibe=computed_simple_vibe,
+                    computed_loudness=computed_loudness,
+                    computed_tempo=computed_tempo,
+                    computed_key=computed_key,
+                    computed_mode=computed_mode,
+                    estimated_tempo=estimated_tempo,
+                    estimated_loudness=estimated_loudness,
+                    estimated_key=estimated_key,
+                    estimated_mode=estimated_mode,
+                    estimated_simple_vibe=estimated_simple_vibe,
                 )
+
+                # Vibe vectors now computed during analysis or inferred from enrichment
 
                 await self._engine._cache.set_enrichment(
                     artist, title, enrichment_entry
@@ -2521,9 +3241,25 @@ class LastFMAutoplayV2:
 
         if enrichment is None:
             # Fall back to individual enrichment only if not pre-fetched
+            # Try to get youtube_id and deezer_id from cache
+            youtube_id = None
+            deezer_id = None
+            try:
+                mapping_entry = await self._engine._cache.get_mapping(artist, title)
+                if mapping_entry:
+                    youtube_id = mapping_entry.youtube_id
+                
+                parsing_entry = await self._engine._cache.get_parsing(artist, title)
+                if parsing_entry:
+                    deezer_id = parsing_entry.deezer_id
+            except Exception as e:
+                LOG.debug(f"Unable to retrieve youtube_id/deezer_id for {artist} - {title}: {e}")
+            
             async with self._enrich_semaphore:
                 try:
-                    enrichment = await self._engine.enrich_track(artist, title)
+                    enrichment = await self._engine.enrich_track(
+                        artist, title, youtube_id=youtube_id, deezer_id=deezer_id
+                    )
                 except Exception as exc:  # pragma: no cover - defensive logging
                     LOG.debug("Enrichment failed for %s - %s: %s", artist, title, exc)
 
@@ -2531,6 +3267,12 @@ class LastFMAutoplayV2:
         mood_label = None
         genres = None
         energy = None
+        
+        # 9D Dual-Vector Architecture (EfficientAT-computed)
+        computed_loudness = None
+        computed_tempo = None
+        computed_key = None
+        computed_mode = None
 
         if enrichment:
             mood_payload = enrichment.get("mood_vector") or {}
@@ -2556,6 +3298,12 @@ class LastFMAutoplayV2:
                     energy = energy_map.get(energy_val.lower(), 0.6)
                 elif isinstance(energy_val, (int, float)):
                     energy = float(energy_val)
+            
+            # Extract 9D dual-vector features from enrichment (EfficientAT-computed)
+            computed_loudness = enrichment.get("computed_loudness")
+            computed_tempo = enrichment.get("computed_tempo")
+            computed_key = enrichment.get("computed_key")
+            computed_mode = enrichment.get("computed_mode")
 
         features = CandidateFeatures(
             track_id=track_id,
@@ -2572,6 +3320,11 @@ class LastFMAutoplayV2:
             mood_label=mood_label,
             genres=genres,
             energy=energy,
+            # 9D Dual-Vector Architecture (Flow features)
+            computed_loudness=computed_loudness,
+            computed_tempo=computed_tempo,
+            computed_key=computed_key,
+            computed_mode=computed_mode,
         )
 
         metadata = {
@@ -2654,6 +3407,8 @@ class LastFMAutoplayV2:
     @staticmethod
     def _is_episode_content(title: str) -> bool:
         """Check if a title appears to be episode/series content rather than music."""
+        import re as _re
+
         title_lower = title.lower()
 
         # Episode indicators - expanded patterns
@@ -2674,7 +3429,7 @@ class LastFMAutoplayV2:
         ]
 
         for pattern in episode_patterns:
-            if re.search(pattern, title_lower):
+            if _re.search(pattern, title_lower):
                 return True
 
         # Context-aware "finale" detection - only flag if combined with series indicators
@@ -2709,7 +3464,7 @@ class LastFMAutoplayV2:
                 r"\bfull\s+movie\b",
             ]
             for pattern in tv_patterns:
-                if re.search(pattern, title_lower):
+                if _re.search(pattern, title_lower):
                     return True
 
         # Non-music content keywords (expanded)
@@ -2839,14 +3594,14 @@ class LastFMAutoplayV2:
         return f"{artist.strip().lower()}::{title.strip().lower()}"
 
 
-_autoplay_instance: Optional[LastFMAutoplayV2] = None
+_autoplay_instance: Optional[LastFMAutoplayV3] = None
 
 
-def get_lastfm_autoplay_v2(bot: Any) -> LastFMAutoplayV2:
+def get_lastfm_autoplay_v3(bot: Any) -> LastFMAutoplayV3:
     global _autoplay_instance
     if _autoplay_instance is None:
-        _autoplay_instance = LastFMAutoplayV2(bot)
+        _autoplay_instance = LastFMAutoplayV3(bot)
     return _autoplay_instance
 
 
-__all__ = ["LastFMAutoplayV2", "get_lastfm_autoplay_v2"]
+__all__ = ["LastFMAutoplayV3", "get_lastfm_autoplay_v3"]

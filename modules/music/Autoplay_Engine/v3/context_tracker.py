@@ -1,12 +1,23 @@
 """
-Context Tracker for Autoplay V2 - Recent Session History
+Context Tracker for Autoplay V2 - Dual Vector Architecture (9D)
 
-Tracks the last N played songs with their metadata to maintain "core vibe" context
-for the recommendation algorithm. This enables:
-- Genre/mood continuity tracking
-- Skip rate monitoring for adaptive exploration
-- Artist diversity enforcement
-- Temporal session state management
+Tracks recent session history with advanced vibe steering and replay detection.
+
+VIBE VECTORS (5D each):
+- current_mood_vector: Weighted average of all recent tracks
+- liked_mood_vector: Weighted average of liked tracks (PULL target)
+- disliked_mood_vector: Average of skipped/disliked tracks (PUSH away)
+  Format: [energy, valence, danceability, acousticness, instrumentalness]
+
+FLOW FEATURES (4D):
+- last_loudness, last_tempo, last_key, last_mode from most recent track
+  Used for DJ-smooth transitions and harmonic mixing
+
+Features:
+- Replay Detection: Resets genre skip streaks, treats as super-like
+- Fatigue Skip Detection: Skipped recent song = novelty signal, no genre penalty
+- 3-Strike Rule: Genre reaches 3 skips → strong penalty (0.85)
+- Vibe Tracking: Maintains last 5 disliked vibe vectors for push logic
 
 Part of Issue #3 - Contextual Arc Recommender
 """
@@ -22,7 +33,12 @@ LOG = logging.getLogger(__name__)
 
 @dataclass
 class PlayedTrack:
-    """Record of a played track with context and multi-user feedback"""
+    """Record of a played track with context and multi-user feedback
+    
+    Dual Vector Architecture (9D Total):
+    - VIBE VECTOR (5D): mood_vector = [energy, valence, danceability, acousticness, instrumentalness]
+    - FLOW VECTOR (4D): computed_loudness, computed_tempo, computed_key, computed_mode
+    """
 
     track_id: str
     artist: str
@@ -30,7 +46,7 @@ class PlayedTrack:
     genres: List[str]
     mood_vector: Optional[
         Union[List[float], Dict]
-    ]  # Can be list or dict with 'vector' key
+    ]  # 5D vibe vector or dict with 'vector' key
     mood_label: Optional[str]
     timestamp: float
     was_skipped: bool
@@ -45,19 +61,33 @@ class PlayedTrack:
     recency_weight: float = (
         1.0  # Temporal weighting (1.0 = most recent, decays with age)
     )
-    energy: Optional[float] = None  # Track energy for energy curve tracking
+    energy: Optional[float] = None  # DEPRECATED: Use computed_loudness instead
 
     # OST-Aware fields (Phase 0.5)
     track_type: str = "music"  # "music", "ost", "game_soundtrack", "anime_opening"
     primary_entity: Optional[str] = None  # Franchise/show/game name for OST content
+    
+    # Dual Vector Architecture: Flow Features (for smooth transitions)
+    # Dual Vector Architecture: Flow features (4D) for harmonic mixing
+    computed_loudness: Optional[float] = None  # Loudness in dB (e.g., -5.883)
+    computed_tempo: Optional[float] = None  # BPM as float (e.g., 120.0)
+    computed_key: Optional[int] = None  # 0-11 (C=0, C#=1, D=2, ..., B=11)
+    computed_mode: Optional[int] = None  # 0=minor, 1=major
+    event_type: Optional[str] = None  # "replay", "skip", "finish", "dislike", etc.
 
 
 @dataclass
 class SessionContext:
-    """Aggregated session state derived from recent history"""
+    """Aggregated session state derived from recent history
+    
+    Dual Vector Architecture (9D Total):
+    - VIBE VECTORS (5D each): current_mood_vector, liked_mood_vector, disliked_mood_vector
+      Format: [energy, valence, danceability, acousticness, instrumentalness]
+    - FLOW FEATURES (4D): last_loudness, last_tempo, last_key, last_mode
+    """
 
     focus_genres: List[str]  # Most common genres (mode)
-    current_mood_vector: Optional[List[float]]  # Average mood
+    current_mood_vector: Optional[List[float]]  # Average session vibe (5D)
     recent_artists: Set[str]  # Artists played in window
     skip_rate: float  # Ratio of skips in recent window
     consecutive_skips: int  # Current skip streak
@@ -66,9 +96,12 @@ class SessionContext:
     last_activity: float
     disliked_tags: Dict[str, float] = field(default_factory=dict)
 
-    # Enhanced context for temporal weighting and safe anchor
+    # Vibe steering vectors (5D each)
     liked_mood_vector: Optional[List[float]] = (
-        None  # Weighted average of explicitly liked tracks
+        None  # Weighted average of liked tracks (PULL target)
+    )
+    disliked_mood_vector: Optional[List[float]] = (
+        None  # Average of skipped/disliked tracks (PUSH away)
     )
     artist_diversity_pool: List[str] = field(
         default_factory=list
@@ -76,6 +109,12 @@ class SessionContext:
     energy_trend: float = (
         0.0  # Rising/falling energy across last 3 tracks (-1.0 to 1.0)
     )
+    
+    # Flow features (4D) from last played track for transitions
+    last_loudness: Optional[float] = None  # Loudness in dB
+    last_tempo: Optional[float] = None  # BPM
+    last_key: Optional[int] = None  # 0-11 (C=0, C#=1, ..., B=11)
+    last_mode: Optional[int] = None  # 0=minor, 1=major
 
 
 class ContextTracker:
@@ -105,6 +144,10 @@ class ContextTracker:
         self._session_start = datetime.now().timestamp()
         self._last_activity = self._session_start
         self._songs_since_novelty = 0
+        
+        # Vibe steering state (Dual Vector Architecture)
+        self._disliked_vectors: List[List[float]] = []  # Last ~5 disliked/skipped vibe vectors
+        self._genre_skip_streaks: Dict[str, int] = {}  # Track skip count per genre (3-strike rule)
 
         LOG.info("🎯 [ContextTracker] Initialized (window=%d tracks)", history_size)
 
@@ -174,16 +217,21 @@ class ContextTracker:
         num_active_listeners: int = 1,
         track_type: str = "music",
         primary_entity: Optional[str] = None,
+        event_type: Optional[str] = None,  # "replay", "skip", "finish", "dislike"
+        computed_loudness: Optional[float] = None,
+        computed_tempo: Optional[float] = None,
+        computed_key: Optional[int] = None,
+        computed_mode: Optional[int] = None,
     ) -> None:
         """
-        Record a played track in the history.
+        Record a played track in the history with enhanced vibe steering logic.
 
         Args:
             track_id: Unique identifier
             artist: Artist name
             title: Track title
             genres: List of genre tags
-            mood_vector: Optional [energy, valence, tempo] vector
+            mood_vector: Optional 5D vibe vector [energy, valence, danceability, acousticness, instrumentalness]
             mood_label: Optional mood label (e.g., "energetic", "mellow")
             was_skipped: Whether track was skipped
             skip_type: If skipped, type: "hard", "medium", or "soft"
@@ -193,19 +241,62 @@ class ContextTracker:
             num_active_listeners: Total active (non-AFK) listeners
             track_type: Track classification (music/ost/game_soundtrack/anime_opening)
             primary_entity: Franchise/show/game name for OST content
+            event_type: Event classification for special handling (replay, skip, finish, dislike)
+            computed_loudness: Loudness in dB for transition smoothness
+            computed_tempo: BPM for transition smoothness
+            computed_key: Key 0-11 for harmonic mixing
+            computed_mode: Mode 0=minor, 1=major for harmonic mixing
         """
         now = datetime.now().timestamp()
 
-        # Calculate consensus signal
+        # Detect replay: track_id exists in recent history
+        is_replay = event_type == "replay" or any(
+            track.track_id == track_id for track in self._history[-5:]
+        )
+
+        # Detect fatigue skip: track was skipped AND exists in last 5 songs
+        is_fatigue_skip = False
+        if was_skipped and not is_replay:
+            is_fatigue_skip = any(
+                track.track_id == track_id for track in self._history[-5:]
+            )
+
+        # Calculate consensus signal (may be overridden for replays)
         consensus_signal = self._calculate_consensus_signal(
             num_likes, num_dislikes, num_active_listeners
         )
+
+        # --- REPLAY HANDLING: Treat as super-like ---
+        if is_replay:
+            # Set consensus to "liked" with maximum weight (100% consensus)
+            consensus_signal = "liked"
+            num_likes = num_active_listeners  # Everyone "loves" this replay
+            num_dislikes = 0
+            
+            # Reset genre skip streaks for all genres of this track
+            for genre in (genres or []):
+                genre_lower = genre.lower()
+                if genre_lower in self._genre_skip_streaks:
+                    if self._verbose >= 1:
+                        LOG.info(
+                            "🔄 [Replay] Resetting skip streak for genre '%s' (was %d skips)",
+                            genre_lower,
+                            self._genre_skip_streaks[genre_lower],
+                        )
+                    self._genre_skip_streaks[genre_lower] = 0
+            
+            if self._verbose >= 1:
+                LOG.info(
+                    "🔄 [Replay Detected] '%s' by '%s' - Treating as super-like, genres re-anchored",
+                    title,
+                    artist,
+                )
 
         # Calculate recency weight based on position in history
         history_position = len(self._history)
         recency_weight = max(0.3, 1.0 - (history_position * 0.05))
 
-        # Extract energy from mood_vector if available
+        # Extract energy from mood_vector for backward compatibility
         energy = None
         if mood_vector:
             if isinstance(mood_vector, dict):
@@ -234,9 +325,66 @@ class ContextTracker:
             energy=energy,
             track_type=track_type,
             primary_entity=primary_entity,
+            computed_loudness=computed_loudness,
+            computed_tempo=computed_tempo,
+            computed_key=computed_key,
+            computed_mode=computed_mode,
+            event_type=event_type or ("replay" if is_replay else None),
         )
 
         self._history.append(played)
+
+        # --- VIBE STEERING: Track disliked vectors & genre skip streaks ---
+        vec = None
+        if mood_vector:
+            if isinstance(mood_vector, dict):
+                vec = mood_vector.get("vector")
+            elif isinstance(mood_vector, (list, tuple)):
+                vec = list(mood_vector)
+
+        # Handle skip/dislike feedback
+        if (was_skipped or consensus_signal == "disliked") and not is_replay:
+            if is_fatigue_skip:
+                # Fatigue Skip: Don't increment genre streaks, only track vibe
+                if vec:
+                    self._disliked_vectors.append(vec)
+                    if len(self._disliked_vectors) > 5:
+                        self._disliked_vectors.pop(0)
+                
+                if self._verbose >= 1:
+                    LOG.info(
+                        "⏭️ [Fatigue Skip] '%s' by '%s' - Novelty signal, no genre penalty",
+                        title,
+                        artist,
+                    )
+            else:
+                # Normal Skip or Dislike: Increment genre streaks AND track vibe
+                for genre in (genres or []):
+                    genre_lower = genre.lower()
+                    self._genre_skip_streaks[genre_lower] = (
+                        self._genre_skip_streaks.get(genre_lower, 0) + 1
+                    )
+                    
+                    if self._verbose >= 2:
+                        LOG.debug(
+                            "📊 [Genre Skip] '%s' streak now %d/3",
+                            genre_lower,
+                            self._genre_skip_streaks[genre_lower],
+                        )
+                
+                if vec:
+                    self._disliked_vectors.append(vec)
+                    if len(self._disliked_vectors) > 5:
+                        self._disliked_vectors.pop(0)
+                
+                if self._verbose >= 1:
+                    skip_reason = "explicit dislike" if consensus_signal == "disliked" else "normal skip"
+                    LOG.info(
+                        "👎 [%s] '%s' by '%s' - Vibe tracked, genre strike +1",
+                        skip_reason.title(),
+                        title,
+                        artist,
+                    )
 
         # Trim to window size
         if len(self._history) > self._history_size:
@@ -245,7 +393,7 @@ class ContextTracker:
         self._last_activity = now
 
         if self._verbose >= 1:
-            status = "⏭️ skipped" if was_skipped else "✅ finished"
+            status = "🔄 replay" if is_replay else ("⏭️ skipped" if was_skipped else "✅ finished")
             feedback_str = (
                 f"👍{num_likes} 👎{num_dislikes}" if num_active_listeners > 1 else ""
             )
@@ -369,6 +517,16 @@ class ContextTracker:
                     for i in range(dim_count)
                 ]
 
+        # Vibe Steering - disliked_mood_vector (from _disliked_vectors tracked in record_play)
+        disliked_mood_vector = None
+        if self._disliked_vectors:
+            dim_count = len(self._disliked_vectors[0])
+            total_vecs = len(self._disliked_vectors)
+            disliked_mood_vector = [
+                sum(v[i] for v in self._disliked_vectors) / total_vecs
+                for i in range(dim_count)
+            ]
+
         # Recent artists (for diversity)
         recent_artists = {t.artist for t in self._history}
 
@@ -391,7 +549,7 @@ class ContextTracker:
             else:
                 break
 
-        # Fast Rollback - disliked tags with temporal-weighted penalties
+        # Fast Rollback - disliked tags with temporal-weighted penalties + 3-strike rule
         disliked_tags: Dict[str, float] = {}
 
         for idx, track in enumerate(self._history):
@@ -430,6 +588,32 @@ class ContextTracker:
                     else:
                         disliked_tags[genre_lower] = penalty
 
+        # 3-Strike Rule: Apply STRONG penalties to genres with >=3 skip streaks
+        for genre_lower, streak_count in self._genre_skip_streaks.items():
+            if streak_count >= 3:
+                #强力惩罚 - this genre should be heavily avoided
+                disliked_tags[genre_lower] = max(
+                    disliked_tags.get(genre_lower, 0.0), 0.85
+                )
+                if self._verbose >= 2:
+                    LOG.debug(
+                        "🚫 [3-Strike Rule] Genre '%s' reached %d skips, penalty=0.85",
+                        genre_lower,
+                        streak_count,
+                    )
+
+        # Flow Features: Extract from last played track for harmonic mixing
+        last_loudness = None
+        last_tempo = None
+        last_key = None
+        last_mode = None
+        if self._history:
+            last_track = self._history[-1]
+            last_loudness = last_track.computed_loudness
+            last_tempo = last_track.computed_tempo
+            last_key = last_track.computed_key
+            last_mode = last_track.computed_mode
+
         # Task 2.4: Energy Trend - calculate energy delta from last 3 tracks
         energy_trend = 0.0
         energy_values = []
@@ -453,8 +637,13 @@ class ContextTracker:
             last_activity=self._last_activity,
             disliked_tags=disliked_tags,
             liked_mood_vector=liked_mood_vector,
+            disliked_mood_vector=disliked_mood_vector,
             artist_diversity_pool=[],  
             energy_trend=energy_trend,
+            last_loudness=last_loudness,
+            last_tempo=last_tempo,
+            last_key=last_key,
+            last_mode=last_mode,
         )
 
         if self._verbose >= 2:

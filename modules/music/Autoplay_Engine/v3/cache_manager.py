@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -9,7 +10,6 @@ __all__ = [
     "MappingEntry",
     "EnrichmentEntry",
     "ParsingEntry",
-    "MoodVectorEntry",
     "CollaborativeSnapshot",
     "CacheManager",
 ]
@@ -27,6 +27,11 @@ class MappingEntry:
     duration_ms: Optional[int] = None
     track_identifier: Optional[str] = None
     title: Optional[str] = None
+    preview_url: Optional[str] = None
+    preview_duration_ms: Optional[int] = None
+    preview_fetched_at: Optional[float] = None
+    deezer_track_id: Optional[str] = None
+    ingest_source: Optional[str] = None
     heuristic_score: float = 0.0
     title_similarity: Optional[float] = None
     artist_similarity: Optional[float] = None
@@ -84,6 +89,23 @@ class MappingEntry:
             title=(
                 str(payload.get("title", "")).strip() if payload.get("title") else None
             ),
+            preview_url=(
+                str(payload.get("preview_url", "")).strip()
+                if payload.get("preview_url")
+                else None
+            ),
+            preview_duration_ms=_safe_int(payload.get("preview_duration_ms")),
+            preview_fetched_at=_safe_float(payload.get("preview_fetched_at")),
+            deezer_track_id=(
+                str(payload.get("deezer_track_id", "")).strip()
+                if payload.get("deezer_track_id")
+                else None
+            ),
+            ingest_source=(
+                str(payload.get("ingest_source", "")).strip()
+                if payload.get("ingest_source")
+                else None
+            ),
             heuristic_score=float(payload.get("heuristic_score", 0.0) or 0.0),
             title_similarity=_safe_float(payload.get("title_similarity")),
             artist_similarity=_safe_float(payload.get("artist_similarity")),
@@ -102,11 +124,7 @@ class MappingEntry:
 class EnrichmentEntry:
     tags: List[str]
     mood: Optional[str]
-    listeners: int
-    playcount: int
-    duration_ms: Optional[int]
     fetched_at: float
-    mood_vector_id: Optional[str] = None
     energy: Optional[str] = None
     # Extended metadata for V3
     bpm: Optional[int] = None
@@ -114,17 +132,152 @@ class EnrichmentEntry:
     activity_affinity: Optional[str] = None  # e.g., "workout", "study", "party"
     emotional_intensity: Optional[float] = None  # 0.0-1.0
     daypart_affinity: Optional[str] = None  # e.g., "morning", "evening", "night"
-    
-    # Phase 0.5: Deezer-sourced metadata (integrated here, NOT separate cache)
-    canonical_duration_ms: Optional[int] = None  # From Deezer API (more accurate)
     genres: List[str] = field(default_factory=list)  # Deezer genres
-    deezer_popularity: Optional[int] = None  # Deezer rank score
+
+    # ============================================================================
+    # Mood Vector (Gemini) - used as lightweight estimate before audio analysis
+    # ============================================================================
+    mood_energy: Optional[float] = None  # 0.0-1.0 Gemini guess
+    mood_valence: Optional[float] = None  # 0.0-1.0 Gemini guess
+    mood_tempo: Optional[float] = None  # 0.0-1.0 Gemini guess
+    mood_confidence: Optional[float] = None  # 0.0-1.0 Gemini confidence
+    
+    # ============================================================================
+    # V3 Architecture (CURRENT) - Librosa + EfficientAT MobileNet or Non-ML Mode
+    # ============================================================================
+    # FLOW VECTOR (4D): For DJ-quality transitions and harmonic mixing (always computed)
+    computed_tempo: Optional[float] = None  # BPM as float (e.g., 120.0)
+    computed_loudness: Optional[float] = None  # Loudness in dB (e.g., -5.883)
+    computed_key: Optional[int] = None  # 0-11 (C=0, C#=1, D=2, ..., B=11)
+    computed_mode: Optional[int] = None  # 0=minor, 1=major
+    
+    # ML MODE: Learned high-dimensional embedding (512D-2048D)
+    # Used when analysis_mode="ml" with EfficientAT (MobileNetV3)
+    computed_embedding: Optional[List[float]] = None  # 512D-2048D learned embedding
+    computed_embedding_model: Optional[str] = None  # "mn10_as"
+    computed_embedding_dim: Optional[int] = None  # Actual dimension (e.g., 1024, 2048)
+    
+    # Non-ML Mode: Simplified 5D vibe vector computed from Librosa features only
+    # Used when analysis_mode="non-ml" - no neural network required
+    computed_simple_vibe: Optional[List[float]] = None  # 5D: [energy, valence, danceability, acousticness, brightness]
+    # Gemini estimates (used until Librosa/MobileNet runs)
+    estimated_tempo: Optional[float] = None
+    estimated_loudness: Optional[float] = None
+    estimated_key: Optional[int] = None
+    estimated_mode: Optional[int] = None
+    estimated_simple_vibe: Optional[List[float]] = None  # Gemini 5D guess until audio analysis finishes
+
+    # Analysis pipeline bookkeeping
+    analysis_verified: bool = False
+    analysis_in_progress: bool = False
+    last_analysis_attempt: Optional[float] = None
 
     def is_expired(self, ttl_seconds: float) -> bool:
         return (time.time() - self.fetched_at) > ttl_seconds
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    # ------------------------------------------------------------------
+    # Feature synthesis helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    def _resolve_energy_score(self) -> float:
+        if isinstance(self.mood_energy, (int, float)):
+            return self._clamp01(float(self.mood_energy))
+
+        if isinstance(self.energy, str):
+            label = self.energy.lower().strip()
+            mapping = {
+                "low": 0.25,
+                "medium": 0.55,
+                "mid": 0.55,
+                "moderate": 0.55,
+                "high": 0.85,
+                "very high": 0.9,
+                "intense": 0.9,
+            }
+            if label in mapping:
+                return mapping[label]
+
+        return 0.5
+
+    def _resolve_valence_score(self) -> float:
+        if isinstance(self.mood_valence, (int, float)):
+            return self._clamp01(float(self.mood_valence))
+
+        valence = 0.5
+        mood_text = (self.mood or "").lower()
+        negative_tokens = ("dark", "somber", "sad", "melancholy", "angst", "moody")
+        positive_tokens = ("happy", "bright", "uplifting", "cheer", "joy", "fun")
+
+        if mood_text:
+            if any(token in mood_text for token in negative_tokens):
+                valence = 0.25
+            elif any(token in mood_text for token in positive_tokens):
+                valence = 0.75
+
+        return valence
+
+    def _estimate_danceability(self) -> float:
+        if isinstance(self.mood_tempo, (int, float)):
+            tempo_score = self._clamp01(float(self.mood_tempo))
+        else:
+            tempo_score = 0.5
+
+        bpm = self.bpm
+        if isinstance(bpm, (int, float)) and bpm > 0:
+            bpm = float(bpm)
+            diff = abs(bpm - 120.0)
+            score = max(0.0, 1.0 - diff / 120.0)
+            tempo_score = max(tempo_score, 0.2 + 0.8 * score)
+
+        return self._clamp01(tempo_score)
+
+    def _estimate_acousticness(self) -> float:
+        combined = {tag.lower() for tag in (self.tags or [])}
+        combined.update(tag.lower() for tag in (self.genres or []))
+
+        acousticness = 0.5
+        if any("acoustic" in tag for tag in combined):
+            acousticness = 0.85
+        elif any(tag in {"electronic", "edm", "synthwave", "dubstep", "industrial"} for tag in combined):
+            acousticness = 0.2
+        elif any(tag in {"folk", "singer-songwriter", "orchestral", "classical"} for tag in combined):
+            acousticness = 0.75
+        elif any(tag in {"rock", "metal", "punk"} for tag in combined):
+            acousticness = 0.35
+
+        return self._clamp01(acousticness)
+
+    def _estimate_instrumentalness(self) -> float:
+        combined = {tag.lower() for tag in (self.tags or [])}
+        combined.update(tag.lower() for tag in (self.genres or []))
+        mood_text = (self.mood or "").lower()
+
+        instrumentalness = 0.2
+        if any(
+            token in combined
+            for token in {"instrumental", "score", "soundtrack", "orchestral", "bgm"}
+        ) or "instrumental" in mood_text:
+            instrumentalness = 0.8
+        elif any(token in combined for token in {"rap", "hip hop", "vocal", "soul", "r&b"}):
+            instrumentalness = 0.1
+
+        return self._clamp01(instrumentalness)
+
+    # DEPRECATED: Vector synthesis removed - V3 audio analysis only
+    # computed_vibe_vector, computed_embedding, computed_simple_vibe can be None if:
+    # 1. V3 audio analysis hasn't run yet (background job pending)
+    # 2. No youtube_id available (cannot analyze audio)
+    # Recommendation system must handle None gracefully (use collaborative filtering fallback)
+    #
+    # def ensure_vibe_vector(self) -> None:
+    #     """DEPRECATED - DO NOT USE. Vectors must come from V3 audio analysis."""
+    #     pass
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "EnrichmentEntry":
@@ -135,18 +288,25 @@ class EnrichmentEntry:
         genres_raw = payload.get("genres") or []
         genres = [str(genre).strip() for genre in genres_raw if str(genre).strip()]
         
-        return cls(
+        # Parse computed_vibe_vector (5D)
+        gemini_simple_vibe_raw = (
+            payload.get("estimated_simple_vibe")
+            or payload.get("gemini_simple_vibe")
+            or payload.get("simple_vibe_guess")
+        )
+        estimated_simple_vibe = None
+        if isinstance(gemini_simple_vibe_raw, list):
+            try:
+                cleaned = [max(0.0, min(1.0, float(v))) for v in gemini_simple_vibe_raw[:5]]
+            except (TypeError, ValueError):
+                cleaned = []
+            if len(cleaned) == 5:
+                estimated_simple_vibe = cleaned
+        
+        entry = cls(
             tags=tags,
             mood=(str(payload["mood"]).strip() if payload.get("mood") else None),
-            listeners=int(payload.get("listeners", 0) or 0),
-            playcount=int(payload.get("playcount", 0) or 0),
-            duration_ms=payload.get("duration_ms"),
             fetched_at=float(payload.get("fetched_at", 0.0)),
-            mood_vector_id=(
-                str(payload["mood_vector_id"]).strip()
-                if payload.get("mood_vector_id")
-                else None
-            ),
             energy=(str(payload["energy"]).strip() if payload.get("energy") else None),
             bpm=(int(payload["bpm"]) if payload.get("bpm") else None),
             key=(str(payload["key"]).strip() if payload.get("key") else None),
@@ -165,19 +325,84 @@ class EnrichmentEntry:
                 if payload.get("daypart_affinity")
                 else None
             ),
-            # Phase 0.5 fields
-            canonical_duration_ms=(
-                int(payload["canonical_duration_ms"])
-                if payload.get("canonical_duration_ms")
+            genres=genres,
+            mood_energy=(
+                float(payload["mood_energy"])
+                if payload.get("mood_energy") is not None
                 else None
             ),
-            genres=genres,
-            deezer_popularity=(
-                int(payload["deezer_popularity"])
-                if payload.get("deezer_popularity")
+            mood_valence=(
+                float(payload["mood_valence"])
+                if payload.get("mood_valence") is not None
+                else None
+            ),
+            mood_tempo=(
+                float(payload["mood_tempo"])
+                if payload.get("mood_tempo") is not None
+                else None
+            ),
+            mood_confidence=(
+                float(payload["mood_confidence"])
+                if payload.get("mood_confidence") is not None
+                else None
+            ),
+            computed_loudness=(
+                float(payload["computed_loudness"])
+                if payload.get("computed_loudness") is not None
+                else None
+            ),
+            computed_tempo=(
+                float(payload["computed_tempo"])
+                if payload.get("computed_tempo") is not None
+                else None
+            ),
+            computed_key=(
+                int(payload["computed_key"])
+                if payload.get("computed_key") is not None
+                else None
+            ),
+            computed_mode=(
+                int(payload["computed_mode"])
+                if payload.get("computed_mode") is not None
+                else None
+            ),
+            computed_simple_vibe=(
+                [float(v) for v in payload.get("computed_simple_vibe", [])]
+                if isinstance(payload.get("computed_simple_vibe"), list)
+                else None
+            ),
+            estimated_tempo=(
+                float(payload["estimated_tempo"])
+                if payload.get("estimated_tempo") is not None
+                else None
+            ),
+            estimated_loudness=(
+                float(payload["estimated_loudness"])
+                if payload.get("estimated_loudness") is not None
+                else None
+            ),
+            estimated_key=(
+                int(payload["estimated_key"])
+                if payload.get("estimated_key") is not None
+                else None
+            ),
+            estimated_mode=(
+                int(payload["estimated_mode"])
+                if payload.get("estimated_mode") is not None
+                else None
+            ),
+            estimated_simple_vibe=estimated_simple_vibe,
+            analysis_verified=bool(payload.get("analysis_verified", False)),
+            analysis_in_progress=bool(payload.get("analysis_in_progress", False)),
+            last_analysis_attempt=(
+                float(payload["last_analysis_attempt"])
+                if payload.get("last_analysis_attempt") is not None
                 else None
             ),
         )
+
+        # NO vector synthesis - if None, it means V3 audio analysis hasn't run yet
+        return entry
 
 
 @dataclass
@@ -250,33 +475,6 @@ class ParsingEntry:
 
 
 @dataclass
-class MoodVectorEntry:
-    energy: float
-    valence: float
-    tempo: float
-    confidence: float
-    mood: Optional[str]
-    fetched_at: float
-
-    def is_expired(self, ttl_seconds: float) -> bool:
-        return (time.time() - self.fetched_at) > ttl_seconds
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, payload: Dict[str, Any]) -> "MoodVectorEntry":
-        return cls(
-            energy=float(payload.get("energy", 0.0) or 0.0),
-            valence=float(payload.get("valence", 0.0) or 0.0),
-            tempo=float(payload.get("tempo", 0.0) or 0.0),
-            confidence=float(payload.get("confidence", 0.0) or 0.0),
-            mood=(str(payload["mood"]).strip() if payload.get("mood") else None),
-            fetched_at=float(payload.get("fetched_at", 0.0)),
-        )
-
-
-@dataclass
 class CollaborativeSnapshot:
     embeddings: Dict[str, List[float]]
     trained_at: float
@@ -311,7 +509,6 @@ class CacheManager:
         mapping_ttl_days: int = 360,
         enrichment_ttl_days: int = 180,
         parsing_ttl_days: int = 120,
-        mood_ttl_days: int = 180,
     ) -> None:
         self._cache_dir = Path(cache_dir)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -319,21 +516,20 @@ class CacheManager:
         self._mapping_ttl = mapping_ttl_days * _SECONDS_PER_DAY
         self._enrichment_ttl = enrichment_ttl_days * _SECONDS_PER_DAY
         self._parsing_ttl = parsing_ttl_days * _SECONDS_PER_DAY
-        self._mood_ttl = mood_ttl_days * _SECONDS_PER_DAY
 
         self._mapping_file = self._cache_dir / "mappings_v2.json"
         self._enrichment_file = self._cache_dir / "enrichment_v2.json"
         self._parsing_file = self._cache_dir / "parsing_v2.json"
-        self._mood_file = self._cache_dir / "mood_vectors_v2.json"
         self._collab_file = self._cache_dir / "collaborative_embeddings.json"
+        self._ingest_queue_file = self._cache_dir / "analysis_queue.json"
 
         self._mapping_cache = self._load_map(self._mapping_file, MappingEntry)
         self._enrichment_cache = self._load_map(self._enrichment_file, EnrichmentEntry)
         self._parsing_cache = self._load_map(self._parsing_file, ParsingEntry)
-        self._mood_cache = self._load_map(self._mood_file, MoodVectorEntry)
         self._collaborative_snapshot = self._load_collaborative()
 
         self._lock = asyncio.Lock()
+        self._ingest_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Mapping cache
@@ -389,6 +585,10 @@ class CacheManager:
         async with self._lock:
             self._enrichment_cache[key] = entry
             self._save_map(self._enrichment_file, self._enrichment_cache)
+
+    async def delete_enrichment_entry(self, artist: str, title: str) -> None:
+        key = self._normalize_key(artist, title)
+        await self._delete_enrichment(key)
 
     async def _delete_enrichment(self, key: str) -> None:
         async with self._lock:
@@ -506,29 +706,6 @@ class CacheManager:
                 self._save_map(self._parsing_file, self._parsing_cache)
 
     # ------------------------------------------------------------------
-    # Mood vector cache
-    # ------------------------------------------------------------------
-    async def get_mood_vector(self, key_id: str) -> Optional[MoodVectorEntry]:
-        entry = self._mood_cache.get(key_id)
-        if not entry:
-            return None
-        if entry.is_expired(self._mood_ttl):
-            await self._delete_mood_vector(key_id)
-            return None
-        return entry
-
-    async def set_mood_vector(self, key_id: str, entry: MoodVectorEntry) -> None:
-        async with self._lock:
-            self._mood_cache[key_id] = entry
-            self._save_map(self._mood_file, self._mood_cache)
-
-    async def _delete_mood_vector(self, key_id: str) -> None:
-        async with self._lock:
-            if key_id in self._mood_cache:
-                self._mood_cache.pop(key_id, None)
-                self._save_map(self._mood_file, self._mood_cache)
-
-    # ------------------------------------------------------------------
     # Collaborative embeddings
     # ------------------------------------------------------------------
     async def get_collaborative_snapshot(self) -> Optional[CollaborativeSnapshot]:
@@ -568,11 +745,6 @@ class CacheManager:
             for key, entry in self._parsing_cache.items()
             if (now - entry.parsed_at) > self._parsing_ttl
         ]
-        stale_mood = [
-            key
-            for key, entry in self._mood_cache.items()
-            if (now - entry.fetched_at) > self._mood_ttl
-        ]
 
         for key in stale_map:
             await self._delete_mapping(key)
@@ -580,21 +752,89 @@ class CacheManager:
             await self._delete_enrichment(key)
         for key in stale_parsing:
             await self._delete_parsing(key)
-        for key in stale_mood:
-            await self._delete_mood_vector(key)
 
     def get_cache_stats(self) -> Dict[str, Any]:
         return {
             "mappings": len(self._mapping_cache),
             "enrichment": len(self._enrichment_cache),
             "parsing": len(self._parsing_cache),
-            "mood_vectors": len(self._mood_cache),
             "mapping_ttl_days": self._mapping_ttl / _SECONDS_PER_DAY,
             "enrichment_ttl_days": self._enrichment_ttl / _SECONDS_PER_DAY,
             "parsing_ttl_days": self._parsing_ttl / _SECONDS_PER_DAY,
-            "mood_ttl_days": self._mood_ttl / _SECONDS_PER_DAY,
             "collaborative_snapshot": bool(self._collaborative_snapshot),
         }
+
+    # ------------------------------------------------------------------
+    # Persistent ingest queue helpers
+    # ------------------------------------------------------------------
+    def load_ingest_queue_state(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Load pending/in-progress ingest jobs from disk."""
+
+        with self._ingest_lock:
+            if not self._ingest_queue_file.exists():
+                return {"pending": [], "in_progress": []}
+            try:
+                with self._ingest_queue_file.open("r", encoding="utf-8") as handle:
+                    raw_state = json.load(handle)
+            except (OSError, ValueError, TypeError):
+                return {"pending": [], "in_progress": []}
+
+        def _sanitize_list(payload: Any) -> List[Dict[str, Any]]:
+            cleaned: List[Dict[str, Any]] = []
+            if not isinstance(payload, list):
+                return cleaned
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                track_id = str(item.get("track_id", "")).strip()
+                youtube_url = str(item.get("youtube_url", "")).strip()
+                if not track_id or not youtube_url:
+                    continue
+                payload = {
+                    "track_id": track_id,
+                    "youtube_url": youtube_url,
+                    "attempts": int(item.get("attempts", 0) or 0),
+                    "enqueued_at": float(item.get("enqueued_at", time.time()) or time.time()),
+                    "last_error": item.get("last_error"),
+                }
+                preview_url = str(item.get("preview_url", "")).strip()
+                if preview_url:
+                    payload["preview_url"] = preview_url
+                try:
+                    preview_duration = item.get("preview_duration_ms")
+                    if preview_duration is not None:
+                        payload["preview_duration_ms"] = int(preview_duration)
+                except (TypeError, ValueError):
+                    pass
+                deezer_track_id = str(item.get("deezer_track_id", "")).strip()
+                if deezer_track_id:
+                    payload["deezer_track_id"] = deezer_track_id
+                cleaned.append(payload)
+            return cleaned
+
+        pending = _sanitize_list(raw_state.get("pending")) if isinstance(raw_state, dict) else []
+        in_progress = _sanitize_list(raw_state.get("in_progress")) if isinstance(raw_state, dict) else []
+        return {"pending": pending, "in_progress": in_progress}
+
+    def persist_ingest_queue_state(
+        self,
+        pending: List[Dict[str, Any]],
+        in_progress: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Persist ingest queue state for crash-safe recovery."""
+
+        payload = {
+            "pending": pending or [],
+            "in_progress": in_progress or [],
+            "saved_at": time.time(),
+        }
+        with self._ingest_lock:
+            self._save_json(self._ingest_queue_file, payload)
+
+    def clear_ingest_queue_state(self) -> None:
+        with self._ingest_lock:
+            if self._ingest_queue_file.exists():
+                self._ingest_queue_file.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # Internal persistence helpers

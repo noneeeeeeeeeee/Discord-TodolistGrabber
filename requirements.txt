@@ -7,3 +7,11 @@ beautifulsoup4
 tzdata
 pomice>=2.9.2,<3.0
 aiohttp
+
+# ==== V3 Audio Analysis (Librosa + EfficientAT MobileNet) ====
+librosa>=0.10.0
+torch>=2.2.0,<3.0
+torchaudio>=2.2.0,<3.0
+numpy
+scipy
+yt-dlp

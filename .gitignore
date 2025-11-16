@@ -14,3 +14,4 @@ lavalink_server/*
 modules/music/lavalink/logs
 modules/music/lavalink/plugins
 modules/music/lavalink/.lavalink-version.json
+dependencies

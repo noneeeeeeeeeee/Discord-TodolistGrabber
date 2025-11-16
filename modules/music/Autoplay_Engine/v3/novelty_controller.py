@@ -16,11 +16,12 @@ LOG = logging.getLogger(__name__)
 
 
 class ExplorationPhase(Enum):
-    """Current exploration phase for the session"""
-    STABLE = "stable"  # Low skip rate, stay in current cluster
+    """Current exploration phase for the session (Apple Music-inspired)"""
+    STABLE = "stable"  # Low skip rate, short session, stay in current cluster
+    PASSIVE_EXPLORATION = "passive_exploration"  # Long session, no skips, safe to diversify
     RISING_BOREDOM = "rising_boredom"  # Increasing skips, add variety
     HIGH_EXPLORATION = "high_exploration"  # Many skips, explore more
-    END_SESSION = "end_session"  # Long session, inject rediscovery
+    REDISCOVERY = "rediscovery"  # Time to return to roots
 
 
 @dataclass
@@ -41,38 +42,57 @@ class NoveltyConfig:
     stable_skip_threshold: float = 0.15  # <15% skips = stable
     boredom_skip_threshold: float = 0.35  # >35% skips = bored
     
-    # Rediscovery timing
+    # Time-based phase detection (Apple Music pattern)
+    passive_exploration_time: float = 15.0  # After 15 minutes, diversify even if no skips
     rediscovery_interval: int = 25  # Every N songs, try rediscovery
+    rediscovery_time: float = 30.0  # After 30 minutes, return to roots
     
-    # Candidate mixing proportions by phase
+    # Apple Music-inspired 5-slot buffer proportions by phase
     phase_proportions: Dict[ExplorationPhase, Dict[str, float]] = field(default_factory=dict)
     
     def __post_init__(self):
         if not self.phase_proportions:
+            # Apple Music-style 5-slot buffer:
+            # Slot 1: Core (familiar, high replay)
+            # Slot 2: Similar (same vibe, different artist)
+            # Slot 3: Bridge (mild novelty, transitional)
+            # Slot 4: Discovery (new vibe exploration)
+            # Slot 5: Safe Harbor (return to roots)
             self.phase_proportions = {
                 ExplorationPhase.STABLE: {
-                    "core": 0.70,
-                    "similar": 0.20,
-                    "novel": 0.10,
-                    "rediscover": 0.00,
+                    "core": 0.50,      # 50% - keep the flow going
+                    "similar": 0.30,   # 30% - same vibe, variety
+                    "bridge": 0.15,    # 15% - gentle transitions
+                    "discovery": 0.05, # 5% - minimal exploration
+                    "safe_harbor": 0.00,  # 0% - no rediscovery yet
+                },
+                ExplorationPhase.PASSIVE_EXPLORATION: {
+                    "core": 0.30,      # 30% - reduce core picks
+                    "similar": 0.25,   # 25% - maintain vibe
+                    "bridge": 0.25,    # 25% - more transitions
+                    "discovery": 0.20, # 20% - significant exploration
+                    "safe_harbor": 0.00,  # 0% - no rediscovery yet
                 },
                 ExplorationPhase.RISING_BOREDOM: {
-                    "core": 0.55,
-                    "similar": 0.30,
-                    "novel": 0.15,
-                    "rediscover": 0.00,
+                    "core": 0.35,      # 35% - some familiarity
+                    "similar": 0.25,   # 25% - maintain vibe
+                    "bridge": 0.20,    # 20% - transitions
+                    "discovery": 0.20, # 20% - exploration
+                    "safe_harbor": 0.00,  # 0% - no rediscovery yet
                 },
                 ExplorationPhase.HIGH_EXPLORATION: {
-                    "core": 0.40,
-                    "similar": 0.35,
-                    "novel": 0.25,
-                    "rediscover": 0.00,
+                    "core": 0.25,      # 25% - minimal familiarity
+                    "similar": 0.20,   # 20% - less vibe matching
+                    "bridge": 0.25,    # 25% - many transitions
+                    "discovery": 0.30, # 30% - heavy exploration
+                    "safe_harbor": 0.00,  # 0% - no rediscovery yet
                 },
-                ExplorationPhase.END_SESSION: {
-                    "core": 0.60,
-                    "similar": 0.20,
-                    "novel": 0.10,
-                    "rediscover": 0.10,
+                ExplorationPhase.REDISCOVERY: {
+                    "core": 0.40,      # 40% - back to familiarity
+                    "similar": 0.20,   # 20% - maintain vibe
+                    "bridge": 0.10,    # 10% - less transitions
+                    "discovery": 0.10, # 10% - minimal exploration
+                    "safe_harbor": 0.20,  # 20% - RETURN TO ROOTS
                 },
             }
 
@@ -153,27 +173,49 @@ class NoveltyController:
         """
         Detect current exploration phase based on session state.
         
+        Implements Apple Music-style time-based diversification:
+        - <15 min, no skips: STABLE (flow state, keep it going)
+        - >15 min, no skips: PASSIVE_EXPLORATION (safe to diversify)
+        - >30 min or N songs: REDISCOVERY (return to roots)
+        - High skips: HIGH_EXPLORATION (user is searching)
+        
+        This solves the "30-minute diversification" observation where
+        Apple Music gradually explores even with zero skips.
+        
         Args:
-            skip_rate: Recent skip rate
+            skip_rate: Recent skip rate (0.0-1.0)
             songs_since_novelty: Songs played since last novelty pick
             session_duration_minutes: Session length in minutes
             
         Returns:
             Current ExplorationPhase
         """
-        # Long session -> try rediscovery
-        if songs_since_novelty >= self.config.rediscovery_interval:
-            return ExplorationPhase.END_SESSION
+        # Priority 1: Rediscovery (time to return to roots)
+        if (songs_since_novelty >= self.config.rediscovery_interval or 
+            session_duration_minutes >= self.config.rediscovery_time):
+            return ExplorationPhase.REDISCOVERY
         
-        # High skip rate -> explore more
+        # Priority 2: High skip rate (user is actively searching)
         if skip_rate > self.config.boredom_skip_threshold:
             return ExplorationPhase.HIGH_EXPLORATION
         
-        # Rising skip rate -> add variety
+        # Priority 3: Rising skip rate (add variety)
         if skip_rate > self.config.stable_skip_threshold:
             return ExplorationPhase.RISING_BOREDOM
         
-        # Low skip rate -> stay stable
+        # Priority 4: Low skip rate - check time-based diversification
+        # This is the KEY insight: "no skips" means different things at different times
+        if skip_rate <= self.config.stable_skip_threshold:
+            if session_duration_minutes >= self.config.passive_exploration_time:
+                # PASSIVE_EXPLORATION: Long session, no skips = background listening
+                # Safe to gradually diversify (user isn't actively engaged)
+                return ExplorationPhase.PASSIVE_EXPLORATION
+            else:
+                # STABLE: Short session, no skips = flow state
+                # Keep the vibe tight, user is actively enjoying
+                return ExplorationPhase.STABLE
+        
+        # Fallback: stable
         return ExplorationPhase.STABLE
     
     def get_candidate_proportions(
@@ -181,24 +223,32 @@ class NoveltyController:
         phase: ExplorationPhase,
     ) -> dict:
         """
-        Get candidate mixing proportions for the current phase.
+        Get candidate mixing proportions for the current phase (Apple Music 5-slot buffer).
+        
+        Apple Music-style recommendation slots:
+        1. **Core**: Familiar tracks (high replay, liked artists)
+        2. **Similar**: Same vibe, different artists (maintain mood)
+        3. **Bridge**: Mild novelty, transitional tracks (smooth exploration)
+        4. **Discovery**: New vibe exploration (learning preferences)
+        5. **Safe Harbor**: Return to roots (replayed favorites)
         
         Args:
             phase: Current exploration phase
             
         Returns:
-            Dict with keys: core, similar, novel, rediscover (proportions sum to 1.0)
+            Dict with keys: core, similar, bridge, discovery, safe_harbor (proportions sum to 1.0)
         """
         proportions = self.config.phase_proportions[phase]
         
         if self._verbose >= 1:
             LOG.info(
-                "🎲 [Novelty] Phase '%s': core=%.0f%% similar=%.0f%% novel=%.0f%% rediscover=%.0f%%",
+                "🎲 [Novelty] Phase '%s': core=%.0f%% similar=%.0f%% bridge=%.0f%% discovery=%.0f%% safe_harbor=%.0f%%",
                 phase.value,
                 proportions["core"] * 100,
                 proportions["similar"] * 100,
-                proportions["novel"] * 100,
-                proportions["rediscover"] * 100,
+                proportions["bridge"] * 100,
+                proportions["discovery"] * 100,
+                proportions["safe_harbor"] * 100,
             )
         
         return proportions
@@ -206,22 +256,38 @@ class NoveltyController:
     def classify_candidate_by_distance(
         self,
         distance: float,
+        familiarity_score: float = 0.0,
     ) -> str:
         """
-        Classify a candidate as core/similar/novel based on embedding distance.
+        Classify a candidate into Apple Music-style 5-slot buffer categories.
+        
+        Categories:
+        - **core**: Very close (<0.25 distance) OR high familiarity (>0.7)
+        - **similar**: Close (0.25-0.50 distance) with moderate familiarity
+        - **bridge**: Mid-range (0.50-0.80 distance), transitional
+        - **discovery**: Far (>0.80 distance), exploration
+        - **safe_harbor**: High replay (familiarity >0.8), return to roots
         
         Args:
             distance: Embedding distance from current context (0.0 to 1.0+)
+            familiarity_score: Track familiarity (0.0-1.0, based on replays/likes)
             
         Returns:
-            Category: "core", "similar", "novel", or "rejected"
+            Category: "core", "similar", "bridge", "discovery", "safe_harbor", or "rejected"
         """
+        # Priority: Safe Harbor (highly familiar tracks)
+        if familiarity_score > 0.8:
+            return "safe_harbor"
+        
+        # Distance-based classification
         if distance <= self.config.same_cluster_threshold:
             return "core"
         elif distance <= self.config.similar_cluster_threshold:
             return "similar"
         elif distance <= self.config.mild_novelty_threshold:
-            return "novel"
+            return "bridge"
+        elif distance <= self.config.max_distance:
+            return "discovery"
         else:
             return "rejected"  # Too far, reject
     

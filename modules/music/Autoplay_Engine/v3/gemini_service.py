@@ -827,6 +827,19 @@ Return the BEST GUESS metadata for Last.fm scrobbling:
             daypart_affinity = record.get("daypart_affinity")
             mood_vector = record.get("mood_vector")
 
+            vibe_guess_raw = record.get("simple_vibe_guess") or record.get("vibe_guess")
+            vibe_guess: Optional[List[float]] = None
+            if isinstance(vibe_guess_raw, list):
+                cleaned: List[float] = []
+                for value in vibe_guess_raw[:5]:
+                    try:
+                        cleaned.append(max(0.0, min(1.0, float(value))))
+                    except (TypeError, ValueError):
+                        cleaned = []
+                        break
+                if len(cleaned) == 5:
+                    vibe_guess = cleaned
+
             payload_entry = {
                 "tags": tags if isinstance(tags, list) else [],
                 "moods": moods if isinstance(moods, list) else [],
@@ -845,6 +858,7 @@ Return the BEST GUESS metadata for Last.fm scrobbling:
                     str(daypart_affinity).strip() if daypart_affinity else None
                 ),
                 "mood_vector": mood_vector if isinstance(mood_vector, dict) else None,
+                "simple_vibe_guess": vibe_guess,
             }
             if track_id and track_id in unmatched:
                 result_map[track_id] = payload_entry
@@ -882,16 +896,13 @@ Return the BEST GUESS metadata for Last.fm scrobbling:
         instructions = (
             "You are enriching music metadata. Return JSON with a 'results' array. "
             "Each result must echo the input 'id' and include:\n"
-            "- 'tags' (list of canonical genres)\n"
-            "- 'moods' (up to 3 descriptive moods)\n"
+            "- 'tags' (list of canonical genres, e.g., ['pop', 'rock', 'electronic'])\n"
+            "- 'moods' (up to 3 descriptive moods, e.g., ['energetic', 'uplifting', 'danceable'])\n"
             "- 'energy' (single word: low, medium, high)\n"
-            "- 'mood_vector' (object with: energy (0-1), valence (0-1), tempo (0-1), confidence (0-1), mood (string))\n"
-            "- 'bpm' (estimated tempo in beats per minute, integer, or null if unknown)\n"
-            "- 'key' (musical key, e.g., 'C major', 'A minor', or null)\n"
-            "- 'activity_affinity' (best use case: 'workout', 'study', 'party', 'relaxation', 'driving', or null)\n"
-            "- 'emotional_intensity' (0.0 to 1.0, how emotionally intense the track feels)\n"
-            "- 'daypart_affinity' (when track fits best: 'morning', 'afternoon', 'evening', 'night', or null)\n"
-            f"{grounding_hint} If unsure, return empty arrays or null values."
+            "- 'mood' (single descriptive word for overall mood, e.g., 'happy', 'melancholic', 'intense')\n"
+            "- 'simple_vibe_guess' (5 floats between 0-1: [energy, valence, danceability, acousticness, brightness])\n"
+            f"{grounding_hint} If unsure, return empty arrays or null values.\n"
+            "Note: Audio features (tempo, key, loudness) are computed separately and should NOT be included."
         )
         return (
             f"{instructions}\n\n"

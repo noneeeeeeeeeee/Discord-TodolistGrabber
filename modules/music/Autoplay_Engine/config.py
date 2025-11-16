@@ -1,7 +1,7 @@
 """
 Autoplay Version Configuration
 
-Global autoplay engine version setting (V1 or V2).
+Global autoplay engine version setting.
 Set by bot owner in this file - changes require bot restart.
 """
 
@@ -10,14 +10,14 @@ from typing import Literal, Optional
 
 LOG = logging.getLogger(__name__)
 
-AutoplayVersion = Literal["v1", "v2", "v3"]
+AutoplayVersion = Literal["v1", "v3"]
 
 # ============================================================================
 # CONFIGURATION: Set your autoplay engine version here
 # ============================================================================
 # "v1" - Legacy engine (stable, no feedback buttons)
-# "v2" - New engine with adaptive feedback system (More Like This / Less Like This buttons)
-AUTOPLAY_VERSION: AutoplayVersion = "v2"
+# "v3" - Deezer-native ingest with EfficientAT MobileNet analyzer and adaptive feedback buttons
+AUTOPLAY_VERSION: AutoplayVersion = "v3"
 # ============================================================================
 
 
@@ -33,7 +33,7 @@ class AutoplayConfig:
         Get configured autoplay version (global setting)
         
         Returns:
-            "v1", "v2", or "v3"
+            "v1" or "v3"
         """
         return self._version
     
@@ -42,9 +42,9 @@ class AutoplayConfig:
         Check if current version supports More/Less Like This buttons
         
         Returns:
-            True for V2+, False for V1
+            True for V3, False for V1
         """
-        return self._version in ["v2", "v3"]
+        return self._version == "v3"
 
 
 # Global instance
@@ -64,20 +64,21 @@ def get_autoplay_engine(bot):
     Get the appropriate autoplay engine based on global configuration
     
     Returns:
-        LastFMAutoplay (V1) or LastFMAutoplayV2 instance
+        LastFMAutoplay (V1) or LastFMAutoplayV3 instance
     """
     config = get_autoplay_config()
     version = config.get_autoplay_version()
     
-    if version in ("v2"):
+    if version == "v3":
         try:
-            from .v2 import get_lastfm_autoplay_v2
+            from .v3 import get_lastfm_autoplay_v3
 
-            return get_lastfm_autoplay_v2(bot)
+            return get_lastfm_autoplay_v3(bot)
         except Exception:  # pragma: no cover - defensive fallback
             LOG.exception(
-                "Autoplay V2 failed to initialize, falling back to legacy engine"
+                "Autoplay V3 failed to initialize, falling back to legacy engine"
             )
+            version = "v1"
 
     from .v1.autoplayengine_v1 import get_lastfm_autoplay
 

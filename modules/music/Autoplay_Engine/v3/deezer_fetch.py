@@ -125,8 +125,79 @@ class DeezerClient:
             )
             return []
 
+        # Preprocess query to improve API search success rate
+        preprocessed_query = self._preprocess_search_query(query)
+        if preprocessed_query != query:
+            LOG.debug(f"🔧 Query preprocessing: '{query}' → '{preprocessed_query}'")
+
         async with self.semaphore:
-            return await self._search_with_retry(query, limit)
+            return await self._search_with_retry(preprocessed_query, limit)
+
+    def _preprocess_search_query(self, query: str) -> str:
+        """
+        Preprocess search query to improve Deezer API success rate.
+        
+        Simplifies queries by removing:
+        - Overly specific keywords that may not appear in Deezer titles
+        - Common noise words (soundtrack, OST, song, music, theme)
+        - Duplicate words
+        - Extra whitespace
+        
+        Args:
+            query: Raw search query
+            
+        Returns:
+            Simplified query more likely to find matches
+        """
+        if not query:
+            return ""
+        
+        # Start with lowercase for processing
+        processed = query.lower()
+        
+        # Remove noise words that don't help Deezer searches
+        noise_words = [
+            r'\b(soundtrack|ost|song|music|theme|audio|video|official|original)\b',
+            r'\b(opening|ending|op|ed)\b',
+            r'\b(cover|remix|acoustic|live|version)\b',
+            r'\b(ultimate|knockout)\b',  # Game-specific decorations
+        ]
+        for pattern in noise_words:
+            processed = re.sub(pattern, ' ', processed, flags=re.IGNORECASE)
+        
+        # Remove parenthetical content (often contains noise)
+        processed = re.sub(r'\([^)]*\)', ' ', processed)
+        processed = re.sub(r'\[[^\]]*\]', ' ', processed)
+        
+        # Remove pipe separators (take first part only)
+        if '|' in processed:
+            processed = processed.split('|')[0]
+        
+        # Remove years (often cause mismatches)
+        processed = re.sub(r'\b(19|20)\d{2}\b', ' ', processed)
+        
+        # Collapse multiple spaces
+        processed = ' '.join(processed.split())
+        
+        # Deduplicate consecutive words
+        words = processed.split()
+        seen = set()
+        deduped = []
+        for word in words:
+            if word.lower() not in seen:
+                seen.add(word.lower())
+                deduped.append(word)
+        
+        result = ' '.join(deduped).strip()
+        
+        # If we simplified too much (< 2 words), keep at least artist + partial title
+        if result and len(result.split()) < 2:
+            # Fall back to original query with minimal cleanup
+            fallback = ' '.join(query.split())
+            if len(fallback.split()) >= 2:
+                return fallback
+        
+        return result if result else query
 
     async def _search_with_retry(
         self,
@@ -262,6 +333,7 @@ class DeezerClient:
         expected_artist: Optional[str] = None,
         expected_title: Optional[str] = None,
         expected_duration_ms: Optional[int] = None,
+        relax_margin: float = 0.05,
     ) -> Optional[MatchResult]:
         """
         Find best matching track from search results using multi-factor scoring.
@@ -314,7 +386,13 @@ class DeezerClient:
                 f"duration={best_match.duration_match:.2f})"
             )
             return best_match
-        
+        if best_match and best_score >= threshold - relax_margin:
+            LOG.warning(
+                f"⚠️ Deezer match fell just below threshold ({best_score:.2f} < {threshold:.2f})"
+                f" but within relax margin ({relax_margin:.2f}); trusting best candidate."
+            )
+            return best_match
+
         LOG.debug(
             f"⚠️ No match above threshold {threshold:.2f} "
             f"(best={best_score:.2f})"
@@ -454,3 +532,56 @@ class DeezerClient:
         normalized = " ".join(normalized.split())
 
         return normalized.strip()
+    
+    async def get_track_details(self, track_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch detailed track information including BPM and gain.
+        
+        This provides acoustic features that can be used as fallback
+        when V3 audio analysis (Librosa+MobileNet) is unavailable.
+        
+        Args:
+            track_id: Deezer track ID
+            
+        Returns:
+            Dict with BPM and gain/loudness or None on failure
+        """
+        if not self.session:
+            LOG.error("❌ No aiohttp session available for track details")
+            return None
+        
+        url = f"{DEEZER_API_BASE}/track/{track_id}"
+        
+        async with self.semaphore:
+            try:
+                timeout = aiohttp.ClientTimeout(total=self.timeout)
+                
+                async with self.session.get(url, timeout=timeout) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        # Extract acoustic features
+                        bpm = float(data.get("bpm", 0) or 0)
+                        gain = float(data.get("gain", 0) or 0)
+                        
+                        LOG.debug(
+                            f"✅ Deezer track details for {track_id}: "
+                            f"BPM={bpm}, gain={gain}dB"
+                        )
+                        
+                        return {
+                            "bpm": bpm,
+                            "gain": gain,
+                            "duration_ms": int(data.get("duration", 0) * 1000),
+                        }
+                    else:
+                        LOG.debug(f"⚠️ Deezer track details failed: HTTP {response.status}")
+                        return None
+                        
+            except asyncio.TimeoutError:
+                LOG.debug(f"⏱️ Deezer track details timeout for {track_id}")
+                return None
+            except Exception as exc:
+                LOG.debug(f"❌ Deezer track details error: {exc}")
+                return None
+
