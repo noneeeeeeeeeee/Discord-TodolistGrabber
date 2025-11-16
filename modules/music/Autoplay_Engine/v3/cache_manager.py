@@ -269,16 +269,6 @@ class EnrichmentEntry:
 
         return self._clamp01(instrumentalness)
 
-    # DEPRECATED: Vector synthesis removed - V3 audio analysis only
-    # computed_vibe_vector, computed_embedding, computed_simple_vibe can be None if:
-    # 1. V3 audio analysis hasn't run yet (background job pending)
-    # 2. No youtube_id available (cannot analyze audio)
-    # Recommendation system must handle None gracefully (use collaborative filtering fallback)
-    #
-    # def ensure_vibe_vector(self) -> None:
-    #     """DEPRECATED - DO NOT USE. Vectors must come from V3 audio analysis."""
-    #     pass
-
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "EnrichmentEntry":
         tags_raw = payload.get("tags") or []

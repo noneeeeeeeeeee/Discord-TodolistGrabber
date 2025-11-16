@@ -15,6 +15,10 @@ Modern Discord bot for homework tracking and utility modules with an advanced mu
 4. (Optional, but recommended) Download the EfficientAT MobileNet checkpoint for the V3 audio analysis pipeline:
 
    ```powershell
+   # new consolidated helper (preferred)
+   python -m modules.music.Autoplay_Engine.v3.dependency_manager --model mn10_as --set-env
+
+   # backward-compatible shim (still works and simply forwards to the helper above)
    python -m modules.music.Autoplay_Engine.v3.mobilenet_setup --model mn10_as --set-env
    ```
 

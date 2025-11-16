@@ -1,10 +1,7 @@
 import asyncio
-import hashlib
 import json
 import logging
-import os
 import random
-import secrets
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -75,7 +72,6 @@ class FeedbackManager:
         *,
         retention_days: int = 365,
         global_buffer_size: int = 4096,
-        salt: Optional[str] = None,
     ) -> None:
         self._cache_dir = Path(cache_dir)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -94,7 +90,6 @@ class FeedbackManager:
         # Track active sessions per guild
         self._active_sessions: Dict[str, str] = {}  # guild_id -> session_id
 
-        self._salt = self._resolve_salt(salt)
         self._io_lock = asyncio.Lock()
 
     async def record_event(
@@ -229,20 +224,6 @@ class FeedbackManager:
                 break
         return results
 
-    def set_guild_opt_out(self, guild_id: int | str, enabled: bool) -> None:
-        """Deprecated: Session-based telemetry doesn't need opt-out."""
-        LOG.warning(
-            "set_guild_opt_out is deprecated - telemetry is now session-based per guild"
-        )
-        pass
-
-    def set_user_opt_out(self, user_id: int | str, enabled: bool) -> None:
-        """Deprecated: Session-based telemetry doesn't track users."""
-        LOG.warning(
-            "set_user_opt_out is deprecated - telemetry is now session-based per guild"
-        )
-        pass
-
     def get_buffer_stats(self) -> Dict[str, Any]:
         cutoff = time.time() - self._retention_window
         self._purge_buffer(self._global_buffer, cutoff)
@@ -292,38 +273,6 @@ class FeedbackManager:
         while buffer and buffer[0].timestamp < cutoff:
             buffer.popleft()
 
-    def _resolve_salt(self, provided: Optional[str]) -> bytes:
-        """Deprecated: Salt no longer used for genre-based telemetry."""
-        if provided:
-            return provided.encode("utf-8")
-
-        env_value = os.getenv("AUTOPLAY_HASH_SALT")
-        if env_value:
-            return env_value.encode("utf-8")
-
-        salt_file = self._telemetry_dir / "salt.txt"
-        if salt_file.exists():
-            try:
-                data = salt_file.read_text(encoding="utf-8").strip()
-                if data:
-                    return data.encode("utf-8")
-            except OSError:
-                pass
-
-        generated = secrets.token_hex(16)
-        try:
-            salt_file.write_text(generated, encoding="utf-8")
-        except OSError:
-            LOG.debug("Failed to persist telemetry salt; falling back to memory only")
-        return generated.encode("utf-8")
-
-    def _hash_identifier(self, value: Optional[int | str]) -> str:
-        """Deprecated: No longer hashes guild/user IDs."""
-        if value is None:
-            return "anon"
-        raw = str(value).encode("utf-8")
-        digest = hashlib.sha256(self._salt + raw).hexdigest()
-        return digest
 
 
 __all__ = ["FeedbackManager", "TelemetryEvent"]

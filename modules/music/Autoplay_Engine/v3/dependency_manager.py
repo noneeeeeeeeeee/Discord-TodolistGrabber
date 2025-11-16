@@ -7,17 +7,19 @@ bot startup does not block on download latency.
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import platform
 import shutil
+import sys
 import tarfile
 import tempfile
 import threading
 import time
 import zipfile
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 from urllib.request import urlopen
 
 LOG = logging.getLogger(__name__)
@@ -40,8 +42,12 @@ _MOBILENET_MODELS: Dict[str, Dict[str, str]] = {
     "mn10_as": {
         "filename": "mn10_as_mAP_471.pt",
         "url": "https://github.com/fschmid56/EfficientAT/releases/download/v0.0.1/mn10_as_mAP_471.pt",
+        "label": "EfficientAT MobileNetV3 Large (mn10_as, 527 logits)",
+        "embedding_model": "mn10_as",
     }
 }
+
+_MODEL_BUFFER_SIZE = 1024 * 1024  # 1 MiB
 
 
 class DependencyManager:
@@ -133,6 +139,94 @@ def get_model_directory() -> Path:
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
     return _MODEL_DIR
 
+
+def list_available_models() -> Dict[str, Dict[str, str]]:
+    """Return a copy of the supported EfficientAT MobileNet definitions."""
+    return {key: dict(info) for key, info in _MOBILENET_MODELS.items()}
+
+
+def download_mobilenet_checkpoint(
+    model_key: str,
+    *,
+    force: bool = False,
+    show_progress: bool = True,
+) -> Path:
+    """Download a MobileNet checkpoint with optional progress output."""
+    info = _MOBILENET_MODELS.get(model_key)
+    if not info:
+        raise ValueError(f"Unknown model key '{model_key}'")
+
+    destination = get_model_directory() / info["filename"]
+    if destination.exists() and not force:
+        if show_progress:
+            print(f"✅ {destination.name} already exists. Use --force to re-download.")
+        return destination
+
+    tmp_path = destination.with_suffix(destination.suffix + ".partial")
+    downloaded = 0
+    total = 0
+    try:
+        with urlopen(info["url"], timeout=_DOWNLOAD_TIMEOUT) as response, open(
+            tmp_path, "wb"
+        ) as fh:
+            length = response.headers.get("Content-Length")
+            total = int(length) if length and length.isdigit() else 0
+            while True:
+                chunk = response.read(_MODEL_BUFFER_SIZE)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                downloaded += len(chunk)
+                if show_progress and total:
+                    percent = downloaded / total * 100
+                    print(
+                        f"\r⬇️  Downloading {destination.name}: {percent:5.1f}%",
+                        end="",
+                        flush=True,
+                    )
+        if show_progress and total:
+            print()
+        tmp_path.replace(destination)
+    except Exception as exc:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise RuntimeError(f"Failed to download {info['filename']}: {exc}") from exc
+
+    LOG.info("✅ Saved MobileNet checkpoint to %s", destination)
+    return destination
+
+
+def _repo_root() -> Path:
+    """Return the repository root to locate the .env file."""
+    return Path(__file__).resolve().parents[4]
+
+
+def update_embedding_model_env(
+    embedding_model: str,
+    *,
+    env_path: Optional[Path] = None,
+) -> bool:
+    """Update (or append) the EMBEDDING_MODEL entry inside .env."""
+    env_file = env_path or (_repo_root() / ".env")
+    if not env_file.exists():
+        LOG.warning("⚠️ .env file not found at %s", env_file)
+        return False
+
+    lines = env_file.read_text().splitlines()
+    target_line = f"EMBEDDING_MODEL={embedding_model}"
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("EMBEDDING_MODEL="):
+            lines[idx] = target_line
+            break
+    else:
+        lines.append(target_line)
+
+    env_file.write_text("\n".join(lines) + "\n")
+    LOG.info("📝 Updated %s -> %s", env_file.name, target_line)
+    return True
 
 def _detect_existing_in_path() -> Optional[Path]:
     ffmpeg = shutil.which("ffmpeg")
@@ -284,6 +378,10 @@ __all__ = [
     "get_ffmpeg_bin_dir",
     "ensure_model_file",
     "get_model_directory",
+    "list_available_models",
+    "download_mobilenet_checkpoint",
+    "update_embedding_model_env",
+    "run_mobilenet_cli",
 ]
 
 
@@ -491,10 +589,56 @@ def _safe_extract_tar(tf: tarfile.TarFile, destination: Path) -> None:
     tf.extractall(destination)
 
 
-__all__ = [
-    "ensure_ffmpeg_binaries",
-    "wait_for_ffmpeg",
-    "get_ffmpeg_bin_dir",
-    "ensure_model_file",
-    "get_model_directory",
-]
+def _parse_mobilenet_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download EfficientAT MobileNet checkpoints for Autoplay V3",
+    )
+    parser.add_argument(
+        "--model",
+        choices=list(_MOBILENET_MODELS.keys()),
+        default="mn10_as",
+        help="Checkpoint to download",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download even if the file already exists",
+    )
+    parser.add_argument(
+        "--set-env",
+        action="store_true",
+        help="Update .env with the selected embedding model",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List available models and exit",
+    )
+    return parser.parse_args(argv)
+
+
+def run_mobilenet_cli(argv: Sequence[str] | None = None) -> int:
+    args = _parse_mobilenet_args(argv)
+
+    if args.list:
+        print("Available checkpoints:")
+        for key, info in list_available_models().items():
+            label = info.get("label", info["filename"])
+            print(f"  {key:8s} -> {label} ({info['filename']})")
+        return 0
+
+    model_key = args.model
+    info = _MOBILENET_MODELS[model_key]
+    print(f"🚀 Preparing to download {info.get('label', info['filename'])}...")
+    destination = download_mobilenet_checkpoint(model_key, force=args.force)
+    if args.set_env:
+        updated = update_embedding_model_env(info.get("embedding_model", model_key))
+        if not updated:
+            print("⚠️ .env file not updated (see logs for details)")
+    print("All done! Restart the bot to pick up the new checkpoint.")
+    print(f"Checkpoint stored at: {destination}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - manual helper
+    raise SystemExit(run_mobilenet_cli(sys.argv[1:]))

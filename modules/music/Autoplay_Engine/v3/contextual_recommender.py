@@ -69,13 +69,8 @@ class CandidateFeatures:
     # Non-ML Mode: Simplified 5D vibe (Librosa-only)
     computed_simple_vibe: Optional[Sequence[float]] = None  # [energy, valence, danceability, acousticness, brightness]
     
-    # V2 Architecture (DEPRECATED - kept for backward compatibility)
-    mood_vector: Optional[Sequence[float]] = None  # Legacy 5D vibe vector (Gemini fallback)
-    mood_label: Optional[str] = None
-    
     # Phase 3: Enhanced scoring fields
     genres: Optional[List[str]] = None  # For genre coherence scoring
-    energy: Optional[float] = None  # DEPRECATED: Use computed_loudness instead
     
     # FLOW VECTOR (4D): For DJ-quality transitions (always computed)
     computed_loudness: Optional[float] = None  # Loudness in dB (e.g., -5.883)
@@ -174,82 +169,52 @@ class ContextualRecommender:
             mood_distance_liked = None
             mood_distance_disliked = None
             
-            # Determine which vibe representation to use
             candidate_vibe = None
             use_ml_mode = False
             use_nonml_mode = False
             
-            # Priority 1: ML Mode - Use computed_embedding (512D-2048D)
             if candidate.computed_embedding and len(candidate.computed_embedding) > 0:
                 candidate_vibe = candidate.computed_embedding
                 use_ml_mode = True
-            
-            # Priority 2: Non-ML Mode - Use computed_simple_vibe (5D)
             elif candidate.computed_simple_vibe and len(candidate.computed_simple_vibe) == 5:
                 candidate_vibe = candidate.computed_simple_vibe
                 use_nonml_mode = True
-            
-            # Priority 3: V2 Legacy - Use mood_vector (deprecated, Gemini fallback)
-            elif candidate.mood_vector:
-                # Detect if mood_vector is 5D (legacy analyzer) or 4D (Gemini)
-                if len(candidate.mood_vector) == 5:
-                    candidate_vibe = candidate.mood_vector
-                elif len(candidate.mood_vector) == 4:
-                    # Legacy Gemini mood vector (4D: energy, valence, tempo, confidence)
-                    # Extract first 2 dimensions (energy, valence) and pad with defaults
-                    candidate_vibe = list(candidate.mood_vector[:2]) + [0.5, 0.5, 0.5]
 
-            # Compute mood alignment using appropriate similarity scorer
             if session_vector and candidate_vibe:
                 if use_ml_mode:
-                    # ML Mode: Cosine similarity on high-dimensional embeddings
                     similarity_score = self._embedding_similarity(session_vector, candidate_vibe)
-                    mood_distance_avg = 1.0 - similarity_score  # Convert similarity to distance
+                    mood_distance_avg = 1.0 - similarity_score
                 elif use_nonml_mode:
-                    # Non-ML Mode: Euclidean distance on 5D simple vibe
                     similarity_score = self._simple_vibe_similarity(session_vector, candidate_vibe)
                     mood_distance_avg = 1.0 - similarity_score
-                else:
-                    # V2 Legacy: Euclidean distance (deprecated)
-                    mood_distance_avg = self._mood_distance(session_vector, candidate_vibe)
+            elif session_vector:
+                mood_alignment = 0.5
 
-            if liked_vector and candidate_vibe:
+            if session_vector and candidate_vibe and liked_vector:
                 if use_ml_mode:
                     liked_similarity = self._embedding_similarity(liked_vector, candidate_vibe)
                     mood_distance_liked = 1.0 - liked_similarity
                 elif use_nonml_mode:
                     liked_similarity = self._simple_vibe_similarity(liked_vector, candidate_vibe)
                     mood_distance_liked = 1.0 - liked_similarity
-                else:
-                    mood_distance_liked = self._mood_distance(liked_vector, candidate_vibe)
-                    liked_similarity = 1.0 - mood_distance_liked  # 1.0 = very close to liked
 
-            if disliked_vector and candidate_vibe:
+            if session_vector and candidate_vibe and disliked_vector:
                 if use_ml_mode:
                     disliked_similarity_score = self._embedding_similarity(disliked_vector, candidate_vibe)
-                    disliked_similarity = disliked_similarity_score  # Higher = closer to disliked (BAD!)
+                    disliked_similarity = disliked_similarity_score
                     mood_distance_disliked = 1.0 - disliked_similarity_score
                 elif use_nonml_mode:
                     disliked_similarity_score = self._simple_vibe_similarity(disliked_vector, candidate_vibe)
                     disliked_similarity = disliked_similarity_score
                     mood_distance_disliked = 1.0 - disliked_similarity_score
-                else:
-                    mood_distance_disliked = self._mood_distance(disliked_vector, candidate_vibe)
-                    disliked_similarity = 1.0 - mood_distance_disliked  # 1.0 = very close to disliked (BAD!)
 
-            # NEW: Push/Pull formula
-            # Highly reward closeness to LIKED songs (70% weight)
-            # Highly penalize closeness to DISLIKED songs (30% weight)
             if mood_distance_liked is not None and mood_distance_disliked is not None:
                 mood_alignment = (0.7 * liked_similarity) - (0.3 * disliked_similarity)
-                # Rescale from [-0.3, 0.7] to [0.0, 1.0]
                 mood_alignment = (mood_alignment + 0.3) / 1.0
                 mood_alignment = self._clamp01(mood_alignment)
             elif mood_distance_liked is not None:
-                # Only liked vector available - pure pull
                 mood_alignment = self._clamp01(liked_similarity)
             elif mood_distance_avg is not None:
-                # Fallback to session average
                 mood_alignment = self._clamp01(1.0 - mood_distance_avg)
 
             novelty_term = novelty
