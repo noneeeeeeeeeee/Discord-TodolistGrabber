@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from collections import deque
 from modules.enviromentfilegenerator import check_and_load_env_file
 from .cache_manager import CacheManager, EnrichmentEntry, ParsingEntry
@@ -82,6 +84,9 @@ class AutoplayEngineV3:
     ) -> None:
         cache_path = Path(cache_dir)
         self._cache = CacheManager(cache_path)
+        self._preview_metadata_cache: Dict[str, Dict[str, Any]] = {}
+        self._preview_locks: Dict[str, asyncio.Lock] = {}
+        self._preview_cache_ttl = 3600.0  # seconds
         self._gemini = gemini_service or GeminiService(cache_dir=cache_path)
         self._feedback = feedback_manager or FeedbackManager(cache_dir=cache_path)
         self._collaborative = collaborative_matrix or CollaborativeMatrix(self._cache)
@@ -677,7 +682,16 @@ class AutoplayEngineV3:
         return True
     
 
-    def queue_audio_analysis(self, artist: str, title: str, youtube_id: str) -> bool:
+    def queue_audio_analysis(
+        self,
+        artist: str,
+        title: str,
+        youtube_id: str,
+        *,
+        preview_url: Optional[str] = None,
+        preview_duration_ms: Optional[int] = None,
+        deezer_track_id: Optional[str] = None,
+    ) -> bool:
         """Helper to enqueue analysis using a bare YouTube video ID."""
         if not youtube_id:
             return False
@@ -687,7 +701,100 @@ class AutoplayEngineV3:
         url = youtube_id
         if not youtube_id.startswith("http"):
             url = f"https://www.youtube.com/watch?v={youtube_id}"
-        return self.queue_analysis(track_id, url)
+        return self.queue_analysis(
+            track_id,
+            url,
+            preview_url=preview_url,
+            preview_duration_ms=preview_duration_ms,
+            deezer_track_id=deezer_track_id,
+        )
+
+    async def ensure_preview_metadata(
+        self,
+        artist: str,
+        title: str,
+        *,
+        youtube_id: Optional[str] = None,
+        expected_duration_ms: Optional[int] = None,
+    ) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+        """Resolve Deezer preview metadata for a track, caching results when possible."""
+
+        track_key = self._make_track_key(artist, title)
+        lock = self._preview_locks.get(track_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._preview_locks[track_key] = lock
+
+        async with lock:
+            mapping = await self._cache.get_mapping(artist, title)
+            preview_url = mapping.preview_url if mapping else None
+            preview_duration_ms = mapping.preview_duration_ms if mapping else None
+            deezer_track_id = mapping.deezer_track_id if mapping else None
+
+            if preview_url:
+                return preview_url, preview_duration_ms, deezer_track_id
+
+            cached = self._preview_metadata_cache.get(track_key)
+            if cached:
+                if time.time() - cached["timestamp"] <= self._preview_cache_ttl:
+                    return (
+                        cached.get("preview_url"),
+                        cached.get("preview_duration_ms"),
+                        cached.get("deezer_track_id") or deezer_track_id,
+                    )
+                self._preview_metadata_cache.pop(track_key, None)
+
+            if DeezerClient is None:
+                return preview_url, preview_duration_ms, deezer_track_id
+
+            lookup_duration = expected_duration_ms
+            if lookup_duration is None and mapping and mapping.duration_ms:
+                lookup_duration = mapping.duration_ms
+
+            try:
+                async with DeezerClient() as deezer_client:
+                    match = await deezer_client.find_track_by_metadata(
+                        artist=artist,
+                        title=title,
+                        expected_duration_ms=lookup_duration,
+                    )
+            except Exception as exc:
+                LOG.debug(
+                    "Deezer preview lookup failed for %s - %s (yt=%s): %s",
+                    artist,
+                    title,
+                    youtube_id or "unknown",
+                    exc,
+                )
+                return preview_url, preview_duration_ms, deezer_track_id
+
+            if not match:
+                return preview_url, preview_duration_ms, deezer_track_id
+
+            preview_url = match.track.preview_url or preview_url
+            preview_duration_ms = preview_duration_ms or match.track.duration_ms
+            deezer_track_id = match.track.id or deezer_track_id
+
+            if preview_url:
+                self._preview_metadata_cache[track_key] = {
+                    "preview_url": preview_url,
+                    "preview_duration_ms": preview_duration_ms,
+                    "deezer_track_id": deezer_track_id,
+                    "timestamp": time.time(),
+                }
+
+            if mapping and preview_url:
+                mapping.preview_url = preview_url
+                mapping.preview_duration_ms = preview_duration_ms
+                mapping.preview_fetched_at = time.time()
+                if deezer_track_id:
+                    mapping.deezer_track_id = deezer_track_id
+                await self._cache.set_mapping(artist, title, mapping)
+            elif mapping and deezer_track_id and not mapping.deezer_track_id:
+                mapping.deezer_track_id = deezer_track_id
+                await self._cache.set_mapping(artist, title, mapping)
+
+            return preview_url, preview_duration_ms, deezer_track_id
 
     async def refresh_ingest_queue(self, *, limit: Optional[int] = None) -> Dict[str, Any]:
         """Rebuild the ingest queue by scanning cache entries missing analysis."""

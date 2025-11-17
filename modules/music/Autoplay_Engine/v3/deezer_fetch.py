@@ -12,9 +12,10 @@ import asyncio
 import logging
 import re
 import time
-from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional
+from collections import OrderedDict
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -67,6 +68,8 @@ class DeezerClient:
         session: Optional[aiohttp.ClientSession] = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_concurrent: int = MAX_CONCURRENT_REQUESTS,
+        cache_ttl: float = 300.0,
+        cache_size: int = 128,
     ):
         """
         Initialize Deezer client.
@@ -80,6 +83,9 @@ class DeezerClient:
         self._owns_session = session is None
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self._cache_ttl = max(30.0, cache_ttl)
+        self._cache_size = max(8, cache_size)
+        self._result_cache: OrderedDict[str, Tuple[float, List[DeezerTrack]]] = OrderedDict()
         
         # Circuit breaker state
         self.consecutive_failures = 0
@@ -116,7 +122,21 @@ class DeezerClient:
         Returns:
             List of DeezerTrack objects
         """
-        # Check circuit breaker
+        # Preprocess query to improve API search success rate
+        preprocessed_query = self._preprocess_search_query(query)
+        if preprocessed_query != query:
+            LOG.debug(f"🔧 Query preprocessing: '{query}' → '{preprocessed_query}'")
+
+        cached = self._get_cached_results(preprocessed_query)
+        if cached is not None:
+            LOG.debug(
+                "♻️ Deezer cache hit: '%s' (%d results)",
+                preprocessed_query,
+                len(cached),
+            )
+            return cached
+
+        # Check circuit breaker after consulting cache so we can still serve warm data
         if time.time() < self.circuit_open_until:
             remaining = int(self.circuit_open_until - time.time())
             LOG.warning(
@@ -124,11 +144,6 @@ class DeezerClient:
                 f"(retry in {remaining}s)"
             )
             return []
-
-        # Preprocess query to improve API search success rate
-        preprocessed_query = self._preprocess_search_query(query)
-        if preprocessed_query != query:
-            LOG.debug(f"🔧 Query preprocessing: '{query}' → '{preprocessed_query}'")
 
         async with self.semaphore:
             return await self._search_with_retry(preprocessed_query, limit)
@@ -235,6 +250,7 @@ class DeezerClient:
                     if response.status == 200:
                         data = await response.json()
                         tracks = self._parse_search_results(data)
+                        self._store_cached_results(query, tracks)
                         
                         # Reset circuit breaker on success
                         self.consecutive_failures = 0
@@ -398,6 +414,98 @@ class DeezerClient:
             f"(best={best_score:.2f})"
         )
         return None
+
+    async def find_track_by_metadata(
+        self,
+        *,
+        artist: str,
+        title: str,
+        expected_duration_ms: Optional[int] = None,
+        limit: int = 10,
+        threshold: float = 0.62,
+    ) -> Optional[MatchResult]:
+        """Run targeted searches using artist/title metadata and return best match."""
+
+        queries = self._generate_query_variants(artist, title)
+        fallback: Optional[MatchResult] = None
+        for query in queries:
+            results = await self.search_track(query, limit=limit)
+            if not results:
+                continue
+
+            match = self.get_best_match(
+                results,
+                threshold=threshold,
+                expected_artist=artist,
+                expected_title=title,
+                expected_duration_ms=expected_duration_ms,
+                relax_margin=0.2,
+            )
+
+            if not match:
+                continue
+
+            if match.track.preview_url:
+                return match
+
+            if fallback is None or match.confidence > fallback.confidence:
+                fallback = match
+
+        return fallback
+
+    def _get_cached_results(self, query: str) -> Optional[List[DeezerTrack]]:
+        key = query.lower().strip()
+        entry = self._result_cache.get(key)
+        if not entry:
+            return None
+        timestamp, results = entry
+        if time.time() - timestamp > self._cache_ttl:
+            self._result_cache.pop(key, None)
+            return None
+        self._result_cache.move_to_end(key)
+        return list(results)
+
+    def _store_cached_results(self, query: str, results: List[DeezerTrack]) -> None:
+        key = query.lower().strip()
+        self._result_cache[key] = (time.time(), list(results))
+        self._result_cache.move_to_end(key)
+        while len(self._result_cache) > self._cache_size:
+            self._result_cache.popitem(last=False)
+
+    def _generate_query_variants(self, artist: str, title: str) -> List[str]:
+        """Build a prioritized list of Deezer queries using artist/title clues."""
+
+        components = []
+        artist = (artist or "").strip()
+        title = (title or "").strip()
+        normalized_artist = self.normalize_music_title(artist)
+        normalized_title = self.normalize_music_title(title)
+
+        combos = [
+            f"{artist} {title}".strip(),
+            f"{title} {artist}".strip(),
+            f"{normalized_artist} {normalized_title}".strip(),
+            title,
+            normalized_title,
+            artist,
+            normalized_artist,
+        ]
+
+        seen = set()
+        for combo in combos:
+            combo = combo.strip()
+            if not combo:
+                continue
+            processed = self._preprocess_search_query(combo)
+            if not processed:
+                continue
+            key = processed.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            components.append(processed)
+
+        return components
 
     def _calculate_match_confidence(
         self,

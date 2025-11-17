@@ -68,6 +68,9 @@ class CandidateFeatures:
     
     # Non-ML Mode: Simplified 5D vibe (Librosa-only)
     computed_simple_vibe: Optional[Sequence[float]] = None  # [energy, valence, danceability, acousticness, brightness]
+    mood_vector: Optional[Sequence[float]] = None  # Legacy V2 vibe vector
+    mood_label: Optional[str] = None  # Text label (e.g., "energetic")
+    energy: Optional[float] = None  # Normalized energy (0.0-1.0)
     
     # Phase 3: Enhanced scoring fields
     genres: Optional[List[str]] = None  # For genre coherence scoring

@@ -407,44 +407,10 @@ def get_ffmpeg_bin_dir() -> Optional[Path]:
     return _detect_existing_in_path() or _detect_local_bundle()
 
 
-def ensure_model_file(model_key: str, *, force: bool = False) -> Optional[Path]:
-    """Ensure a MobileNet checkpoint exists locally and return the path."""
-    info = _MOBILENET_MODELS.get(model_key)
-    if not info:
-        LOG.error("Unknown model key '%s'", model_key)
-        return None
-
-
 def get_model_directory() -> Path:
     """Return the directory where ML checkpoints are stored."""
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
     return _MODEL_DIR
-
-    try:
-        _MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        LOG.warning("Unable to prepare model directory %s: %s", _MODEL_DIR, exc)
-        return None
-
-    destination = _MODEL_DIR / info["filename"]
-    if destination.exists() and not force:
-        return destination
-
-    tmp_path = destination.with_suffix(destination.suffix + ".partial")
-    try:
-        _download_file(info["url"], tmp_path)
-        tmp_path.replace(destination)
-        LOG.info("✅ Saved MobileNet checkpoint to %s", destination)
-        return destination
-    except Exception as exc:  # pragma: no cover - network I/O
-        LOG.warning("Failed to download %s: %s", info["url"], exc)
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-        return None
-
 
 def _detect_existing_in_path() -> Optional[Path]:
     ffmpeg = shutil.which("ffmpeg")

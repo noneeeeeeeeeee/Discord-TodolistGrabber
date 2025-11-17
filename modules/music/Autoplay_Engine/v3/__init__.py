@@ -321,25 +321,65 @@ class LastFMAutoplayV3:
         if guild_id in self._recommendation_buffer:
             self._recommendation_buffer[guild_id].clear()
 
-    def _queue_analysis_for_track(self, artist: str, title: str, track_obj: Any) -> None:
-        """Extract YouTube identifier from ``track_obj`` and enqueue analysis."""
+    async def _queue_analysis_for_track(self, artist: str, title: str, track_obj: Any) -> None:
+        """Extract identifiers and enqueue analysis, preferring Deezer previews."""
         if not self._engine or not track_obj:
             return
+
         youtube_id = None
+        preview_url = None
+        preview_duration_ms = None
+        deezer_track_id = None
+        expected_duration_ms = None
+
         info = getattr(track_obj, "info", None)
         if isinstance(info, dict):
             youtube_id = info.get("identifier") or info.get("id")
+            preview_url = info.get("preview_url") or info.get("previewUrl")
+            preview_duration_ms = info.get("preview_duration_ms") or info.get("previewDurationMs")
+            deezer_track_id = info.get("deezer_track_id") or info.get("deezerTrackId")
+            duration_hint = info.get("length") or info.get("duration_ms")
+            try:
+                preview_duration_ms = int(preview_duration_ms) if preview_duration_ms else None
+            except (TypeError, ValueError):
+                preview_duration_ms = None
+            try:
+                expected_duration_ms = int(duration_hint) if duration_hint is not None else None
+            except (TypeError, ValueError):
+                expected_duration_ms = None
         if not youtube_id:
             youtube_id = getattr(track_obj, "identifier", None)
-        if youtube_id:
-            queued = self._engine.queue_audio_analysis(artist, title, youtube_id)
-            if queued and self._verbose >= 2:
-                LOG.debug(
-                    "🎛️ [Analysis Queue] Scheduled %s - %s for audio analysis (youtube_id=%s)",
-                    artist,
-                    title,
-                    youtube_id,
-                )
+
+        if not youtube_id:
+            return
+
+        if (not preview_url or not preview_duration_ms) and hasattr(self._engine, "ensure_preview_metadata"):
+            preview_url, preview_duration_ms, resolved_deezer_id = await self._engine.ensure_preview_metadata(
+                artist,
+                title,
+                youtube_id=youtube_id,
+                expected_duration_ms=expected_duration_ms,
+            )
+            if resolved_deezer_id and not deezer_track_id:
+                deezer_track_id = resolved_deezer_id
+
+        queued = self._engine.queue_audio_analysis(
+            artist,
+            title,
+            youtube_id,
+            preview_url=preview_url,
+            preview_duration_ms=preview_duration_ms,
+            deezer_track_id=deezer_track_id,
+        )
+        if queued and self._verbose >= 2:
+            source = "Deezer preview" if preview_url else "YouTube fallback"
+            LOG.debug(
+                "🎛️ [Analysis Queue] Scheduled %s - %s via %s (youtube_id=%s)",
+                artist,
+                title,
+                source,
+                youtube_id,
+            )
 
     async def _write_telemetry_event(self, event: AutoplayTelemetryEvent) -> None:
         """
@@ -870,7 +910,7 @@ class LastFMAutoplayV3:
                 )
                 
                 if track_obj:
-                    self._queue_analysis_for_track(meta["artist"], meta["title"], track_obj)
+                    await self._queue_analysis_for_track(meta["artist"], meta["title"], track_obj)
                     self._note_recommendation(guild_id, meta["artist"], meta["title"])
                     return [(prepared_candidate.features.track_id, track_obj)]
                 else:
@@ -900,7 +940,7 @@ class LastFMAutoplayV3:
                         )
                         
                         if track_obj:
-                            self._queue_analysis_for_track(meta["artist"], meta["title"], track_obj)
+                            await self._queue_analysis_for_track(meta["artist"], meta["title"], track_obj)
                             self._note_recommendation(guild_id, meta["artist"], meta["title"])
                             return [(prepared_candidate.features.track_id, track_obj)]
                 except asyncio.TimeoutError:
@@ -1172,7 +1212,7 @@ class LastFMAutoplayV3:
                     continue
 
                 # Track accepted after resolution
-                self._queue_analysis_for_track(meta["artist"], meta["title"], track_obj)
+                await self._queue_analysis_for_track(meta["artist"], meta["title"], track_obj)
                 self._note_recommendation(guild_id, meta["artist"], meta["title"])
                 results.append((selected_candidate.track_id, track_obj))
 
