@@ -183,6 +183,14 @@ class LastFMAutoplayV3:
         self._filling_task: Dict[int, Optional[asyncio.Task]] = {}
         self._buffer_fill_size = 5
 
+    def start(self) -> None:
+        """Start the autoplay engine background workers."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._engine.start_analysis_workers())
+        except RuntimeError:
+            LOG.warning("Could not start autoplay engine workers: No running event loop.")
+
     # ------------------------------------------------------------------
     # Internal helpers for context tracking (Issue #3)
     # ------------------------------------------------------------------
@@ -443,6 +451,10 @@ class LastFMAutoplayV3:
         Returns:
             True if session was cleared successfully.
         """
+        # Release ML session slot
+        if self._engine and hasattr(self._engine, "_session_manager"):
+            await self._engine._session_manager.release(guild_id)
+
         # Clear recent history
         self._recent_history.pop(guild_id, None)
 
@@ -803,6 +815,14 @@ class LastFMAutoplayV3:
         channel_name = str(track_info.get("author", "")).strip()
         expected_duration_ms = track_info.get("length")
         guild_id = int(track_info.get("guild_id", 0) or 0)
+
+        # V3 Session Management: Strict VIP Room
+        # Try to acquire ML session slot
+        has_ml_session = await self._engine._session_manager.acquire(guild_id)
+        if not has_ml_session:
+            if self._verbose:
+                LOG.info(f"🚫 Autoplay denied for guild {guild_id} (Capacity reached: 2/2)")
+            return []
 
         await self._engine.start_analysis_workers()
 
@@ -1274,6 +1294,57 @@ class LastFMAutoplayV3:
             if not self._collaborative_ready:
                 self._collaborative_ready = await self._engine.hydrate_collaborative()
 
+    async def _fetch_bootstrapped_pool(self) -> List[Dict[str, Any]]:
+        """
+        Fetch candidates from the bootstrapped charts.
+        Used when cache size < 50 (System Cold Start).
+        """
+        if self._engine._verbose:
+            LOG.info("🌱 [Progressive] Using Bootstrapped Charts strategy (< 50 cached tracks)")
+            
+        bootstrapped_keys = list(self._engine._bootstrap_manager._bootstrapped_tracks)
+        if not bootstrapped_keys:
+            if self._engine._verbose:
+                LOG.warning("🌱 [Progressive] No bootstrapped tracks available yet")
+            return []
+            
+        # Sample 50 tracks if we have more
+        selected_keys = random.sample(bootstrapped_keys, min(50, len(bootstrapped_keys)))
+        
+        pool = []
+        for key in selected_keys:
+            if "::" in key:
+                artist, title = key.split("::", 1)
+                pool.append({
+                    "title": title,
+                    "artist": artist,
+                    "pool_source": "bootstrapped_charts"
+                })
+        return pool
+
+    async def _fetch_collaborative_pool(self, seed_track_id: str) -> List[Dict[str, Any]]:
+        """
+        Fetch candidates from the Collaborative Matrix.
+        Used when cache size >= 200 (System Mature).
+        """
+        if self._engine._verbose:
+            LOG.info("🤝 [Progressive] Using Collaborative Filtering strategy (>= 200 cached tracks)")
+            
+        # Get similar tracks from matrix
+        similar = self._engine._collaborative.similar_tracks(seed_track_id, limit=50)
+        
+        pool = []
+        for track_id, score in similar:
+            if "::" in track_id:
+                artist, title = track_id.split("::", 1)
+                pool.append({
+                    "title": title,
+                    "artist": artist,
+                    "pool_source": "collaborative_matrix",
+                    "collaborative_score": score
+                })
+        return pool
+
     async def _fetch_candidate_records(
         self,
         *,
@@ -1313,82 +1384,103 @@ class LastFMAutoplayV3:
             LOG.warning("Last.fm API key missing; cannot fetch candidates")
             return []
 
+        # --- PROGRESSIVE LOGIC INJECTION ---
+        cached_count = 0
+        if hasattr(self._engine, "_cache") and hasattr(self._engine._cache, "_enrichment_cache"):
+             cached_count = len(self._engine._cache._enrichment_cache)
+
+        # Case 1: System Cold Start (< 50 tracks)
+        if cached_count < 50:
+             return await self._fetch_bootstrapped_pool()
+
+        # Case 3 Preparation: Hybrid (>= 200 tracks)
+        collaborative_pool = []
+        if cached_count >= 200:
+             seed_track_id = self._track_id(seed_artist, seed_title)
+             collaborative_pool = await self._fetch_collaborative_pool(seed_track_id)
+
         # Priority routing based on is_canonical flag
+        candidates = []
         if not is_canonical:
-            # Deezer failed to verify artist/title → use degraded genre-based pools
+            # STRICT: If Deezer failed to verify, we drop the track.
+            # No degraded pools.
             if self._verbose:
-                LOG.info(
-                    "🔻 [Degraded Path] Deezer verification failed for '%s', using genre-based pools",
+                LOG.warning(
+                    "🚫 [Strict Mode] Deezer verification failed for '%s'. Autoplay disabled for this track.",
                     seed_title,
                 )
-            return await self._fetch_degraded_pools(
-                seed_artist=seed_artist,
-                seed_title=seed_title,
-                context=context,
-            )
-
-        # OST branch detection (only when canonical)
-        is_ost = seed_track_type in {"ost", "game_soundtrack", "anime_opening"}
-        use_entity_branch = is_ost and seed_entity is not None
-
-        history = self._recent_history.get(guild_id, [])
-        history_size = len(history)
-
-        if use_entity_branch:
-            # Branch A: Entity-based fetch for OST content
-            entity_key = cast(str, seed_entity)
-            return await self._fetch_entity_based_pools(
-                seed_artist=seed_artist,
-                seed_title=seed_title,
-                seed_entity=entity_key,
-                context=context,
-                tracker=tracker,
-            )
-        elif history_size < 3:
-            # Branch A: Cold start
-            return await self._fetch_cold_start_pools(
-                seed_artist=seed_artist,
-                seed_title=seed_title,
-                context=context,
-            )
+            candidates = []
         else:
-            # V2.5+: Check exploration phase for Hot Pool vs Warm Pool
-            phase = self._novelty_controller.detect_exploration_phase(
-                skip_rate=context.skip_rate,
-                songs_since_novelty=context.songs_since_novelty,
-                session_duration_minutes=(context.last_activity - context.session_start) / 60,
-            )
-            
-            # Import ExplorationPhase for comparison
-            from .novelty_controller import ExplorationPhase
-            
-            if phase == ExplorationPhase.STABLE:
-                # Branch B: Hot Pool (user satisfied, low diversity)
-                if self._verbose:
-                    LOG.info(
-                        "🔥 [Branch B: Hot Pool] User in STABLE phase (skip_rate=%.1f%%), using high-familiarity pool",
-                        context.skip_rate * 100,
-                    )
-                return await self._fetch_hot_pool(
+            # OST branch detection (only when canonical)
+            is_ost = seed_track_type in {"ost", "game_soundtrack", "anime_opening"}
+            use_entity_branch = is_ost and seed_entity is not None
+
+            history = self._recent_history.get(guild_id, [])
+            history_size = len(history)
+
+            if use_entity_branch:
+                # Branch A: Entity-based fetch for OST content
+                entity_key = cast(str, seed_entity)
+                candidates = await self._fetch_entity_based_pools(
+                    seed_artist=seed_artist,
+                    seed_title=seed_title,
+                    seed_entity=entity_key,
+                    context=context,
+                    tracker=tracker,
+                )
+            elif history_size < 3:
+                # Branch A: Cold start
+                candidates = await self._fetch_cold_start_pools(
                     seed_artist=seed_artist,
                     seed_title=seed_title,
                     context=context,
-                    tracker=tracker,
                 )
             else:
-                # Branch C: Warm Pool (exploration/boredom, high diversity)
-                if self._verbose:
-                    LOG.info(
-                        "🌈 [Branch C: Warm Pool] User in %s phase (skip_rate=%.1f%%), using high-diversity pool",
-                        phase.value,
-                        context.skip_rate * 100,
-                    )
-                return await self._fetch_warm_start_pools(
-                    seed_artist=seed_artist,
-                    seed_title=seed_title,
-                    context=context,
-                    tracker=tracker,
+                # V2.5+: Check exploration phase for Hot Pool vs Warm Pool
+                phase = self._novelty_controller.detect_exploration_phase(
+                    skip_rate=context.skip_rate,
+                    songs_since_novelty=context.songs_since_novelty,
+                    session_duration_minutes=(context.last_activity - context.session_start) / 60,
                 )
+                
+                # Import ExplorationPhase for comparison
+                from .novelty_controller import ExplorationPhase
+                
+                if phase == ExplorationPhase.STABLE:
+                    # Branch B: Hot Pool (user satisfied, low diversity)
+                    if self._verbose:
+                        LOG.info(
+                            "🔥 [Branch B: Hot Pool] User in STABLE phase (skip_rate=%.1f%%), using high-familiarity pool",
+                            context.skip_rate * 100,
+                        )
+                    candidates = await self._fetch_hot_pool(
+                        seed_artist=seed_artist,
+                        seed_title=seed_title,
+                        context=context,
+                        tracker=tracker,
+                    )
+                else:
+                    # Branch C: Warm Pool (exploration/boredom, high diversity)
+                    if self._verbose:
+                        LOG.info(
+                            "🌈 [Branch C: Warm Pool] User in %s phase (skip_rate=%.1f%%), using high-diversity pool",
+                            phase.value,
+                            context.skip_rate * 100,
+                        )
+                    candidates = await self._fetch_warm_start_pools(
+                        seed_artist=seed_artist,
+                        seed_title=seed_title,
+                        context=context,
+                        tracker=tracker,
+                    )
+        
+        # Merge Collaborative Pool if available
+        if collaborative_pool:
+             if self._verbose:
+                 LOG.info("🤝 [Progressive] Merging %d collaborative candidates", len(collaborative_pool))
+             candidates.extend(collaborative_pool)
+             
+        return candidates
 
     async def _fetch_entity_based_pools(
         self,

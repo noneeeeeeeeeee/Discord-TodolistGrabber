@@ -18,6 +18,8 @@ from .dependency_manager import DependencyManager
 from .feedback_manager import FeedbackManager
 from .gemini_service import GeminiService
 from .track_resolver import TrackResolver
+from .session_manager import AutoplaySessionManager
+from .bootstrap_manager import BootstrapManager
 
 try:
     from .preview_fetcher import PreviewFetcher
@@ -83,6 +85,43 @@ class AutoplayEngineV3:
         analysis_workers: int = 3,  # Number of concurrent analysis workers
     ) -> None:
         cache_path = Path(cache_dir)
+        # instance verbosity (0 = off, 1 = debug, 2 = very verbose)
+        self._verbose = DEFAULT_VERBOSITY
+        if self._verbose:
+            # Configure logging for autoplay V3 modules only (not root logger)
+            autoplay_loggers = [
+                "modules.music.Autoplay_Engine.v3",
+                "modules.music.Autoplay_Engine.v3.autoplayengine_v3",
+                "modules.music.Autoplay_Engine.v3.gemini_service",
+                "modules.music.Autoplay_Engine.v3.cache_manager",
+                "modules.music.Autoplay_Engine.v3.context_tracker",
+                "modules.music.Autoplay_Engine.v3.contextual_recommender",
+                "modules.music.Autoplay_Engine.v3.feedback_manager",
+                "modules.music.Autoplay_Engine.v3.novelty_controller",
+                "modules.music.Autoplay_Engine.v3.track_resolver",
+            ]
+
+            # Add console handler to each autoplay logger if not present
+            for logger_name in autoplay_loggers:
+                logger = logging.getLogger(logger_name)
+                logger.setLevel(logging.DEBUG)
+
+                # Only add handler if this logger doesn't have one
+                if not logger.handlers:
+                    handler = logging.StreamHandler()
+                    handler.setLevel(logging.DEBUG)
+                    formatter = logging.Formatter(
+                        "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+                    )
+                    handler.setFormatter(formatter)
+                    logger.addHandler(handler)
+                    # Don't propagate to avoid duplicate logs
+                    logger.propagate = False
+
+            LOG.debug(
+                "[AutoplayV3] Verbosity enabled: level=%s (autoplay modules only)",
+                self._verbose,
+            )
         self._cache = CacheManager(cache_path)
         self._preview_metadata_cache: Dict[str, Dict[str, Any]] = {}
         self._preview_locks: Dict[str, asyncio.Lock] = {}
@@ -96,6 +135,13 @@ class AutoplayEngineV3:
         )
         self._lastfm_key = os.getenv(LASTFM_API_KEY_ENV, "").strip()
         
+        # Resource limiter: Max 2 concurrent ML sessions
+        max_sessions = int(os.getenv("AUTOPLAY_MAX_SESSIONS", "2"))
+        self._session_manager = AutoplaySessionManager(max_sessions=max_sessions)
+        
+        # Cold Start Bootstrapper
+        self._bootstrap_manager = BootstrapManager(self)
+
         # V3 Configuration: Use environment variables if not explicitly provided
         if analysis_mode is None:
             analysis_mode = DEFAULT_ANALYSIS_MODE
@@ -224,44 +270,6 @@ class AutoplayEngineV3:
         else:
             LOG.info("ℹ️ Audio analysis disabled (using Gemini estimates)")
 
-        # instance verbosity (0 = off, 1 = debug, 2 = very verbose)
-        self._verbose = DEFAULT_VERBOSITY
-        if self._verbose:
-            # Configure logging for autoplay V3 modules only (not root logger)
-            autoplay_loggers = [
-                "modules.music.Autoplay_Engine.v3",
-                "modules.music.Autoplay_Engine.v3.autoplayengine_v3",
-                "modules.music.Autoplay_Engine.v3.gemini_service",
-                "modules.music.Autoplay_Engine.v3.cache_manager",
-                "modules.music.Autoplay_Engine.v3.context_tracker",
-                "modules.music.Autoplay_Engine.v3.contextual_recommender",
-                "modules.music.Autoplay_Engine.v3.feedback_manager",
-                "modules.music.Autoplay_Engine.v3.novelty_controller",
-                "modules.music.Autoplay_Engine.v3.track_resolver",
-            ]
-
-            # Add console handler to each autoplay logger if not present
-            for logger_name in autoplay_loggers:
-                logger = logging.getLogger(logger_name)
-                logger.setLevel(logging.DEBUG)
-
-                # Only add handler if this logger doesn't have one
-                if not logger.handlers:
-                    handler = logging.StreamHandler()
-                    handler.setLevel(logging.DEBUG)
-                    formatter = logging.Formatter(
-                        "%(asctime)s %(levelname)s [%(name)s] %(message)s"
-                    )
-                    handler.setFormatter(formatter)
-                    logger.addHandler(handler)
-                    # Don't propagate to avoid duplicate logs
-                    logger.propagate = False
-
-            LOG.debug(
-                "[AutoplayV3] Verbosity enabled: level=%s (autoplay modules only)",
-                self._verbose,
-            )
-
         if not self._lastfm_key:
             LOG.warning(
                 "Last.fm API key missing. Populate LASTFM_API_KEY in .env (see modules/enviromentfilegenerator.py)."
@@ -271,6 +279,16 @@ class AutoplayEngineV3:
                 "Gemini unavailable during AutoplayEngineV3 init: %s",
                 self._gemini.status,
             )
+
+        # Eagerly start analysis workers if possible (Daydream mode)
+        if self._analyzer and self._analyzer.is_available():
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.start_analysis_workers())
+                LOG.info("🚀 Scheduled background analysis workers (Daydream mode)")
+            except RuntimeError:
+                # No running loop yet (e.g. during early init)
+                LOG.debug("⚠️ Could not start analysis workers in __init__ (no event loop)")
 
     # ------------------------------------------------------------------
     # Verbosity helpers
@@ -419,7 +437,7 @@ class AutoplayEngineV3:
                 youtube_url = job.get("youtube_url")
                 if not track_id or not youtube_url or track_id in seen:
                     continue
-                restored.append(self._build_analysis_job(track_id, youtube_url, job))
+                restored.append(self._build_analysis_job(track_id, youtube_url, overrides=job))
                 seen.add(track_id)
 
         for job in restored:
@@ -559,6 +577,10 @@ class AutoplayEngineV3:
         for i in range(self._analysis_worker_count):
             task = asyncio.create_task(self._analysis_worker_loop(worker_id=i))
             self._analysis_workers.append(task)
+            
+        # Start bootstrapper
+        if self._bootstrap_manager:
+            await self._bootstrap_manager.start()
         
     
     async def stop_analysis_workers(self) -> None:
@@ -568,6 +590,10 @@ class AutoplayEngineV3:
         
         LOG.info(f"🛑 Stopping {len(self._analysis_workers)} analysis workers...")
         self._analysis_shutdown = True
+        
+        # Stop bootstrapper
+        if self._bootstrap_manager:
+            await self._bootstrap_manager.stop()
         
         # Wait for workers to finish current jobs
         await asyncio.gather(*self._analysis_workers, return_exceptions=True)
@@ -871,6 +897,45 @@ class AutoplayEngineV3:
             "mapping_found": bool(mapping),
         }
     
+    async def _daydream_analysis(self) -> None:
+        """
+        When idle, proactively analyze popular/trending tracks.
+        """
+        # Strategy 1: Analyze tracks from collaborative matrix (high affinity)
+        try:
+            popular_tracks = await self._collaborative.get_popular_tracks(limit=50)
+            
+            for track_id in popular_tracks:
+                # Check if already analyzed
+                artist, title = self._split_track_key(track_id)
+                entry = await self._cache.get_enrichment(artist, title)
+                
+                needs_analysis = False
+                if not entry:
+                    needs_analysis = True
+                elif self._analysis_mode == "ml" and not entry.computed_embedding:
+                    needs_analysis = True
+                elif self._analysis_mode == "non-ml" and not entry.computed_simple_vibe:
+                    needs_analysis = True
+                
+                if needs_analysis:
+                    # Queue for analysis
+                    mapping = await self._cache.get_mapping(artist, title)
+                    youtube_url = mapping.url if mapping else None
+                    if not youtube_url and mapping and mapping.youtube_id:
+                        youtube_url = mapping.youtube_id
+                    
+                    if youtube_url:
+                        queued = self.queue_analysis(track_id, youtube_url)
+                        if queued:
+                            LOG.debug(f"💤 [Daydream] Queued {track_id} for background analysis")
+                            await asyncio.sleep(10)  # Rate limit: 1 track per 10s in daydream
+                            return  # Process one track per daydream cycle
+        except Exception as e:
+            LOG.debug(f"Daydream error: {e}")
+        
+        await asyncio.sleep(60)  # Daydream cooldown: 1 minute
+
     async def _analysis_worker_loop(self, worker_id: int) -> None:
         """Background worker that processes audio analysis queue (V3).
 
@@ -891,7 +956,8 @@ class AutoplayEngineV3:
                     break
                 # Check for work
                 if not self._analysis_queue:
-                    await asyncio.sleep(1)  # Idle wait
+                    # Priority 2: Daydream mode
+                    await self._daydream_analysis()
                     continue
                 
                 # Get next job
@@ -2003,11 +2069,11 @@ class AutoplayEngineV3:
                     grounding_status,
                 )
             
-            # Stage 3: Flash + Grounding + Thinking → Direct extraction (best_guess)
+            # Stage 3: Flash + Grounding + Thinking → Direct extraction + Verification
             if self._gemini.is_available and self._gemini.can_use_grounding():
                 self._log_verbose(
                     2,
-                    "🎯 [Stage 3: Fallback Extraction] Extracting metadata directly...",
+                    "🎯 [Stage 3: Extraction + Verification] Extracting metadata and verifying...",
                 )
                 
                 try:
@@ -2033,44 +2099,58 @@ class AutoplayEngineV3:
                             reasoning = fallback_response.get("reasoning", "N/A")
                             self._log_verbose(
                                 2,
-                                "✅ [Stage 3: SUCCESS] Extracted: %s - %s (track_type=%s, entity=%s)",
+                                "🤔 [Stage 3] Extracted: %s - %s. Verifying with Deezer...",
                                 artist,
                                 title,
-                                track_type,
-                                primary_entity or "N/A",
-                            )
-                            self._log_verbose(
-                                2,
-                                "🎯 [Stage 3] Reasoning: %s",
-                                reasoning,
-                                log_fn=LOG.debug,
                             )
                             
-                            # Cache as best_guess (7-day TTL)
-                            entry = ParsingEntry(
-                                artist=artist,
-                                title=title,
-                                confidence=0.65,  # Medium confidence for unverified
-                                parsed_at=time.time(),
-                                track_type=track_type,
-                                primary_entity=primary_entity,
-                                is_canonical=False,
-                                is_best_guess=True,
-                                retry_after_days=7,  # Retry after 7 days
-                                schema_version=PARSING_SCHEMA_VERSION,
+                            # STRICT VERIFICATION: Must match on Deezer
+                            # Construct a precise query based on extracted metadata
+                            query = f'artist:"{artist}" track:"{title}"'
+                            search_results = await deezer_client.search_track(query)
+                            match = deezer_client.get_best_match(
+                                search_results, 
+                                threshold=0.70, # Slightly lower threshold for exact extraction
+                                expected_title=youtube_title
                             )
-                            await self._cache.set_parsing(youtube_title, youtube_id, entry)
                             
-                            return {
-                                "artist": artist,
-                                "title": title,
-                                "confidence": 0.65,
-                                "track_type": track_type,
-                                "primary_entity": primary_entity,
-                                "is_canonical": False,
-                                "is_best_guess": True,
-                                "deezer_id": None,
-                            }
+                            if match:
+                                self._log_verbose(
+                                    2,
+                                    "✅ [Stage 3: SUCCESS] Verified: %s - %s (confidence=%.2f)",
+                                    match.track.artist,
+                                    match.track.title,
+                                    match.confidence,
+                                )
+                                
+                                # Cache as canonical (indefinite TTL)
+                                entry = ParsingEntry(
+                                    artist=match.track.artist,
+                                    title=match.track.title,
+                                    confidence=match.confidence,
+                                    parsed_at=time.time(),
+                                    track_type=track_type,
+                                    primary_entity=primary_entity,
+                                    is_canonical=True,
+                                    is_best_guess=False,
+                                    deezer_id=match.track.id,
+                                    schema_version=PARSING_SCHEMA_VERSION,
+                                )
+                                await self._cache.set_parsing(youtube_title, youtube_id, entry)
+                                
+                                return {
+                                    "artist": match.track.artist,
+                                    "title": match.track.title,
+                                    "confidence": match.confidence,
+                                    "track_type": track_type,
+                                    "primary_entity": primary_entity,
+                                    "is_canonical": True,
+                                    "is_best_guess": False,
+                                    "deezer_id": match.track.id,
+                                }
+                            else:
+                                LOG.warning(f"❌ [Stage 3: Strict] Extracted '{artist} - {title}' but failed Deezer verification. Dropping.")
+                                return None
                 
                 except Exception as exc:
                     LOG.warning(f"⚠️ [Stage 3: ERROR] Fallback extraction failed: {exc}")
@@ -2081,103 +2161,6 @@ class AutoplayEngineV3:
                     "⏭️ [Stage 3: SKIPPED] %s",
                     grounding_status,
                 )
-            
-            # Emergency: Regex fallback (retry after 1 day)
-            self._log_verbose(
-                2,
-                "🚨 [Emergency: Regex Fallback] All AI stages failed, using regex...",
-                log_fn=LOG.warning,
-            )
-            
-            # Simple regex to extract "Artist - Title" or "Title by Artist"
-            patterns = [
-                r"^(.+?)\s*[-:]\s*(.+?)(?:\s*\[.*\]|\s*\(.*\)|$)",  # "Artist - Title [...]" or "Artist: Title"
-                r"^(.+?)\s+by\s+(.+?)(?:\s*\[.*\]|\s*\(.*\)|$)",  # "Title by Artist"
-            ]
-            
-            # Words that commonly appear in titles but are not artist names
-            suspicious_artist_words = {
-                "song", "theme", "music", "soundtrack", "ost", "opening", "ending",
-                "cover", "remix", "version", "feat", "ft", "lyric", "lyrics",
-                "official", "audio", "video", "mv", "full"
-            }
-            
-            extracted_artist = None
-            extracted_title = None
-            
-            for pattern in patterns:
-                match = re.match(pattern, youtube_title, re.IGNORECASE)
-                if match:
-                    potential_artist = match.group(1).strip()
-                    potential_title = match.group(2).strip()
-                    
-                    if potential_artist and potential_title:
-                        # Check if the "artist" looks suspicious (likely part of title)
-                        artist_words = set(potential_artist.lower().split())
-                        is_suspicious = bool(artist_words & suspicious_artist_words)
-                        
-                        # Also check if artist is just a single common word
-                        if len(artist_words) == 1 and potential_artist.lower() in suspicious_artist_words:
-                            is_suspicious = True
-                        
-                        if is_suspicious:
-                            if self._verbose >= 2:
-                                LOG.debug(
-                                    f"🔍 [Regex] Rejected suspicious artist '{potential_artist}', "
-                                    f"using channel name as fallback"
-                                )
-                            # Use channel name as artist if available
-                            if channel_name:
-                                extracted_artist = channel_name
-                                # Clean the title by removing the suspicious part
-                                extracted_title = youtube_title.split(':', 1)[-1].split('-', 1)[-1].strip()
-                                if not extracted_title:
-                                    extracted_title = potential_title
-                            else:
-                                # No channel name available, skip this match
-                                extracted_artist = None
-                                extracted_title = None
-                        else:
-                            extracted_artist = potential_artist
-                            extracted_title = potential_title
-                        break
-            
-            # If regex found something valid, use it
-            if extracted_artist and extracted_title:
-                self._log_verbose(
-                    2,
-                    "🚨 [Emergency: Regex] Extracted: %s - %s (retry after 1 day)",
-                    extracted_artist,
-                    extracted_title,
-                    log_fn=LOG.warning,
-                )
-                
-                # Cache as fallback (1-day TTL for quota_exhausted)
-                entry = ParsingEntry(
-                    artist=extracted_artist,
-                    title=extracted_title,
-                    confidence=0.3,  # Low confidence for regex
-                    parsed_at=time.time(),
-                    track_type="music",
-                    primary_entity=None,
-                    is_canonical=False,
-                    is_best_guess=False,
-                    failure_reason="quota_exhausted",
-                    retry_after_days=1,  # Retry tomorrow when quota resets
-                    schema_version=PARSING_SCHEMA_VERSION,
-                )
-                await self._cache.set_parsing(youtube_title, youtube_id, entry)
-                
-                return {
-                    "artist": extracted_artist,
-                    "title": extracted_title,
-                    "confidence": 0.3,
-                    "track_type": "music",
-                    "primary_entity": None,
-                    "is_canonical": False,
-                    "is_best_guess": False,
-                    "deezer_id": None,
-                }
             
             # Total failure - return None
             LOG.error(f"❌ [TOTAL FAILURE] Could not parse '{youtube_title[:60]}...'")

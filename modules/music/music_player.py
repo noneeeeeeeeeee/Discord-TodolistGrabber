@@ -219,6 +219,14 @@ class MusicPlayer(commands.Cog):
                         f"[AutoPlay] ✅ Autoplay engine {version.upper()} is READY and AVAILABLE!"
                     )
                     self._autoplay_available = True
+
+                    # Start background workers if supported (V3+)
+                    if hasattr(self._autoplay_engine, "start"):
+                        try:
+                            self._autoplay_engine.start()
+                            LOG.info(f"[AutoPlay] Started background workers for {version.upper()}")
+                        except Exception as e:
+                            LOG.error(f"[AutoPlay] Failed to start background workers: {e}")
                 else:
                     LOG.warning(
                         "[AutoPlay] Autoplay engine loaded but prerequisites not configured"

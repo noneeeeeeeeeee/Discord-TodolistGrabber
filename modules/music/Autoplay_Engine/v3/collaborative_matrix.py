@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import time
+import random
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -78,6 +79,19 @@ class CollaborativeMatrix:
 
     def get_track_vector(self, track_id: str) -> Optional[List[float]]:
         return self._track_vectors.get(track_id)
+
+    async def get_popular_tracks(self, limit: int = 50) -> List[str]:
+        """
+        Get a list of track IDs from the matrix.
+        Since the matrix is built from listening history, these are implicitly 'popular'.
+        """
+        keys = list(self._track_vectors.keys())
+        if not keys:
+            return []
+        # Return a random sample to avoid analyzing the same tracks every time
+        if len(keys) <= limit:
+            return keys
+        return random.sample(keys, limit)
 
     def get_genre_vector(self, genre: str) -> Optional[List[float]]:
         return self._genre_vectors.get(genre.lower())

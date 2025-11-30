@@ -48,6 +48,13 @@ class AnalysisResult:
     embedding_model: Optional[str] = None
     embedding_dim: Optional[int] = None
     simple_vibe: Optional[List[float]] = None
+    
+    # Enhanced Librosa Features (Musical Syntax)
+    chroma_mean: Optional[List[float]] = None  # (Harmonic Content)
+    mfcc_mean: Optional[List[float]] = None    #  (Timbre/Texture)
+    spectral_centroid_mean: Optional[float] = None  # Brightness
+    zero_crossing_rate_mean: Optional[float] = None # Percussiveness
+    
     analysis_mode: str = "ml"
     success: bool = False
     error: Optional[str] = None
@@ -115,15 +122,31 @@ if torch is not None:
             key = str(device)
             basis = self._mel_basis.get(key)
             if basis is None:
-                fb = torchaudio.functional.create_fb_matrix(
-                    self.n_fft // 2 + 1,
-                    self.fmin,
-                    self.fmax,
-                    self.n_mels,
-                    self.sr,
-                    norm=None,
-                    mel_scale="htk",
-                )
+                try:
+                    fb = torchaudio.functional.create_fb_matrix(
+                        self.n_fft // 2 + 1,
+                        self.fmin,
+                        self.fmax,
+                        self.n_mels,
+                        self.sr,
+                        norm=None,
+                        mel_scale="htk",
+                    )
+                except (AttributeError, ImportError):
+                    # Fallback using librosa if torchaudio function is missing
+                    import librosa
+                    # librosa returns (n_mels, n_freqs), we need (n_freqs, n_mels)
+                    fb_np = librosa.filters.mel(
+                        sr=self.sr,
+                        n_fft=self.n_fft,
+                        n_mels=self.n_mels,
+                        fmin=self.fmin,
+                        fmax=self.fmax,
+                        htk=True,
+                        norm=None
+                    )
+                    fb = torch.from_numpy(fb_np).float()
+
                 basis = fb.to(device)
                 self._mel_basis[key] = basis
             return basis
@@ -177,8 +200,14 @@ class EnrichingService:
         try:
             librosa = self._import_librosa()
             audio, sr = librosa.load(str(audio_path), sr=_SAMPLE_RATE, mono=True)
-            tempo, loudness, key, mode = self._analyze_flow_librosa(audio, sr)
-            simple_vibe = self._compute_simple_vibe(audio, sr, tempo, loudness, key, mode)
+            
+            # Enhanced Librosa Analysis (Musical Syntax)
+            tempo, loudness, key, mode, chroma, mfcc, centroid, zcr = self._analyze_flow_librosa(audio, sr)
+            
+            simple_vibe = self._compute_simple_vibe(
+                audio, sr, tempo, loudness, key, mode, 
+                centroid=centroid, zcr=zcr
+            )
 
             if self._analysis_mode == "ml":
                 embedding, model_name, embedding_dim = self._extract_mobile_embedding(audio, sr)
@@ -191,6 +220,10 @@ class EnrichingService:
                     embedding=embedding,
                     embedding_model=model_name,
                     embedding_dim=embedding_dim,
+                    chroma_mean=chroma,
+                    mfcc_mean=mfcc,
+                    spectral_centroid_mean=centroid,
+                    zero_crossing_rate_mean=zcr,
                     analysis_mode="ml",
                     success=True,
                 )
@@ -201,6 +234,10 @@ class EnrichingService:
                     key=key,
                     mode=mode,
                     simple_vibe=simple_vibe,
+                    chroma_mean=chroma,
+                    mfcc_mean=mfcc,
+                    spectral_centroid_mean=centroid,
+                    zero_crossing_rate_mean=zcr,
                     analysis_mode="non-ml",
                     success=True,
                 )
@@ -288,25 +325,45 @@ class EnrichingService:
         self,
         audio: np.ndarray,
         sr: int,
-    ) -> Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]:
+    ) -> Tuple[Optional[float], Optional[float], Optional[int], Optional[int], Optional[List[float]], Optional[List[float]], Optional[float], Optional[float]]:
         librosa = self._import_librosa()
         try:
+            # Rhythm & Tempo
             tempo, _ = librosa.beat.beat_track(y=audio, sr=sr)
             tempo = float(tempo)
+            
+            # Loudness (RMS)
             rms = librosa.feature.rms(y=audio)[0]
             rms_mean = float(np.mean(rms))
             loudness = 20 * np.log10(rms_mean + 1e-6)
-            key, mode = self._detect_key_mode_librosa(audio, sr)
-            return tempo, loudness, key, mode
+            
+            # Harmonic Content (Key/Mode + Chroma)
+            key, mode, chroma_mean = self._detect_key_mode_librosa(audio, sr)
+            
+            # Timbre & Texture (MFCCs)
+            mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=20)
+            mfcc_mean = np.mean(mfcc, axis=1).tolist()
+            
+            # Brightness (Spectral Centroid)
+            spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sr)[0]
+            centroid_mean = float(np.mean(spectral_centroid))
+            
+            # Percussiveness (Zero Crossing Rate)
+            zero_crossing = librosa.feature.zero_crossing_rate(y=audio)[0]
+            zcr_mean = float(np.mean(zero_crossing))
+            
+            return tempo, loudness, key, mode, chroma_mean, mfcc_mean, centroid_mean, zcr_mean
         except Exception as exc:
             LOG.warning("Librosa flow analysis failed: %s", exc)
-            return None, None, None, None
+            return None, None, None, None, None, None, None, None
 
-    def _detect_key_mode_librosa(self, audio: np.ndarray, sr: int) -> Tuple[Optional[int], Optional[int]]:
+    def _detect_key_mode_librosa(self, audio: np.ndarray, sr: int) -> Tuple[Optional[int], Optional[int], Optional[List[float]]]:
         librosa = self._import_librosa()
         try:
             chroma = librosa.feature.chroma_cqt(y=audio, sr=sr)
             chroma_mean = np.mean(chroma, axis=1)
+            chroma_list = chroma_mean.tolist()
+            
             major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
             minor_profile = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
             major_profile /= np.sum(major_profile)
@@ -322,10 +379,10 @@ class EnrichingService:
             best_match = max(correlations, key=lambda x: x[2])
             mode = 1 if best_match[0] == "major" else 0
             key = best_match[1]
-            return int(key), int(mode)
+            return int(key), int(mode), chroma_list
         except Exception as exc:
             LOG.warning("Key/mode detection failed: %s", exc)
-            return None, None
+            return None, None, None
 
     def _compute_simple_vibe(
         self,
@@ -335,6 +392,8 @@ class EnrichingService:
         loudness: Optional[float],
         key: Optional[int],
         mode: Optional[int],
+        centroid: Optional[float] = None,
+        zcr: Optional[float] = None,
     ) -> List[float]:
         librosa = self._import_librosa()
         try:
@@ -346,8 +405,14 @@ class EnrichingService:
             energy = np.clip(energy + rms_std * 0.3, 0.0, 1.0)
 
             valence = 0.65 if mode == 1 else 0.35 if mode == 0 else 0.5
-            spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sr)[0]
-            centroid_mean = float(np.mean(spectral_centroid))
+            
+            # Use pre-computed centroid if available
+            if centroid is not None:
+                centroid_mean = centroid
+            else:
+                spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sr)[0]
+                centroid_mean = float(np.mean(spectral_centroid))
+                
             centroid_normalized = np.clip(centroid_mean / 4000.0, 0.0, 1.0)
             valence = np.clip(valence + (centroid_normalized - 0.5) * 0.2, 0.0, 1.0)
 
@@ -362,8 +427,14 @@ class EnrichingService:
             spectral_rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sr)[0]
             rolloff_mean = float(np.mean(spectral_rolloff))
             rolloff_normalized = np.clip(rolloff_mean / 8000.0, 0.0, 1.0)
-            zero_crossing = librosa.feature.zero_crossing_rate(y=audio)[0]
-            zcr_mean = float(np.mean(zero_crossing))
+            
+            # Use pre-computed ZCR if available
+            if zcr is not None:
+                zcr_mean = zcr
+            else:
+                zero_crossing = librosa.feature.zero_crossing_rate(y=audio)[0]
+                zcr_mean = float(np.mean(zero_crossing))
+                
             acousticness = 1.0 - (rolloff_normalized * 0.6 + zcr_mean * 0.4)
             acousticness = np.clip(acousticness, 0.0, 1.0)
 

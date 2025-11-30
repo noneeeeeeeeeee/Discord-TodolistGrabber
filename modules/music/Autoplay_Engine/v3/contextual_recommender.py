@@ -336,6 +336,84 @@ class ContextualRecommender:
             )
         return scored
 
+    def recommend_with_progressive_logic(
+        self,
+        guild_id: int | str,
+        candidates: Sequence[CandidateFeatures],
+        cache_size: int,
+        *,
+        seed_track_ids: Optional[Iterable[str]] = None,
+        session_mood_vector: Optional[Sequence[float]] = None,
+        target_mood: Optional[str] = None,
+        session_focus_genres: Optional[List[str]] = None,
+        liked_mood_vector: Optional[Sequence[float]] = None,
+        disliked_mood_vector: Optional[Sequence[float]] = None,
+        energy_trend: float = 0.0,
+        last_energy: Optional[float] = None,
+        last_loudness: Optional[float] = None,
+        last_tempo: Optional[float] = None,
+        last_key: Optional[int] = None,
+        last_mode: Optional[int] = None,
+    ) -> List[ScoredCandidate]:
+        """
+        Progressive Recommendation Logic (Phase 2):
+        - Cache < 50: Cold Start (Bootstrapped Charts)
+        - Cache < 200: Content-Based (V3 Embeddings)
+        - Cache > 200: Hybrid (Content + Collaborative)
+        """
+        if not candidates:
+            return []
+
+        # Determine mode based on cache size
+        mode = "hybrid"
+        if cache_size < 50:
+            mode = "cold_start"
+        elif cache_size < 200:
+            mode = "content_based"
+        
+        LOG.debug(f"Progressive Logic: Mode={mode} (Cache={cache_size})")
+
+        # Save original state to restore later
+        original_enabled = self.is_collaborative_enabled(guild_id)
+        
+        try:
+            if mode == "cold_start":
+                # Cold Start: Disable collaborative, rely on base scoring (content/quality)
+                self.set_collaborative_enabled(guild_id, False)
+                
+            elif mode == "content_based":
+                # Content-Based: Disable collaborative, rely on V3 embeddings
+                self.set_collaborative_enabled(guild_id, False)
+                
+            elif mode == "hybrid":
+                # Hybrid: Enable collaborative if globally allowed
+                # We assume the caller wants to use it if available
+                self.set_collaborative_enabled(guild_id, True)
+
+            # Call the standard scoring
+            scored = self.score_candidates(
+                guild_id,
+                candidates,
+                seed_track_ids=seed_track_ids,
+                session_mood_vector=session_mood_vector,
+                target_mood=target_mood,
+                session_focus_genres=session_focus_genres,
+                liked_mood_vector=liked_mood_vector,
+                disliked_mood_vector=disliked_mood_vector,
+                energy_trend=energy_trend,
+                last_energy=last_energy,
+                last_loudness=last_loudness,
+                last_tempo=last_tempo,
+                last_key=last_key,
+                last_mode=last_mode,
+            )
+            
+            return scored
+            
+        finally:
+            # Restore original state
+            self.set_collaborative_enabled(guild_id, original_enabled)
+
     def snapshot_settings(self) -> Dict[str, Any]:
         return {
             "toggle_overrides": dict(self._collab_toggles),

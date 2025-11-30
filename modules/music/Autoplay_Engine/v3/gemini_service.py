@@ -304,12 +304,25 @@ class GeminiService:
         valence = float(payload.get("valence", 0.0) or 0.0)
         tempo = float(payload.get("tempo", 0.0) or 0.0)
         confidence = float(payload.get("confidence", 0.0) or 0.0)
+        
+        # New Cultural Tags
+        vibe_situation = str(payload.get("vibe_situation", "")).strip() or None
+        lyrical_themes = str(payload.get("lyrical_themes", "")).strip() or None
+        similar_artists = payload.get("similar_artists", [])
+        if isinstance(similar_artists, str):
+            similar_artists = [similar_artists]
+        era_scene = str(payload.get("era_scene", "")).strip() or None
+
         return {
             "mood": mood,
             "energy": energy,
             "valence": valence,
             "tempo": tempo,
             "confidence": confidence,
+            "vibe_situation": vibe_situation,
+            "lyrical_themes": lyrical_themes,
+            "similar_artists": similar_artists,
+            "era_scene": era_scene,
         }
 
     async def generate_deezer_queries_lite(
@@ -1387,8 +1400,15 @@ Return the BEST GUESS metadata for Last.fm scrobbling:
         return (
             "You are enriching music metadata for a recommendation engine.\n"
             "Infer high-level mood and energy signals given the supplied context.\n"
-            "Respond with JSON containing numeric fields 'energy', 'valence', 'tempo'\n"
-            "(each 0..1) and a string 'mood'. Add 'confidence' (0..1).\n\n"
+            "Also provide cultural context tags.\n"
+            "Respond with JSON containing:\n"
+            "- 'energy', 'valence', 'tempo' (each 0..1)\n"
+            "- 'mood' (single descriptive word)\n"
+            "- 'confidence' (0..1)\n"
+            "- 'vibe_situation' (e.g., 'gym workout', 'dinner party', 'studying')\n"
+            "- 'lyrical_themes' (e.g., 'heartbreak', 'victory', 'social commentary')\n"
+            "- 'similar_artists' (list of 3 artist names)\n"
+            "- 'era_scene' (e.g., '90s Grunge', '2010s EDM')\n\n"
             f"Tags: {tags_text}\n"
             f"Genre: {genre_text}\n"
             f"Description: {description_text}\n"

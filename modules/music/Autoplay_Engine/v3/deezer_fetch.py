@@ -309,6 +309,39 @@ class DeezerClient:
         
         return []
 
+    async def get_charts(self, limit: int = 50) -> List[DeezerTrack]:
+        """
+        Fetch top tracks from Deezer charts.
+        
+        Args:
+            limit: Maximum number of tracks to return
+            
+        Returns:
+            List of DeezerTrack objects
+        """
+        if not self.session:
+            LOG.error("❌ No aiohttp session available for charts")
+            return []
+            
+        url = f"{DEEZER_API_BASE}/chart/0/tracks"
+        params = {"limit": limit}
+        
+        async with self.semaphore:
+            try:
+                timeout = aiohttp.ClientTimeout(total=self.timeout)
+                async with self.session.get(url, params=params, timeout=timeout) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        tracks = self._parse_search_results(data)
+                        LOG.info(f"📈 Fetched {len(tracks)} tracks from Deezer charts")
+                        return tracks
+                    else:
+                        LOG.error(f"❌ Failed to fetch Deezer charts: {response.status}")
+                        return []
+            except Exception as e:
+                LOG.error(f"❌ Error fetching Deezer charts: {e}")
+                return []
+
     def _parse_search_results(self, data: Dict[str, Any]) -> List[DeezerTrack]:
         """Parse Deezer API response into DeezerTrack objects."""
         tracks = []
