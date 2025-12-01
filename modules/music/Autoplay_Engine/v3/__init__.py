@@ -1297,22 +1297,21 @@ class LastFMAutoplayV3:
     async def _fetch_bootstrapped_pool(self) -> List[Dict[str, Any]]:
         """
         Fetch candidates from the bootstrapped charts.
-        Used when cache size < 50 (System Cold Start).
+        Used when cache size < 50 (System Cold Start) or as fallback.
+        
+        Sources (in priority order):
+        1. Bootstrap manager's tracked set
+        2. Enrichment cache (for tracks that have been processed)
+        3. Direct Deezer chart fetch (emergency fallback)
         """
         if self._engine._verbose:
-            LOG.info("🌱 [Progressive] Using Bootstrapped Charts strategy (< 50 cached tracks)")
-            
-        bootstrapped_keys = list(self._engine._bootstrap_manager._bootstrapped_tracks)
-        if not bootstrapped_keys:
-            if self._engine._verbose:
-                LOG.warning("🌱 [Progressive] No bootstrapped tracks available yet")
-            return []
-            
-        # Sample 50 tracks if we have more
-        selected_keys = random.sample(bootstrapped_keys, min(50, len(bootstrapped_keys)))
+            LOG.info("🌱 [Progressive] Using Bootstrapped Charts strategy")
         
         pool = []
-        for key in selected_keys:
+        
+        # Source 1: Bootstrap manager's tracked set
+        bootstrapped_keys = list(self._engine._bootstrap_manager._bootstrapped_tracks)
+        for key in bootstrapped_keys:
             if "::" in key:
                 artist, title = key.split("::", 1)
                 pool.append({
@@ -1320,6 +1319,47 @@ class LastFMAutoplayV3:
                     "artist": artist,
                     "pool_source": "bootstrapped_charts"
                 })
+        
+        # Source 2: Enrichment cache (tracks that have been processed but maybe not in bootstrap set)
+        if hasattr(self._engine, "_cache") and hasattr(self._engine._cache, "_enrichment_cache"):
+            for key in list(self._engine._cache._enrichment_cache.keys()):
+                if key not in bootstrapped_keys and "::" in key:
+                    artist, title = key.split("::", 1)
+                    pool.append({
+                        "title": title,
+                        "artist": artist,
+                        "pool_source": "enrichment_cache"
+                    })
+        
+        # Source 3: Emergency fallback - fetch directly from Deezer if we have nothing
+        if not pool:
+            if self._engine._verbose:
+                LOG.warning("🌱 [Progressive] No cached tracks, fetching Deezer charts directly")
+            try:
+                from .deezer_fetch import DeezerClient
+                async with DeezerClient() as client:
+                    tracks = await client.get_charts(limit=50)
+                    for track in tracks:
+                        pool.append({
+                            "title": track.title,
+                            "artist": track.artist,
+                            "pool_source": "deezer_charts_direct"
+                        })
+                if self._engine._verbose and pool:
+                    LOG.info("🌱 [Fallback] Fetched %d tracks directly from Deezer charts", len(pool))
+            except Exception as e:
+                LOG.error("❌ [Fallback] Failed to fetch Deezer charts: %s", e)
+        
+        if pool:
+            # Sample 50 tracks if we have more
+            if len(pool) > 50:
+                pool = random.sample(pool, 50)
+            if self._engine._verbose:
+                LOG.info("🌱 [Progressive] Returning %d bootstrapped candidates", len(pool))
+        else:
+            if self._engine._verbose:
+                LOG.warning("🌱 [Progressive] No bootstrapped tracks available")
+            
         return pool
 
     async def _fetch_collaborative_pool(self, seed_track_id: str) -> List[Dict[str, Any]]:
@@ -1479,6 +1519,16 @@ class LastFMAutoplayV3:
              if self._verbose:
                  LOG.info("🤝 [Progressive] Merging %d collaborative candidates", len(collaborative_pool))
              candidates.extend(collaborative_pool)
+
+        # Fallback to Bootstrapped Pool if all else fails (Daydreamer Fallback)
+        if not candidates:
+            if self._verbose:
+                LOG.warning("⚠️ [Fallback] No candidates found via primary strategies. Attempting Daydreamer fallback.")
+            bootstrapped = await self._fetch_bootstrapped_pool()
+            if bootstrapped:
+                candidates.extend(bootstrapped)
+                if self._verbose:
+                    LOG.info("🌱 [Fallback] Rescued session with %d Daydreamer tracks", len(bootstrapped))
              
         return candidates
 
@@ -1894,30 +1944,38 @@ class LastFMAutoplayV3:
         context: Any,
     ) -> List[Dict[str, Any]]:
         """
-        Phase 2 Task 2.2: Fetch degraded genre-based pools when Deezer verification fails.
-
-        This is used when is_canonical=False (waterfall couldn't verify artist on Deezer).
-        Falls back to pure genre-based recommendations without artist similarity.
-
-        Pool A: tag.getTopTracks(primary_genre, 40)
-        Pool B: tag.getTopTracks(secondary_genre, 20) 
-        Pool C: tag.getSimilar(primary_genre) + tag.getTopTracks(20)
-        Total: ~80 tracks
-
-        Args:
-            seed_artist: Seed track artist (unverified)
-            seed_title: Seed track title (unverified)
-            context: SessionContext with focus_genres
-
-        Returns:
-            List of track records with pool_source tags
+        ⚠️ DEPRECATED: This function is no longer used.
+        
+        Per design decision: "fallback systems can also go. And the degraded pool"
+        
+        When Deezer verification fails (is_canonical=False), we now return an empty
+        pool instead of using degraded genre-based recommendations. The rationale:
+        - Deezer has ~120M songs, so if a track isn't found, it's likely not commercial music
+        - Better to fail gracefully than recommend low-quality matches
+        - The bootstrapped pool (Daydreamer) serves as the emergency fallback if needed
+        
+        This function is kept for reference but should be removed in a future cleanup.
         """
+        import warnings
+        warnings.warn(
+            "_fetch_degraded_pools is deprecated and no longer used. "
+            "See docstring for rationale.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        
         if self._engine._verbose:
-            LOG.info(
-                "🔻 [Degraded Pools] Fetching genre-based pools for unverified track: %s - %s",
+            LOG.warning(
+                "🔻 [DEPRECATED] _fetch_degraded_pools called for: %s - %s",
                 seed_artist,
                 seed_title,
             )
+        
+        # Return empty - no longer used
+        return []
+        
+        # Original implementation below (kept for reference):
+        # -------------------------------------------------------
 
         focus_genres = getattr(context, "focus_genres", []) or []
         primary_genre = focus_genres[0] if len(focus_genres) > 0 else "rock"

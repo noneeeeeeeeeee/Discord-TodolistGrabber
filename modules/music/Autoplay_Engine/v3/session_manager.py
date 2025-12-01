@@ -20,6 +20,18 @@ class AutoplaySessionManager:
         
         LOG.info(f"🎱 Session Manager initialized with {max_sessions} slots")
     
+    def get_active_count(self) -> int:
+        """Return the number of currently active sessions."""
+        return len(self._active_sessions)
+    
+    def has_active_sessions(self) -> bool:
+        """Check if any sessions are currently active."""
+        return len(self._active_sessions) > 0
+    
+    def is_full(self) -> bool:
+        """Check if all session slots are occupied."""
+        return len(self._active_sessions) >= self._max_sessions
+    
     async def acquire(self, guild_id: int) -> bool:
         """
         Try to acquire an ML session slot for this guild.

@@ -91,7 +91,7 @@ class DeezerClient:
         self.consecutive_failures = 0
         self.circuit_open_until = 0.0
         
-        LOG.info(
+        LOG.debug(
             f"🎵 DeezerClient initialized: {max_concurrent} concurrent requests, "
             f"{timeout}s timeout"
         )
@@ -171,10 +171,13 @@ class DeezerClient:
         processed = query.lower()
         
         # Remove noise words that don't help Deezer searches
+        # IMPORTANT: Do NOT remove 'live' as a standalone word - it can be part of song titles like "Live to Live"
+        # Only remove it when it's clearly a video type indicator (e.g., "live version", "live performance")
         noise_words = [
             r'\b(soundtrack|ost|song|music|theme|audio|video|official|original)\b',
             r'\b(opening|ending|op|ed)\b',
-            r'\b(cover|remix|acoustic|live|version)\b',
+            r'\b(cover|remix|acoustic|version)\b',  # 'live' removed from this list
+            r'\blive\s+(version|performance|recording|session|concert)\b',  # Only remove 'live' when it's a type indicator
             r'\b(ultimate|knockout)\b',  # Game-specific decorations
         ]
         for pattern in noise_words:
@@ -427,7 +430,7 @@ class DeezerClient:
                 )
 
         if best_match and best_match.confidence >= threshold:
-            LOG.info(
+            LOG.debug(
                 f"✅ Deezer match: '{best_match.track.artist} - {best_match.track.title}' "
                 f"(confidence={best_match.confidence:.2f}, "
                 f"title={best_match.title_match:.2f}, "
@@ -514,9 +517,13 @@ class DeezerClient:
         normalized_artist = self.normalize_music_title(artist)
         normalized_title = self.normalize_music_title(title)
 
+        # Priority 1: Raw title + artist (no preprocessing) - best for exact matches
+        # Priority 2: Normalized versions
+        # Priority 3: Individual components
         combos = [
+            f"{title} {artist}".strip(),  # Title first often works better for Deezer
             f"{artist} {title}".strip(),
-            f"{title} {artist}".strip(),
+            f"{normalized_title} {normalized_artist}".strip(),
             f"{normalized_artist} {normalized_title}".strip(),
             title,
             normalized_title,

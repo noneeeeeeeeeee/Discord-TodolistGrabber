@@ -55,6 +55,21 @@ DEFAULT_ANALYSIS_MODE = os.getenv("ANALYSIS_MODE", "ml").lower()  # "ml" or "non
 DEFAULT_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "mn10_as").lower()
 MAX_ANALYSIS_RETRIES = 3
 
+# Priority Queue System (Apple Music-style)
+# P1: Active enrichment - user waiting, top candidates only (15-25)
+# P2: Buffer building - maintains 5-song ready buffer
+# P3: Daydreaming - background research when idle (50 per batch)
+PRIORITY_ACTIVE = 1      # P1: User-triggered, immediate need
+PRIORITY_BUFFER = 2      # P2: Buffer refill, background
+PRIORITY_DAYDREAM = 3    # P3: Proactive caching, lowest priority
+
+# Queue limits
+DAYDREAM_QUEUE_BACKLOG_LIMIT = 200  # Pause daydreaming if queue > 200
+DAYDREAM_BATCH_SIZE = 50            # Songs per daydream batch
+BUFFER_TARGET_SIZE = 5              # Apple Music-style 5-song buffer
+P1_CANDIDATE_LIMIT = 25             # Max candidates for P1 (user waiting)
+P1_TIMEOUT_SECONDS = 10             # Notify user if P1 takes longer
+
 print("[AutoplayEngineV3] Set verbosity to ", DEFAULT_VERBOSITY)
 print(
     f"[AutoplayEngineV3] Configuration: ANALYSIS_MODE={DEFAULT_ANALYSIS_MODE}, EMBEDDING_MODEL={DEFAULT_EMBEDDING_MODEL}"
@@ -390,11 +405,13 @@ class AutoplayEngineV3:
         preview_url: Optional[str] = None,
         preview_duration_ms: Optional[int] = None,
         deezer_track_id: Optional[str] = None,
+        priority: int = PRIORITY_ACTIVE,
         overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         job: Dict[str, Any] = {
             "track_id": track_id,
             "youtube_url": self._normalize_youtube_url(youtube_url),
+            "priority": priority,
             "attempts": 0,
             "enqueued_at": time.time(),
             "last_error": None,
@@ -411,6 +428,7 @@ class AutoplayEngineV3:
 
         if overrides:
             for key in (
+                "priority",
                 "attempts",
                 "enqueued_at",
                 "last_error",
@@ -459,6 +477,37 @@ class AutoplayEngineV3:
         if any(job.get("track_id") == track_id for job in self._analysis_queue):
             return True
         return any(job.get("track_id") == track_id for job in self._active_jobs.values())
+
+    def _get_next_priority_job(self) -> Optional[Dict[str, Any]]:
+        """
+        Get the highest priority job from the queue.
+        
+        Priority order: P1 (Active) > P2 (Buffer) > P3 (Daydream)
+        Within same priority, FIFO order is maintained.
+        
+        Returns:
+            Job dict or None if queue is empty
+        """
+        if not self._analysis_queue:
+            return None
+        
+        # Find the job with lowest priority number (P1=1 is highest priority)
+        best_idx = 0
+        best_priority = self._analysis_queue[0].get("priority", 3)  # Default to P3
+        
+        for idx, job in enumerate(self._analysis_queue):
+            job_priority = job.get("priority", 3)
+            if job_priority < best_priority:
+                best_priority = job_priority
+                best_idx = idx
+                # P1 is highest, no need to look further
+                if job_priority == PRIORITY_ACTIVE:
+                    break
+        
+        # Remove and return the selected job
+        job = self._analysis_queue[best_idx]
+        del self._analysis_queue[best_idx]
+        return job
 
     def _handle_job_failure(
         self,
@@ -560,8 +609,9 @@ class AutoplayEngineV3:
         if not self._analyzer or not self._analyzer.is_available():
             LOG.debug("Audio analyzer not available, skipping worker startup")
             return
-        if not (self._preview_fetcher or self._audio_downloader):
-            LOG.warning("⚠️ No audio ingest source available; cannot start analysis workers")
+        # Deezer-only architecture: preview_fetcher is REQUIRED
+        if not self._preview_fetcher:
+            LOG.warning("⚠️ Preview fetcher unavailable (Deezer-only architecture requires it)")
             return
             
         if self._analysis_workers:
@@ -569,9 +619,8 @@ class AutoplayEngineV3:
             return
         
         mode_str = "Non-ML" if self._analysis_mode == "non-ml" else "ML"
-        source_hint = "Deezer previews" if self._preview_fetcher else "YouTube fallback"
         LOG.info(
-            f"🚀 Starting {self._analysis_worker_count} {mode_str} analysis workers ({source_hint})"
+            f"🚀 Starting {self._analysis_worker_count} {mode_str} analysis workers (Deezer previews only)"
         )
         self._analysis_shutdown = False
         for i in range(self._analysis_worker_count):
@@ -604,12 +653,18 @@ class AutoplayEngineV3:
         LOG.info("✅ Analysis workers stopped")
     
 
-    def queue_analysis(self, track_id: str, youtube_url: str) -> bool:
-        """Queue a track for background analysis using Deezer preview or YouTube fallback.
+    def queue_analysis(
+        self, track_id: str, youtube_url: str, *, priority: int = PRIORITY_ACTIVE
+    ) -> bool:
+        """Queue a track for background analysis using Deezer preview only.
+
+        NOTE: Despite the parameter name, youtube_url is kept for backward compatibility
+        but is NOT used for audio downloading. Only Deezer previews are used.
 
         Args:
             track_id: Normalized ``artist::title`` cache key.
-            youtube_url: YouTube URL used when no Deezer preview is available.
+            youtube_url: YouTube URL (DEPRECATED - kept for cache key compatibility).
+            priority: Job priority (1=active/user waiting, 2=buffer, 3=daydream).
 
         Returns:
             True if the track was enqueued, False otherwise.
@@ -629,15 +684,22 @@ class AutoplayEngineV3:
         preview_url = mapping_entry.preview_url if mapping_entry else None
         preview_duration_ms = mapping_entry.preview_duration_ms if mapping_entry else None
         deezer_track_id = mapping_entry.deezer_track_id if mapping_entry else None
-        has_preview_source = bool(preview_url and self._preview_fetcher)
-        has_youtube_source = bool(self._audio_downloader and youtube_url)
-        if not (has_preview_source or has_youtube_source):
+        
+        # Deezer-only architecture: REQUIRE preview_url
+        # If no Deezer preview, track is assumed non-commercial music
+        if not preview_url:
             self._log_verbose(
                 1,
-                "[Analysis Queue] No ingest source for %s (preview=%s, youtube=%s)",
+                "[Analysis Queue] No Deezer preview for %s - assuming non-commercial music, skipping",
                 track_id,
-                bool(preview_url),
-                bool(youtube_url),
+                log_fn=LOG.debug,
+            )
+            return False
+        
+        if not self._preview_fetcher:
+            self._log_verbose(
+                1,
+                "[Analysis Queue] Preview fetcher unavailable (Deezer-only architecture)",
                 log_fn=LOG.debug,
             )
             return False
@@ -699,6 +761,7 @@ class AutoplayEngineV3:
             preview_url=preview_url,
             preview_duration_ms=preview_duration_ms,
             deezer_track_id=deezer_track_id,
+            priority=priority,
         )
         self._analysis_queue.append(job)
         self._analysis_stats["queued"] += 1
@@ -717,6 +780,7 @@ class AutoplayEngineV3:
         preview_url: Optional[str] = None,
         preview_duration_ms: Optional[int] = None,
         deezer_track_id: Optional[str] = None,
+        priority: int = PRIORITY_ACTIVE,
     ) -> bool:
         """Helper to enqueue analysis using a bare YouTube video ID."""
         if not youtube_id:
@@ -727,13 +791,8 @@ class AutoplayEngineV3:
         url = youtube_id
         if not youtube_id.startswith("http"):
             url = f"https://www.youtube.com/watch?v={youtube_id}"
-        return self.queue_analysis(
-            track_id,
-            url,
-            preview_url=preview_url,
-            preview_duration_ms=preview_duration_ms,
-            deezer_track_id=deezer_track_id,
-        )
+        # Note: queue_analysis reads preview_url/deezer_track_id from mapping cache internally
+        return self.queue_analysis(track_id, url, priority=priority)
 
     async def ensure_preview_metadata(
         self,
@@ -850,7 +909,7 @@ class AutoplayEngineV3:
                 missing_mapping += 1
                 continue
 
-            if self.queue_analysis(track_key, youtube_source):
+            if self.queue_analysis(track_key, youtube_source, priority=PRIORITY_BUFFER):
                 queued += 1
             else:
                 duplicates += 1
@@ -926,7 +985,7 @@ class AutoplayEngineV3:
                         youtube_url = mapping.youtube_id
                     
                     if youtube_url:
-                        queued = self.queue_analysis(track_id, youtube_url)
+                        queued = self.queue_analysis(track_id, youtube_url, priority=PRIORITY_DAYDREAM)
                         if queued:
                             LOG.debug(f"💤 [Daydream] Queued {track_id} for background analysis")
                             await asyncio.sleep(10)  # Rate limit: 1 track per 10s in daydream
@@ -949,9 +1008,10 @@ class AutoplayEngineV3:
         
         while not self._analysis_shutdown:
             try:
-                if not (self._preview_fetcher or self._audio_downloader):
+                # Deezer-only architecture: preview_fetcher is REQUIRED
+                if not self._preview_fetcher:
                     LOG.warning(
-                        f"[Worker {worker_id}] No audio ingest source available; shutting down worker"
+                        f"[Worker {worker_id}] Preview fetcher unavailable (Deezer-only); shutting down"
                     )
                     break
                 # Check for work
@@ -960,8 +1020,11 @@ class AutoplayEngineV3:
                     await self._daydream_analysis()
                     continue
                 
-                # Get next job
-                job = self._analysis_queue.popleft()
+                # Get next job (sorted by priority: P1 > P2 > P3)
+                job = self._get_next_priority_job()
+                if not job:
+                    await self._daydream_analysis()
+                    continue
                 self._analysis_stats["queue_depth"] = len(self._analysis_queue)
                 self._analysis_stats["in_progress"] += 1
                 track_id = job.get("track_id")
@@ -972,7 +1035,9 @@ class AutoplayEngineV3:
                 self._persist_analysis_queue_state()
                 self._log_worker_progress(worker_id, track_id)
                 
-                # Download audio (prefer Deezer preview, fallback to YouTube)
+                # Download audio (Deezer preview ONLY - no YouTube fallback)
+                # Per design: "ALWAYS download the deezer preview. NOT USE YOUTUBE"
+                # If no Deezer preview, assume non-commercial music and skip
                 audio_path = None
                 cleanup_parent = False
                 preview_url = job.get("preview_url")
@@ -981,7 +1046,7 @@ class AutoplayEngineV3:
                     preview_duration_ms = int(preview_duration_ms)
                 except (TypeError, ValueError):
                     preview_duration_ms = None
-                audio_source = "preview" if preview_url else "youtube"
+                audio_source = "deezer_preview"
                 try:
                     if preview_url and self._preview_fetcher:
                         audio_path = await self._preview_fetcher.fetch_preview(
@@ -993,20 +1058,30 @@ class AutoplayEngineV3:
                             audio_source = "deezer_preview"
                         else:
                             LOG.debug(
-                                "[Worker %d] Deezer preview unavailable for %s",
+                                "[Worker %d] Deezer preview download failed for %s",
                                 worker_id,
                                 track_id or "unknown",
                             )
 
+                    # NO YOUTUBE FALLBACK - Deezer-only architecture
+                    # If no Deezer preview, assume non-commercial music and skip
                     if not audio_path:
-                        if not self._audio_downloader:
-                            raise RuntimeError("Preview unavailable and downloader missing")
-                        audio_path = await self._audio_downloader.download_audio(youtube_url)
-                        cleanup_parent = True
-                        audio_source = "youtube_fallback"
-
-                    if not audio_path:
-                        raise Exception("Audio ingest failed")
+                        LOG.info(
+                            "🚫 [Worker %d] No Deezer preview for %s - assuming non-commercial music, skipping",
+                            worker_id,
+                            track_id or "unknown",
+                        )
+                        self._analysis_stats["failed"] += 1
+                        # Mark as permanently failed (no Deezer preview available)
+                        artist_key, title_key = self._split_track_key(track_id or "")
+                        if artist_key and title_key:
+                            entry = await self._cache.get_enrichment(artist_key, title_key)
+                            if entry:
+                                entry.analysis_verified = False
+                                entry.analysis_in_progress = False
+                                entry.last_analysis_attempt = time.time()
+                                await self._cache.set_enrichment(artist_key, title_key, entry)
+                        continue  # Skip to next job
 
                     if self._verbose >= 2:
                         LOG.debug(

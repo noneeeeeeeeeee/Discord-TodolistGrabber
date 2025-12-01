@@ -1,12 +1,44 @@
+"""
+⚠️ DEPRECATED MODULE - audio_downloader.py
+
+This module is DEPRECATED as of 2025-12-XX.
+
+Reason:
+    The Autoplay V3 system now exclusively uses Deezer previews for audio analysis.
+    YouTube audio downloading via yt-dlp is no longer needed because:
+    
+    1. Deezer has ~120 million songs with new releases included
+    2. Deezer previews are legal, consistent 30-second clips
+    3. If a track isn't on Deezer, we assume it's not commercial music
+    4. YouTube requires yt-dlp maintenance and format changes
+    
+Replacement:
+    Use `preview_fetcher.py` for all audio analysis needs.
+    
+Migration:
+    - Remove all calls to AudioDownloader.download_audio()
+    - Use PreviewFetcher.fetch_preview() instead
+    - If no Deezer preview is available, skip the track (don't fallback to YouTube)
+    
+This file is kept temporarily for rollback purposes. It will be removed in a future release.
+"""
 import asyncio
 import logging
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Optional
 
 from .dependency_manager import wait_for_ffmpeg
 
 LOG = logging.getLogger(__name__)
+
+# Emit deprecation warning when module is imported
+warnings.warn(
+    "audio_downloader.py is deprecated. Use preview_fetcher.py (Deezer previews) instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 try:  # Lazy import to avoid mandatory dependency during startup
     from yt_dlp import YoutubeDL  # type: ignore
