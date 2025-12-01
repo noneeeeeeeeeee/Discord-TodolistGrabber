@@ -31,10 +31,7 @@ try:
 except ImportError:
     EnrichingService = None
 
-try:
-    from .audio_downloader import AudioDownloader
-except ImportError:
-    AudioDownloader = None
+# AudioDownloader REMOVED - Deezer-only architecture (no YouTube audio downloads)
 
 try:
     from .deezer_fetch import DeezerClient
@@ -43,10 +40,8 @@ except ImportError:
 
 LOG = logging.getLogger(__name__)
 
-# Verbosity control: prefer AUTOPLAY_V3_VERBOSITY but honor legacy env for compatibility.
-DEFAULT_VERBOSITY = int(
-    os.getenv("AUTOPLAY_V3_VERBOSITY", os.getenv("AUTOPLAY_V2_VERBOSITY", "0"))
-)
+# Verbosity control for debugging
+DEFAULT_VERBOSITY = int(os.getenv("AUTOPLAY_V3_VERBOSITY", "0"))
 LASTFM_API_KEY_ENV = "LASTFM_API_KEY"
 PARSING_SCHEMA_VERSION = 2
 
@@ -252,12 +247,7 @@ class AutoplayEngineV3:
                 "❌ EnrichingService unavailable. Install librosa, numpy, scipy, torch, torchaudio"
             )
 
-        self._audio_downloader = None
-        if AudioDownloader and self._analyzer and self._analyzer.is_available():
-            try:
-                self._audio_downloader = AudioDownloader()
-            except Exception as exc:
-                LOG.warning("⚠️ Audio downloader unavailable: %s", exc)
+        # AudioDownloader REMOVED - V3 uses Deezer previews only (no YouTube audio downloads)
         
         # Analysis Worker Pool (async background processing)
         self._analysis_queue: deque = deque()  # Queue of job dicts (track_id, youtube_url)

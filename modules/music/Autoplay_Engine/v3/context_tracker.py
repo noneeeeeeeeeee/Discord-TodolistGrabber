@@ -1,5 +1,5 @@
 """
-Context Tracker for Autoplay V2 - Dual Vector Architecture (9D)
+Context Tracker for Autoplay V3 - Dual Vector Architecture (9D)
 
 Tracks recent session history with advanced vibe steering and replay detection.
 

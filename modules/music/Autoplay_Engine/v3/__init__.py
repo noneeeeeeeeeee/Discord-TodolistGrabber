@@ -79,7 +79,7 @@ class AutoplayTelemetryEvent:
     selected_title: str
     
     # Pool composition: number of tracks from each pool
-    pool_composition: Dict[str, int]  # {pool_a: 30, pool_b: 30, degraded_pool_a: 40, ...}
+    pool_composition: Dict[str, int]  # {pool_a: 30, pool_b: 30, pool_c: 20, pool_d: 10, ...}
     
     # Consensus breakdown: distribution of consensus signals in session
     consensus_breakdown: Dict[str, int]  # {liked: 5, disliked: 2, weak_like: 3, neutral: 10}
@@ -91,7 +91,6 @@ class AutoplayTelemetryEvent:
     # Deezer verification metrics
     deezer_canonical_rate: float  # % of tracks in session with is_canonical=True
     is_canonical: bool  # Whether seed track was Deezer-verified
-    is_degraded_path: bool  # Whether degraded pools were used
     
     # API health
     deezer_api_errors: int  # Number of Deezer errors in this session
@@ -114,7 +113,6 @@ class AutoplayTelemetryEvent:
             "consecutive_safe_picks": self.consecutive_safe_picks,
             "deezer_canonical_rate": self.deezer_canonical_rate,
             "is_canonical": self.is_canonical,
-            "is_degraded_path": self.is_degraded_path,
             "deezer_api_errors": self.deezer_api_errors,
             "gemini_quota_remaining": self.gemini_quota_remaining,
             "selected_score": self.selected_score,
@@ -143,7 +141,7 @@ class LastFMAutoplayV3:
         self._http_timeout = aiohttp.ClientTimeout(total=12)
 
         # Issue #3 - Contextual Arc Recommender components
-        verbosity = int(os.getenv("AUTOPLAY_V2_VERBOSITY", "0"))
+        verbosity = int(os.getenv("AUTOPLAY_V3_VERBOSITY", "0"))
         self._context_tracker: Dict[int, ContextTracker] = {}  # Per-guild context
         self._novelty_controller = NoveltyController(verbose=verbosity)
         self._verbose = verbosity
@@ -380,7 +378,7 @@ class LastFMAutoplayV3:
             deezer_track_id=deezer_track_id,
         )
         if queued and self._verbose >= 2:
-            source = "Deezer preview" if preview_url else "YouTube fallback"
+            source = "Deezer preview"
             LOG.debug(
                 "🎛️ [Analysis Queue] Scheduled %s - %s via %s (youtube_id=%s)",
                 artist,
@@ -1932,110 +1930,6 @@ class LastFMAutoplayV3:
                 len(pool_b),
                 len(pool_c),
                 len(pool_d),
-            )
-
-        return all_pools
-
-    async def _fetch_degraded_pools(
-        self,
-        *,
-        seed_artist: str,
-        seed_title: str,
-        context: Any,
-    ) -> List[Dict[str, Any]]:
-        """
-        ⚠️ DEPRECATED: This function is no longer used.
-        
-        Per design decision: "fallback systems can also go. And the degraded pool"
-        
-        When Deezer verification fails (is_canonical=False), we now return an empty
-        pool instead of using degraded genre-based recommendations. The rationale:
-        - Deezer has ~120M songs, so if a track isn't found, it's likely not commercial music
-        - Better to fail gracefully than recommend low-quality matches
-        - The bootstrapped pool (Daydreamer) serves as the emergency fallback if needed
-        
-        This function is kept for reference but should be removed in a future cleanup.
-        """
-        import warnings
-        warnings.warn(
-            "_fetch_degraded_pools is deprecated and no longer used. "
-            "See docstring for rationale.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        
-        if self._engine._verbose:
-            LOG.warning(
-                "🔻 [DEPRECATED] _fetch_degraded_pools called for: %s - %s",
-                seed_artist,
-                seed_title,
-            )
-        
-        # Return empty - no longer used
-        return []
-        
-        # Original implementation below (kept for reference):
-        # -------------------------------------------------------
-
-        focus_genres = getattr(context, "focus_genres", []) or []
-        primary_genre = focus_genres[0] if len(focus_genres) > 0 else "rock"
-        secondary_genre = focus_genres[1] if len(focus_genres) > 1 else "pop"
-
-        # Parallel fetch all pools
-        pool_a_task = self._fetch_tag_top_tracks(primary_genre, limit=40)
-        pool_b_task = self._fetch_tag_top_tracks(secondary_genre, limit=20)
-        
-        # Pool C: Similar tags → top tracks from first similar tag
-        pool_c_similar_tags_task = self._fetch_similar_tags(primary_genre, limit=5)
-        pool_c_top_task = self._fetch_tag_top_tracks(primary_genre, limit=20)
-
-        base_results = await asyncio.gather(
-            pool_a_task,
-            pool_b_task,
-            pool_c_similar_tags_task,
-            pool_c_top_task,
-            return_exceptions=True,
-        )
-
-        pool_a = base_results[0] if isinstance(base_results[0], list) else []
-        pool_b = base_results[1] if isinstance(base_results[1], list) else []
-        similar_tags = base_results[2] if isinstance(base_results[2], list) else []
-        pool_c_top = base_results[3] if isinstance(base_results[3], list) else []
-
-        # Fetch top tracks from first similar tag for Pool C discovery
-        pool_c_similar = []
-        if similar_tags:
-            first_similar_tag = similar_tags[0]
-            pool_c_similar = await self._fetch_tag_top_tracks(first_similar_tag, limit=10)
-
-        # Combine Pool C
-        pool_c = []
-        for track in pool_c_similar:
-            if len(pool_c) < 10:
-                pool_c.append(track)
-        for track in pool_c_top:
-            if len(pool_c) < 20:
-                # Avoid duplicates
-                if not any(t.get("name") == track.get("name") and t.get("artist") == track.get("artist") for t in pool_c):
-                    pool_c.append(track)
-
-        # Tag pools
-        for record in pool_a:
-            record["pool_source"] = "degraded_pool_a"
-        for record in pool_b:
-            record["pool_source"] = "degraded_pool_b"
-        for record in pool_c:
-            record["pool_source"] = "degraded_pool_c"
-
-        all_pools = pool_a + pool_b + pool_c
-
-        if self._engine._verbose:
-            LOG.info(
-                "🔻 [Degraded Pools] Fetched %d tracks (A:%d, B:%d, C:%d)",
-                len(all_pools),
-                len(pool_a),
-                len(pool_b),
-                len(pool_c),
             )
 
         return all_pools

@@ -490,7 +490,7 @@ class CollaborativeSnapshot:
 
 
 class CacheManager:
-    """Persistent cache for autoplay V2 subsystems."""
+    """Persistent cache for autoplay V3 subsystems."""
 
     def __init__(
         self,

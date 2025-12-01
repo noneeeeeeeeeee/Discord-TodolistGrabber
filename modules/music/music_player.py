@@ -1780,13 +1780,13 @@ class MusicPlayer(commands.Cog):
                     )
 
             if not recommendations:
-                # Resort to YouTube-based fallback recommendations
-                yt_success = await self._youtube_autoplay_fallback(
+                # Resort to Lavalink-based fallback recommendations 
+                yt_success = await self._lavalink_autoplay_fallback(
                     player, current_entry, guild_id
                 )
                 if yt_success:
                     LOG.info(
-                        "[AutoPlay] ▶️ Switched to YouTube fallback recommendations"
+                        "[AutoPlay] ▶️ Switched to Lavalink fallback recommendations"
                     )
                     return True
 
@@ -1842,11 +1842,16 @@ class MusicPlayer(commands.Cog):
             traceback.print_exc()
             return False
 
-    async def _youtube_autoplay_fallback(
+    async def _lavalink_autoplay_fallback(
         self, player: pomice.Player, current_entry: Dict[str, Any], guild_id: int
     ) -> bool:
-        """Fallback to YouTube-based autoplay recommendations."""
-        LOG.debug(f"Using YouTube autoplay fallback for guild {guild_id}")
+        """
+        Fallback to Lavalink-based autoplay recommendations.
+        
+        This is a last-resort fallback when V3 Deezer recommendations fail.
+        Uses Lavalink's search functionality to find related tracks.
+        """
+        LOG.debug(f"Using Lavalink autoplay fallback for guild {guild_id}")
 
         # Use existing recommend method
         recs = await self.recommend(player.guild, max_rec=1)

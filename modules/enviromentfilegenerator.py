@@ -29,7 +29,7 @@ def check_and_load_env_file():
             "\n"
             "LASTFM_API_KEY=YOUR_LASTFM_API_KEY\n"
             "AUTOPLAY_TELEMETRY_ENABLED=1\n"
-            "AUTOPLAY_V2_VERBOSITY=0\n"
+            "AUTOPLAY_V3_VERBOSITY=0\n"
             "\n"
             "# V3 Audio Analysis Configuration\n"
             "# ANALYSIS_MODE: 'ml' (high accuracy, requires models) or 'non-ml' (lightweight, Librosa-only)\n"

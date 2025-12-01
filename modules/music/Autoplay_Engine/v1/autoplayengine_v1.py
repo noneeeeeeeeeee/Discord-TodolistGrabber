@@ -23,7 +23,7 @@ LOG = logging.getLogger(__name__)
 # |__|__|___|_| |___|__|  |_|__,|_  |
 #                              |___|
 # This module implements Last.fm-based autoplay recommendations with Gemini AI parsing.
-# This module has been deprecated. Use it for reference only. It will be removed once 2 versions behind (v3 comes out).
+# This module has been revived for use as a fallback engine instead. Once v3 is finished, this will be improved further.
 
 LOG_LEVEL = 1  # 0=ERROR, 1=INFO, 2=DEBUG, 3=All (Higher number more verbose)
 SESSION_HISTORY_LIMIT = 50  # How many recent tracks to remember in a single session (if you change this value, you may need to change the other numbers to fit with it)
