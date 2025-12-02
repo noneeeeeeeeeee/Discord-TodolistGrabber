@@ -115,6 +115,10 @@ class SessionContext:
     last_tempo: Optional[float] = None  # BPM
     last_key: Optional[int] = None  # 0-11 (C=0, C#=1, ..., B=11)
     last_mode: Optional[int] = None  # 0=minor, 1=major
+    
+    # Anchor Artist System (Apple Music style)
+    anchor_artists: List[str] = field(default_factory=list)  # Artists with >3 completed plays
+    session_duration_minutes: float = 0.0  # For session context awareness
 
 
 class ContextTracker:
@@ -148,6 +152,13 @@ class ContextTracker:
         # Vibe steering state (Dual Vector Architecture)
         self._disliked_vectors: List[List[float]] = []  # Last ~5 disliked/skipped vibe vectors
         self._genre_skip_streaks: Dict[str, int] = {}  # Track skip count per genre (3-strike rule)
+        
+        # Anchor Artist System (Apple Music style)
+        # Track completed plays per artist across session (not just window)
+        self._artist_completed_plays: Dict[str, int] = {}  # artist -> completed play count
+        
+        # Session skip velocity tracking (for pacing recommendations)
+        self._recent_skip_timestamps: List[float] = []  # Last 5 skip timestamps
 
         LOG.info("🎯 [ContextTracker] Initialized (window=%d tracks)", history_size)
 
@@ -391,6 +402,26 @@ class ContextTracker:
             self._history.pop(0)
 
         self._last_activity = now
+        
+        # Anchor Artist System: Track completed plays (>80% progress, not skipped)
+        if not was_skipped and progress_ratio >= 0.8:
+            artist_lower = artist.lower()
+            self._artist_completed_plays[artist_lower] = (
+                self._artist_completed_plays.get(artist_lower, 0) + 1
+            )
+            
+            if self._verbose >= 2 and self._artist_completed_plays[artist_lower] == 3:
+                LOG.info(
+                    "⚓ [Anchor Artist] '%s' reached 3 completed plays - now an anchor artist",
+                    artist,
+                )
+        
+        # Skip velocity tracking: Record skip timestamps
+        if was_skipped:
+            self._recent_skip_timestamps.append(now)
+            # Keep only last 5 skip timestamps
+            if len(self._recent_skip_timestamps) > 5:
+                self._recent_skip_timestamps.pop(0)
 
         if self._verbose >= 1:
             status = "🔄 replay" if is_replay else ("⏭️ skipped" if was_skipped else "✅ finished")
@@ -626,6 +657,15 @@ class ContextTracker:
             # Energy trend = change from oldest to newest in window
             energy_trend = energy_values[-1] - energy_values[0]
 
+        # Anchor Artist System: Get artists with >3 completed plays
+        anchor_artists = [
+            artist for artist, count in self._artist_completed_plays.items()
+            if count >= 3
+        ]
+        
+        # Session duration calculation
+        session_duration_minutes = (self._last_activity - self._session_start) / 60
+
         context = SessionContext(
             focus_genres=focus_genres,
             current_mood_vector=current_mood,
@@ -644,6 +684,8 @@ class ContextTracker:
             last_tempo=last_tempo,
             last_key=last_key,
             last_mode=last_mode,
+            anchor_artists=anchor_artists,
+            session_duration_minutes=session_duration_minutes,
         )
 
         if self._verbose >= 2:
@@ -692,6 +734,14 @@ class ContextTracker:
         self._session_start = datetime.now().timestamp()
         self._last_activity = self._session_start
         self._songs_since_novelty = 0
+        
+        # Reset vibe steering state
+        self._disliked_vectors.clear()
+        self._genre_skip_streaks.clear()
+        
+        # Reset anchor artists and skip velocity
+        self._artist_completed_plays.clear()
+        self._recent_skip_timestamps.clear()
 
         if self._verbose >= 1:
             LOG.info("🔄 [Context] Session reset (cleared %d tracks)", old_count)
@@ -771,4 +821,132 @@ class ContextTracker:
             "consecutive_skips": context.consecutive_skips,
             "unique_artists": len(context.recent_artists),
             "songs_since_novelty": self._songs_since_novelty,
+            "anchor_artists": context.anchor_artists,
+            "skip_velocity": self.get_skip_velocity(),
         }
+
+    def get_anchor_artists(self) -> List[str]:
+        """
+        Get list of anchor artists (artists with >3 completed plays).
+        
+        Anchor artists are "safe zones" for mood probing before exploration.
+        If an anchor artist is skipped, it's a strong signal to change mood entirely.
+        
+        Returns:
+            List of artist names that are anchors
+        """
+        return [
+            artist for artist, count in self._artist_completed_plays.items()
+            if count >= 3
+        ]
+
+    def is_anchor_artist(self, artist: str) -> bool:
+        """Check if an artist is an anchor (>3 completed plays)."""
+        return self._artist_completed_plays.get(artist.lower(), 0) >= 3
+
+    def get_anchor_artist_score(self, artist: str) -> float:
+        """
+        Get affinity boost for anchor artists.
+        
+        Anchor artists get progressively higher boosts:
+        - 3 plays: +0.1 boost
+        - 4 plays: +0.15 boost
+        - 5+ plays: +0.2 boost (max)
+        
+        Returns:
+            Boost value 0.0-0.2
+        """
+        completed = self._artist_completed_plays.get(artist.lower(), 0)
+        if completed < 3:
+            return 0.0
+        elif completed == 3:
+            return 0.1
+        elif completed == 4:
+            return 0.15
+        else:
+            return 0.2
+
+    def get_skip_velocity(self) -> float:
+        """
+        Calculate skip velocity (skips per minute in recent window).
+        
+        Used for session context awareness:
+        - High velocity (>2/min): User is indecisive, slow down recommendations
+        - Medium velocity (0.5-2/min): Normal exploration behavior
+        - Low velocity (<0.5/min): User is satisfied, stick to current style
+        
+        Returns:
+            Skips per minute (0.0 if no recent skips)
+        """
+        if len(self._recent_skip_timestamps) < 2:
+            return 0.0
+        
+        now = datetime.now().timestamp()
+        
+        # Only consider skips in last 5 minutes
+        recent_skips = [
+            ts for ts in self._recent_skip_timestamps
+            if now - ts < 300  # 5 minutes
+        ]
+        
+        if len(recent_skips) < 2:
+            return 0.0
+        
+        # Calculate time span of recent skips
+        time_span_minutes = (recent_skips[-1] - recent_skips[0]) / 60
+        if time_span_minutes <= 0:
+            return 0.0
+        
+        return (len(recent_skips) - 1) / time_span_minutes
+
+    def should_use_safe_picks(self) -> bool:
+        """
+        Determine if the session should stick to safe picks.
+        
+        Safe picks are recommended when:
+        - Session is short (<15 minutes)
+        - Skip velocity is very high (>3/min = frustrated user)
+        - Consecutive skips is high (>=3)
+        
+        Returns:
+            True if safe picks should be prioritized
+        """
+        context = self.get_context()
+        
+        # Short session: stick to safe picks
+        if context.session_duration_minutes < 15:
+            return True
+        
+        # Rapid skipping: user is frustrated, fall back to anchors
+        if self.get_skip_velocity() > 3.0:
+            return True
+        
+        # High consecutive skips: exploration is failing
+        if context.consecutive_skips >= 3:
+            return True
+        
+        return False
+
+    def should_allow_exploration(self) -> bool:
+        """
+        Determine if the session should allow more exploration.
+        
+        Exploration is encouraged when:
+        - Session is long (>1 hour)
+        - Skip rate is low (<0.2)
+        - User has established anchor artists (trusts the system)
+        
+        Returns:
+            True if exploration should be encouraged
+        """
+        context = self.get_context()
+        
+        # Long session with low skip rate = user trusts the system
+        if context.session_duration_minutes > 60 and context.skip_rate < 0.2:
+            return True
+        
+        # Has anchor artists and good skip rate
+        if len(context.anchor_artists) >= 2 and context.skip_rate < 0.3:
+            return True
+        
+        return False

@@ -5,7 +5,7 @@ import math
 import time
 import random
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .cache_manager import CacheManager, CollaborativeSnapshot
 
@@ -13,10 +13,15 @@ LOG = logging.getLogger(__name__)
 
 _TRACK_PREFIX = "track::"
 _GENRE_PREFIX = "genre::"
+_ARTIST_PREFIX = "artist::"
+
+# Collaboration Graph boost values (per v3_reimplementation.md)
+_COLLAB_SINGLE_BOOST = 0.2   # Artist B featured on 1 track with liked Artist A
+_COLLAB_MULTI_BOOST = 0.4    # Artist B featured on 2+ tracks with liked Artist A
 
 
 class CollaborativeMatrix:
-    """Manages collaborative embeddings and serves similarity lookups."""
+    """Manages collaborative embeddings, similarity lookups, and collaboration graphs."""
 
     def __init__(
         self,
@@ -31,6 +36,14 @@ class CollaborativeMatrix:
         self._genre_vectors: Dict[str, List[float]] = {}
         self._norm_cache: Dict[str, float] = {}
         self._lock = asyncio.Lock()
+        
+        # Collaboration Graph (Apple Music style)
+        # Maps: artist -> {collaborator -> collab_count}
+        self._collaboration_graph: Dict[str, Dict[str, int]] = {}
+        
+        # Liked artists per guild for collaboration boost
+        # Maps: guild_id -> set of liked artist names
+        self._liked_artists: Dict[str, Set[str]] = {}
 
     async def hydrate(self) -> bool:
         async with self._lock:
@@ -157,7 +170,182 @@ class CollaborativeMatrix:
             "version": snapshot.version,
             "track_vectors": len(self._track_vectors),
             "genre_vectors": len(self._genre_vectors),
+            "collaboration_edges": sum(
+                len(collabs) for collabs in self._collaboration_graph.values()
+            ),
         }
+
+    # ------------------------------------------------------------------
+    # Collaboration Graph (Apple Music style)
+    # ------------------------------------------------------------------
+    def record_collaboration(
+        self,
+        primary_artist: str,
+        collaborators: List[str],
+    ) -> None:
+        """
+        Record collaborations between artists.
+        
+        Called when enriching tracks with featured artists.
+        
+        Args:
+            primary_artist: Main artist on the track
+            collaborators: List of featured/collaborating artists
+        """
+        primary_lower = primary_artist.lower()
+        
+        for collab in collaborators:
+            collab_lower = collab.lower()
+            if collab_lower == primary_lower:
+                continue  # Skip self-reference
+            
+            # Bidirectional: A collaborated with B, B collaborated with A
+            if primary_lower not in self._collaboration_graph:
+                self._collaboration_graph[primary_lower] = {}
+            if collab_lower not in self._collaboration_graph:
+                self._collaboration_graph[collab_lower] = {}
+            
+            # Increment collaboration count
+            self._collaboration_graph[primary_lower][collab_lower] = (
+                self._collaboration_graph[primary_lower].get(collab_lower, 0) + 1
+            )
+            self._collaboration_graph[collab_lower][primary_lower] = (
+                self._collaboration_graph[collab_lower].get(primary_lower, 0) + 1
+            )
+
+    def mark_artist_liked(self, guild_id: str, artist: str) -> None:
+        """
+        Mark an artist as liked for a guild (for collaboration boost).
+        
+        Args:
+            guild_id: Guild identifier
+            artist: Artist name
+        """
+        guild_str = str(guild_id)
+        if guild_str not in self._liked_artists:
+            self._liked_artists[guild_str] = set()
+        self._liked_artists[guild_str].add(artist.lower())
+
+    def get_collaboration_boost(
+        self,
+        guild_id: str,
+        artist: str,
+    ) -> float:
+        """
+        Calculate collaboration boost for an artist based on liked artists.
+        
+        Per v3_reimplementation.md:
+        - Artist B featured on 1 track with liked Artist A: +0.2
+        - Artist B featured on 2+ tracks with liked Artist A: +0.4
+        - Collaborative tracks (A + B together): +0.4
+        
+        Args:
+            guild_id: Guild identifier
+            artist: Artist to check for collaboration boost
+            
+        Returns:
+            Boost value (0.0, 0.2, or 0.4)
+        """
+        guild_str = str(guild_id)
+        
+        if guild_str not in self._liked_artists:
+            return 0.0
+        
+        liked = self._liked_artists[guild_str]
+        artist_lower = artist.lower()
+        
+        # If this artist is already liked, no additional boost
+        if artist_lower in liked:
+            return 0.0
+        
+        # Check if this artist has collaborated with any liked artist
+        if artist_lower not in self._collaboration_graph:
+            return 0.0
+        
+        artist_collabs = self._collaboration_graph[artist_lower]
+        
+        max_collab_count = 0
+        for liked_artist in liked:
+            if liked_artist in artist_collabs:
+                max_collab_count = max(max_collab_count, artist_collabs[liked_artist])
+        
+        if max_collab_count >= 2:
+            return _COLLAB_MULTI_BOOST  # +0.4 for 2+ collaborations
+        elif max_collab_count >= 1:
+            return _COLLAB_SINGLE_BOOST  # +0.2 for 1 collaboration
+        
+        return 0.0
+
+    def get_collaborative_artists(
+        self,
+        artist: str,
+        *,
+        min_collabs: int = 1,
+    ) -> List[Tuple[str, int]]:
+        """
+        Get list of artists who have collaborated with the given artist.
+        
+        Args:
+            artist: Artist to find collaborators for
+            min_collabs: Minimum collaboration count to include
+            
+        Returns:
+            List of (artist_name, collab_count) tuples, sorted by count desc
+        """
+        artist_lower = artist.lower()
+        
+        if artist_lower not in self._collaboration_graph:
+            return []
+        
+        collabs = [
+            (name, count)
+            for name, count in self._collaboration_graph[artist_lower].items()
+            if count >= min_collabs
+        ]
+        
+        # Sort by collaboration count (descending)
+        collabs.sort(key=lambda x: x[1], reverse=True)
+        return collabs
+
+    def build_collaboration_clusters(
+        self,
+        seed_artist: str,
+        *,
+        depth: int = 2,
+        min_collabs: int = 2,
+    ) -> Set[str]:
+        """
+        Build a cluster of related artists through collaboration chains.
+        
+        Useful for genre bridging - discovering new artists through
+        trusted connections.
+        
+        Args:
+            seed_artist: Starting artist
+            depth: How many hops to follow (1 = direct collabs, 2 = collabs of collabs)
+            min_collabs: Minimum collaboration count to follow
+            
+        Returns:
+            Set of artist names in the cluster
+        """
+        cluster: Set[str] = {seed_artist.lower()}
+        frontier = {seed_artist.lower()}
+        
+        for _ in range(depth):
+            next_frontier: Set[str] = set()
+            
+            for artist in frontier:
+                collabs = self.get_collaborative_artists(artist, min_collabs=min_collabs)
+                for collab_name, _ in collabs:
+                    if collab_name not in cluster:
+                        cluster.add(collab_name)
+                        next_frontier.add(collab_name)
+            
+            frontier = next_frontier
+            if not frontier:
+                break
+        
+        return cluster
 
     # ------------------------------------------------------------------
     # Internal helpers

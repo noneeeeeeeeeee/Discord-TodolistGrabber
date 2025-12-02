@@ -22,7 +22,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, cast
 
 import aiohttp
 
-from .autoplayengine_v3 import AutoplayEngineV3, LASTFM_API_KEY_ENV
+from .config import LASTFM_API_KEY_ENV, PRIORITY_ACTIVE, PRIORITY_BUFFER, PRIORITY_DAYDREAM
+from .autoplayengine_v3 import AutoplayEngineV3
 from .contextual_recommender import CandidateFeatures
 from .context_tracker import ContextTracker
 from .novelty_controller import NoveltyController, NoveltyConfig

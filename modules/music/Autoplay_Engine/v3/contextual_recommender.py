@@ -31,10 +31,15 @@ Scoring Jobs:
 1. Vibe Steering: 70% PULL to liked_mood_vector, 30% PUSH from disliked_mood_vector
 2. Energy Flow: Penalize jarring dB jumps (>10dB = -0.6 penalty)
 3. Harmonic Mixing: Camelot wheel compatibility for key transitions
+4. Session Momentum: Limit BPM/energy jumps for smooth transitions (max 30 BPM, 0.3 energy)
+
+NOTE: Time-based energy bias was removed - server timezone != user timezone.
+Discord guilds span multiple timezones, making server-side time unreliable.
 """
 import logging
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -250,16 +255,28 @@ class ContextualRecommender:
                 last_mode=last_mode,
             )
 
-            # Updated score composition with harmonic mixing
-            # 30% mood (vibe steering) + 20% genre + 15% harmonic + 10% energy flow + 25% content/session/quality
+            # Apple Music Feature: Session momentum (smooth transitions)
+            # NOTE: Time-based energy bias removed - server timezone != user timezone
+            # Discord users span multiple timezones, making server-side time unreliable
+            momentum_score = self._score_session_momentum(
+                candidate_tempo=candidate.computed_tempo,
+                candidate_energy=candidate.energy,
+                last_tempo=last_tempo,
+                last_energy=last_energy,
+            )
+
+            # Updated score composition with Apple Music features
+            # 28% mood (vibe steering) + 18% genre + 14% harmonic + 12% energy flow
+            # + 12% momentum + 16% content/session/quality
             base_score = (
-                mood_alignment * 0.30  # Vibe steering with push/pull
-                + genre_coherence * 0.20  # Genre coherence
-                + harmonic_coherence * 0.15  # Key compatibility (NEW!)
-                + energy_flow * 0.10  # Volume/energy transitions
-                + content_similarity * 0.12
-                + session_similarity * 0.08
-                + quality * 0.05
+                mood_alignment * 0.28  # Vibe steering with push/pull
+                + genre_coherence * 0.18  # Genre coherence
+                + harmonic_coherence * 0.14  # Key compatibility
+                + energy_flow * 0.12  # Volume/energy transitions
+                + momentum_score * 0.12  # Session momentum (BPM/energy limits)
+                + content_similarity * 0.10
+                + session_similarity * 0.04
+                + quality * 0.02
             )
 
             collaborative_score = 0.0
@@ -306,6 +323,7 @@ class ContextualRecommender:
                         "genre_coherence": genre_coherence,
                         "energy_flow": energy_flow,
                         "harmonic_coherence": harmonic_coherence,
+                        "momentum_score": momentum_score,
                         "feedback_multiplier": candidate.feedback_multiplier,
                         "diversity_penalty": candidate.diversity_penalty,
                         "extra_weight": candidate.extra_weight,
@@ -356,20 +374,26 @@ class ContextualRecommender:
         last_mode: Optional[int] = None,
     ) -> List[ScoredCandidate]:
         """
-        Progressive Recommendation Logic (Phase 2):
-        - Cache < 50: Cold Start (Bootstrapped Charts)
-        - Cache < 200: Content-Based (V3 Embeddings)
-        - Cache > 200: Hybrid (Content + Collaborative)
+        Progressive Recommendation Logic (Apple Music Cold Start Thresholds):
+        
+        | Cache Size | Autoplay State | Matching Mode                    |
+        |------------|----------------|----------------------------------|
+        | 0-100      | DISABLED       | Show "Building taste profile..." |
+        | 100-300    | LIMITED        | Conservative matching only       |
+        | 300-500    | BASIC          | Genre-based recommendations      |
+        | 500+       | FULL           | Embedding similarity unlocked    |
         """
         if not candidates:
             return []
 
-        # Determine mode based on cache size
-        mode = "hybrid"
-        if cache_size < 50:
-            mode = "cold_start"
-        elif cache_size < 200:
-            mode = "content_based"
+        # Determine mode based on cache size (per v3_reimplementation.md spec)
+        mode = "full"
+        if cache_size < 100:
+            mode = "disabled"
+        elif cache_size < 300:
+            mode = "limited"
+        elif cache_size < 500:
+            mode = "basic"
         
         LOG.debug(f"Progressive Logic: Mode={mode} (Cache={cache_size})")
 
@@ -377,17 +401,24 @@ class ContextualRecommender:
         original_enabled = self.is_collaborative_enabled(guild_id)
         
         try:
-            if mode == "cold_start":
-                # Cold Start: Disable collaborative, rely on base scoring (content/quality)
+            if mode == "disabled":
+                # Cache too small: Rely entirely on base quality/popularity
+                # No embedding similarity, no collaborative
+                self.set_collaborative_enabled(guild_id, False)
+                LOG.debug("⏳ [Cold Start] Cache < 100: Building taste profile...")
+                
+            elif mode == "limited":
+                # Conservative: Genre-based + light content matching
+                # No collaborative filtering, limited embedding use
                 self.set_collaborative_enabled(guild_id, False)
                 
-            elif mode == "content_based":
-                # Content-Based: Disable collaborative, rely on V3 embeddings
+            elif mode == "basic":
+                # Genre-based + content similarity
+                # Still no collaborative (not enough data)
                 self.set_collaborative_enabled(guild_id, False)
                 
-            elif mode == "hybrid":
-                # Hybrid: Enable collaborative if globally allowed
-                # We assume the caller wants to use it if available
+            elif mode == "full":
+                # Full mode: Enable all features including collaborative
                 self.set_collaborative_enabled(guild_id, True)
 
             # Call the standard scoring
@@ -738,6 +769,127 @@ class ContextualRecommender:
             return 0.50
         else:
             return 0.30
+
+    @staticmethod
+    def _get_time_based_energy_bias() -> float:
+        """
+        Apple Music-style time-of-day energy bias.
+        
+        Adjusts target energy based on time of day:
+        - Morning (6am-10am): +0.1 energy boost for motivation
+        - Midday (10am-2pm): Neutral (focus/work time)
+        - Afternoon (2pm-6pm): +0.05 slight boost
+        - Evening (6pm-10pm): Neutral (variety time)
+        - Night (10pm-2am): -0.15 chill time
+        - Late Night (2am-6am): -0.2 ambient/sleep
+        
+        Returns:
+            Energy bias adjustment (-0.2 to +0.1)
+        """
+        hour = datetime.now().hour
+        
+        if 6 <= hour < 10:
+            return 0.1  # Morning motivation
+        elif 10 <= hour < 14:
+            return 0.0  # Neutral (focus/work)
+        elif 14 <= hour < 18:
+            return 0.05  # Afternoon boost
+        elif 18 <= hour < 22:
+            return 0.0  # Neutral (evening variety)
+        elif 22 <= hour or hour < 2:
+            return -0.15  # Night chill
+        else:  # 2am-6am
+            return -0.2  # Late night ambient
+
+    @staticmethod
+    def _score_time_energy_alignment(
+        candidate_energy: Optional[float],
+    ) -> float:
+        """
+        Score how well a candidate's energy matches the time-of-day preference.
+        
+        Args:
+            candidate_energy: Energy level 0.0-1.0
+            
+        Returns:
+            Score from 0.0 to 1.0 based on time alignment
+        """
+        if candidate_energy is None:
+            return 0.5  # Neutral when no energy data
+        
+        energy_bias = ContextualRecommender._get_time_based_energy_bias()
+        
+        # Target energy: 0.5 (neutral) + bias adjustment
+        target_energy = 0.5 + energy_bias
+        target_energy = max(0.0, min(1.0, target_energy))
+        
+        # Score based on distance from target
+        # Perfect match = 1.0, opposite = 0.0
+        distance = abs(candidate_energy - target_energy)
+        score = 1.0 - distance
+        
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _score_session_momentum(
+        candidate_tempo: Optional[float],
+        candidate_energy: Optional[float],
+        last_tempo: Optional[float],
+        last_energy: Optional[float],
+    ) -> float:
+        """
+        Apple Music-style session momentum scoring.
+        
+        Prevents jarring transitions by limiting:
+        - Max BPM jump: 30 BPM
+        - Max energy delta: 0.3
+        
+        Gradual drift (5 BPM per song) is acceptable and even encouraged
+        for building momentum.
+        
+        Args:
+            candidate_tempo: Candidate BPM
+            candidate_energy: Candidate energy 0-1
+            last_tempo: Previous track BPM
+            last_energy: Previous track energy 0-1
+            
+        Returns:
+            Score from 0.0 (jarring) to 1.0 (smooth transition)
+        """
+        score = 1.0
+        
+        # BPM momentum check
+        if candidate_tempo is not None and last_tempo is not None:
+            bpm_delta = abs(candidate_tempo - last_tempo)
+            
+            if bpm_delta > 30:
+                # Severe penalty for jarring BPM jumps
+                score -= 0.5
+            elif bpm_delta > 20:
+                # Moderate penalty
+                score -= 0.2
+            elif bpm_delta > 10:
+                # Light penalty
+                score -= 0.05
+            elif bpm_delta <= 5:
+                # Bonus for gradual drift
+                score += 0.1
+        
+        # Energy momentum check
+        if candidate_energy is not None and last_energy is not None:
+            energy_delta = abs(candidate_energy - last_energy)
+            
+            if energy_delta > 0.3:
+                # Severe penalty for jarring energy jumps
+                score -= 0.4
+            elif energy_delta > 0.2:
+                # Moderate penalty
+                score -= 0.15
+            elif energy_delta <= 0.1:
+                # Bonus for smooth transition
+                score += 0.1
+        
+        return max(0.0, min(1.0, score))
 
     @staticmethod
     def _clamp01(value: float) -> float:

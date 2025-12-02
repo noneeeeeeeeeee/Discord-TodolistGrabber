@@ -281,50 +281,6 @@ class GeminiService:
             payload["primary_entity"] = primary_entity
         return payload
 
-    async def classify_mood_vector(
-        self,
-        metadata: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        """Derive mood/energy descriptors from enriched metadata."""
-
-        tags = metadata.get("tags") or []
-        genre = metadata.get("genre") or ""
-        description = metadata.get("description") or ""
-        prompt = self._build_mood_prompt(tags, genre, description)
-        response = await self._generate(prompt)
-        if not response:
-            return None
-
-        payload = self._extract_json_dict(response)
-        if not isinstance(payload, dict):
-            return None
-
-        mood = str(payload.get("mood", "")).strip() or None
-        energy = float(payload.get("energy", 0.0) or 0.0)
-        valence = float(payload.get("valence", 0.0) or 0.0)
-        tempo = float(payload.get("tempo", 0.0) or 0.0)
-        confidence = float(payload.get("confidence", 0.0) or 0.0)
-        
-        # New Cultural Tags
-        vibe_situation = str(payload.get("vibe_situation", "")).strip() or None
-        lyrical_themes = str(payload.get("lyrical_themes", "")).strip() or None
-        similar_artists = payload.get("similar_artists", [])
-        if isinstance(similar_artists, str):
-            similar_artists = [similar_artists]
-        era_scene = str(payload.get("era_scene", "")).strip() or None
-
-        return {
-            "mood": mood,
-            "energy": energy,
-            "valence": valence,
-            "tempo": tempo,
-            "confidence": confidence,
-            "vibe_situation": vibe_situation,
-            "lyrical_themes": lyrical_themes,
-            "similar_artists": similar_artists,
-            "era_scene": era_scene,
-        }
-
     async def generate_deezer_queries_lite(
         self,
         title: str,

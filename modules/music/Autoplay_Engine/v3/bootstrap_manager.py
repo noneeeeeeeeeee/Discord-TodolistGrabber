@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Set, Optional, List, Dict, Any
 
 from .deezer_fetch import DeezerClient
 from .cache_manager import MappingEntry, EnrichmentEntry
-from .autoplayengine_v3 import PRIORITY_DAYDREAM, MAX_QUEUE_BACKLOG
+from .config import PRIORITY_DAYDREAM, MAX_QUEUE_BACKLOG
 
 if TYPE_CHECKING:
     from .autoplayengine_v3 import AutoplayEngineV3

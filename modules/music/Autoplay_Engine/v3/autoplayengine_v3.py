@@ -40,30 +40,24 @@ except ImportError:
 
 LOG = logging.getLogger(__name__)
 
-# Verbosity control for debugging
-DEFAULT_VERBOSITY = int(os.getenv("AUTOPLAY_V3_VERBOSITY", "0"))
-LASTFM_API_KEY_ENV = "LASTFM_API_KEY"
-PARSING_SCHEMA_VERSION = 2
-
-# V3 Configuration: Read from environment variables with sensible defaults
-DEFAULT_ANALYSIS_MODE = os.getenv("ANALYSIS_MODE", "ml").lower()  # "ml" or "non-ml"
-DEFAULT_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "mn10_as").lower()
-MAX_ANALYSIS_RETRIES = 3
-
-# Priority Queue System (Apple Music-style)
-# P1: Active enrichment - user waiting, top candidates only (15-25)
-# P2: Buffer building - maintains 5-song ready buffer
-# P3: Daydreaming - background research when idle (50 per batch)
-PRIORITY_ACTIVE = 1      # P1: User-triggered, immediate need
-PRIORITY_BUFFER = 2      # P2: Buffer refill, background
-PRIORITY_DAYDREAM = 3    # P3: Proactive caching, lowest priority
-
-# Queue limits
-DAYDREAM_QUEUE_BACKLOG_LIMIT = 200  # Pause daydreaming if queue > 200
-DAYDREAM_BATCH_SIZE = 50            # Songs per daydream batch
-BUFFER_TARGET_SIZE = 5              # Apple Music-style 5-song buffer
-P1_CANDIDATE_LIMIT = 25             # Max candidates for P1 (user waiting)
-P1_TIMEOUT_SECONDS = 10             # Notify user if P1 takes longer
+# Import shared configuration constants to avoid circular imports
+from .config import (
+    DEFAULT_VERBOSITY,
+    LASTFM_API_KEY_ENV,
+    PARSING_SCHEMA_VERSION,
+    DEFAULT_ANALYSIS_MODE,
+    DEFAULT_EMBEDDING_MODEL,
+    MAX_ANALYSIS_RETRIES,
+    PRIORITY_ACTIVE,
+    PRIORITY_BUFFER,
+    PRIORITY_DAYDREAM,
+    DAYDREAM_QUEUE_BACKLOG_LIMIT,
+    DAYDREAM_BATCH_SIZE,
+    BUFFER_TARGET_SIZE,
+    P1_CANDIDATE_LIMIT,
+    P1_TIMEOUT_SECONDS,
+    MAX_QUEUE_BACKLOG,
+)
 
 print("[AutoplayEngineV3] Set verbosity to ", DEFAULT_VERBOSITY)
 print(

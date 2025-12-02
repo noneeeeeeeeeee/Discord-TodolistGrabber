@@ -1,16 +1,18 @@
 import asyncio
 import json
 import logging
+import math
 import random
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence
 
 LOG = logging.getLogger(__name__)
 
 _SECONDS_PER_DAY = 86400
+_SKIP_DECAY_DAYS = 7  # Skip penalties decay over 7 days
 _ALLOWED_EVENT_TYPES = {
     "play",
     "finish",
@@ -53,6 +55,41 @@ class TelemetryEvent:
         return payload
 
 
+@dataclass
+class SkipPenalty:
+    """
+    Track-level skip penalty with timestamp for decay calculation.
+    
+    Apple Music-style decay: penalties reduce over 7 days.
+    
+    NOTE: Currently stored in memory only - lost on session end/bot restart.
+    Future implementation will persist to guild telemetry files and restore
+    on session start. This ties into the export/import autoplay feature (V2).
+    
+    For now, skip penalties only persist within a single session.
+    """
+    track_id: str
+    penalty: float  # Base penalty (-0.3 for skip, -0.5 for "less like this")
+    timestamp: float
+    
+    def get_decayed_penalty(self, now: Optional[float] = None) -> float:
+        """
+        Calculate penalty with 7-day exponential decay.
+        
+        Formula: decayed_penalty = penalty * exp(-days_elapsed / 7)
+        
+        Returns:
+            Decayed penalty (approaches 0 over time)
+        """
+        if now is None:
+            now = time.time()
+        
+        days_elapsed = (now - self.timestamp) / _SECONDS_PER_DAY
+        decay_factor = math.exp(-days_elapsed / _SKIP_DECAY_DAYS)
+        
+        return self.penalty * decay_factor
+
+
 class FeedbackManager:
     """
     Collects feedback signals and emits session-scoped telemetry per guild.
@@ -89,6 +126,16 @@ class FeedbackManager:
 
         # Track active sessions per guild
         self._active_sessions: Dict[str, str] = {}  # guild_id -> session_id
+
+        # Skip Penalty Decay System (Apple Music style)
+        # Tracks: {track_id: SkipPenalty} - penalties decay over 7 days
+        # NOTE: In-memory only for now. Persistence requires export/import feature (V2)
+        # Future: Load from guild telemetry on session start, save on session end
+        self._skip_penalties: Dict[str, SkipPenalty] = {}
+        
+        # Artist session skip counter (resets each session)
+        # {guild_id: {artist: skip_count}}
+        self._artist_session_skips: Dict[str, Dict[str, int]] = {}
 
         self._io_lock = asyncio.Lock()
 
@@ -168,6 +215,10 @@ class FeedbackManager:
         # Remove active session
         if guild_str in self._active_sessions:
             del self._active_sessions[guild_str]
+        
+        # Reset artist session skip counter
+        if guild_str in self._artist_session_skips:
+            del self._artist_session_skips[guild_str]
 
         # Delete guild telemetry file
         guild_file = self._telemetry_dir / f"{guild_str}.jsonl"
@@ -231,7 +282,174 @@ class FeedbackManager:
             "global_events": len(self._global_buffer),
             "active_sessions": len(self._active_sessions),
             "guild_files": len(self._guild_telemetry_files),
+            "tracked_skip_penalties": len(self._skip_penalties),
         }
+
+    # -------------------------------------------------------------------------
+    # Skip Penalty Decay System (Apple Music style)
+    # -------------------------------------------------------------------------
+    def record_skip_penalty(
+        self,
+        track_id: str,
+        *,
+        penalty: float = -0.3,
+        guild_id: Optional[str] = None,
+        artist: Optional[str] = None,
+    ) -> None:
+        """
+        Record a skip penalty for a track with decay timestamp.
+        
+        Penalty weights:
+        - Quick skip (<15s): -0.3
+        - "Less Like This": -0.5
+        - Artist skip x2 in session: -0.1 additional
+        
+        Args:
+            track_id: Track identifier
+            penalty: Penalty value (negative)
+            guild_id: Guild for artist session tracking
+            artist: Artist name for session skip counting
+        """
+        now = time.time()
+        
+        # Stack penalties if track already has one (additive)
+        if track_id in self._skip_penalties:
+            existing = self._skip_penalties[track_id]
+            # Combine penalties (more negative = stronger dislike)
+            combined_penalty = max(-1.0, existing.penalty + penalty)
+            self._skip_penalties[track_id] = SkipPenalty(
+                track_id=track_id,
+                penalty=combined_penalty,
+                timestamp=now,  # Reset decay clock
+            )
+        else:
+            self._skip_penalties[track_id] = SkipPenalty(
+                track_id=track_id,
+                penalty=penalty,
+                timestamp=now,
+            )
+        
+        # Track artist session skips
+        if guild_id and artist:
+            guild_str = str(guild_id)
+            if guild_str not in self._artist_session_skips:
+                self._artist_session_skips[guild_str] = {}
+            
+            artist_lower = artist.lower()
+            self._artist_session_skips[guild_str][artist_lower] = (
+                self._artist_session_skips[guild_str].get(artist_lower, 0) + 1
+            )
+            
+            # 2+ artist skips in session = additional penalty
+            if self._artist_session_skips[guild_str][artist_lower] >= 2:
+                LOG.debug(
+                    "📉 [Feedback] Artist '%s' skipped %d times this session, applying -0.1 penalty",
+                    artist,
+                    self._artist_session_skips[guild_str][artist_lower],
+                )
+
+    def record_less_like_this(
+        self,
+        track_id: str,
+        embedding: Optional[List[float]] = None,
+    ) -> None:
+        """
+        Record "Less Like This" explicit dislike.
+        
+        Per spec:
+        - Track penalty: -0.5
+        - Similar embeddings penalty: -0.2 (if provided)
+        
+        Args:
+            track_id: Track identifier
+            embedding: Track embedding for similarity penalty (future use)
+        """
+        self.record_skip_penalty(track_id, penalty=-0.5)
+        
+        # TODO: When collaborative matrix is ready, apply -0.2 to similar embeddings
+        if embedding:
+            LOG.debug(
+                "📉 [Feedback] 'Less Like This' recorded for %s (embedding penalty pending)",
+                track_id,
+            )
+
+    def get_track_penalty(self, track_id: str) -> float:
+        """
+        Get current decayed penalty for a track.
+        
+        Returns:
+            Decayed penalty value (0.0 if no penalty or fully decayed)
+        """
+        if track_id not in self._skip_penalties:
+            return 0.0
+        
+        penalty = self._skip_penalties[track_id]
+        decayed = penalty.get_decayed_penalty()
+        
+        # Remove if penalty has decayed to negligible
+        if abs(decayed) < 0.01:
+            del self._skip_penalties[track_id]
+            return 0.0
+        
+        return decayed
+
+    def get_feedback_multiplier(self, track_id: str) -> float:
+        """
+        Get feedback multiplier for scoring (1.0 + penalty).
+        
+        Returns:
+            Multiplier for candidate scoring (0.5 to 1.0 range)
+        """
+        penalty = self.get_track_penalty(track_id)
+        # Convert penalty to multiplier (penalty is negative, so this reduces score)
+        multiplier = 1.0 + penalty
+        return max(0.5, min(1.0, multiplier))
+
+    def get_artist_session_skips(self, guild_id: str, artist: str) -> int:
+        """Get number of times an artist was skipped this session."""
+        guild_str = str(guild_id)
+        if guild_str not in self._artist_session_skips:
+            return 0
+        return self._artist_session_skips[guild_str].get(artist.lower(), 0)
+
+    def get_artist_penalty(self, guild_id: str, artist: str) -> float:
+        """
+        Get session-based artist penalty.
+        
+        Per spec: 2+ artist skips/session = -0.1 affinity (resets next session)
+        
+        Returns:
+            Penalty value (0.0 or -0.1)
+        """
+        skip_count = self.get_artist_session_skips(guild_id, artist)
+        if skip_count >= 2:
+            return -0.1
+        return 0.0
+
+    def cleanup_decayed_penalties(self) -> int:
+        """
+        Remove fully decayed penalties to free memory.
+        
+        Returns:
+            Number of penalties removed
+        """
+        now = time.time()
+        to_remove = []
+        
+        for track_id, penalty in self._skip_penalties.items():
+            if abs(penalty.get_decayed_penalty(now)) < 0.01:
+                to_remove.append(track_id)
+        
+        for track_id in to_remove:
+            del self._skip_penalties[track_id]
+        
+        if to_remove:
+            LOG.debug(
+                "🧹 [Feedback] Cleaned up %d fully decayed penalties",
+                len(to_remove),
+            )
+        
+        return len(to_remove)
 
     # -------------------------------------------------------------------------
     # Private Helpers
@@ -275,4 +493,4 @@ class FeedbackManager:
 
 
 
-__all__ = ["FeedbackManager", "TelemetryEvent"]
+__all__ = ["FeedbackManager", "TelemetryEvent", "SkipPenalty"]

@@ -1,42 +1,48 @@
-# Core Idea:
+# Core Idea
+
 Quality over speed. Users have to wait for a certain amount of time for cold start. While the bot initializes
 
 > "Apple Music's algorithm analyzes a vast array of data points, from individual listening habits to broader trends in music consumption. This includes the genres a user prefers, the artists they listen to most, how often they play certain songs, and even the time of day they're most active."
 
 ---
 
-## Machine Learning Enrichment (4-Factor System):
+## Machine Learning Enrichment (4-Factor System)
 
 The Enrichment includes 4 different factors from Librosa, EfficientAT, Deezer, and GeminiAPI. All are crucial and have NO fallbacks.
 
-### 1. Librosa (Audio Structure Analysis):
+### 1. Librosa (Audio Structure Analysis)
+
 - **BPM/Tempo**: Beats per minute for energy matching
-- **Key/Scale**: Musical key detection for harmonic compatibility  
+- **Key/Scale**: Musical key detection for harmonic compatibility
 - **Energy Curve**: How energy evolves through the song (intro → buildup → drop → outro)
 - **Spectral Features**: Brightness, rolloff, centroid for tonal characteristics
 - **Onset Strength**: Rhythmic intensity and groove patterns
 
-### 2. EfficientAT (MobileNetV3 - Semantic Audio Tags):
+### 2. EfficientAT (MobileNetV3 - Semantic Audio Tags)
+
 - **Mood Tags**: Happy, sad, energetic, chill, aggressive, melancholic
 - **Instrument Detection**: Guitar, synth, drums, piano, vocals, bass
 - **Genre Classification**: Multi-label genre probabilities (pop: 0.8, electronic: 0.3)
 - **Embedding Vector**: 512-dim vector for similarity calculations (cosine distance)
 
-### 3. Deezer (Metadata & Audio):
+### 3. Deezer (Metadata & Audio)
+
 - **Track Metadata**: Artist, album, release date, explicit flag, ISRC
 - **Genre Tags**: Official Deezer genre classification
 - **Preview URL**: 30-second HQ audio preview for analysis
 - **Collaboration Artists**: Featured artists for graph expansion
 - **Related Artists**: Deezer's built-in artist similarity
 
-### 4. GeminiAPI (Cultural Context & Semantic Understanding):
+### 4. GeminiAPI (Cultural Context & Semantic Understanding)
+
 - **Lyrical Themes**: Love, party, breakup, motivation, storytelling
 - **Cultural Context**: Era, scene, movement (e.g., "90s grunge", "UK garage revival")
 - **Mood Descriptors**: Natural language mood descriptions beyond simple tags
 - **Artist Context**: Career phase, typical sound, notable collaborations
 - **Use Cases**: "Good for workout", "late night vibes", "road trip energy"
 
-### Enrichment Output (per track):
+### Enrichment Output (per track)
+
 ```json
 {
   "track_id": "artist::title",
@@ -64,11 +70,13 @@ This daydreamer is needed as no music metadata is provided upon first bot start.
 ## Daydreamer Behavior
 
 **Genre-Weighted Exploration:**
+
 - If telemetry shows users listen to pop more → prioritize pop exploration
 - Dynamic genre balancing based on actual user preferences
 - Tracks "heat" of each genre based on play counts
 
 **Batch Processing:**
+
 - Daydreams until reaching 50 tracks per batch
 - If focused on pop → grab pop tracks depth-first until batch complete
 - Next run: A) Continue exploring same vein, OR B) Choose another genre from list
@@ -76,31 +84,33 @@ This daydreamer is needed as no music metadata is provided upon first bot start.
 ## Cold Start Bootstrap (First Run)
 
 Upon bot first boot:
+
 1. Fetch pool of 50 popular tracks from Deezer charts
 2. Ingest up to **500 tracks** on FIRST run
 3. Autoplay is **DISABLED** until 500 tracks in cache
 4. Total after first run: 550 tracks (500 bootstrap + 50 first batch)
 
 **Skip Option for Owner:**
+
 - Bot checks if user is owner running music command
 - Prompt: "Process first run daydreamer in background?"
 - If yes → queue songs in background, user can play immediately
 
 ## Cold Start Thresholds
 
-| Cache Size | Autoplay State | Matching Mode |
-|------------|----------------|---------------|
-| 0-100 | DISABLED | Show "Building taste profile..." |
-| 100-300 | LIMITED | Conservative matching only |
-| 300-500 | BASIC | Genre-based recommendations |
-| 500+ | FULL | Embedding similarity unlocked |
+| Cache Size | Autoplay State | Matching Mode                    |
+| ---------- | -------------- | -------------------------------- |
+| 0-100      | DISABLED       | Show "Building taste profile..." |
+| 100-300    | LIMITED        | Conservative matching only       |
+| 300-500    | BASIC          | Genre-based recommendations      |
+| 500+       | FULL           | Embedding similarity unlocked    |
 
 ## New Releases Check
 
 - Check every **1 month** for new releases
 - If batch 21 runs and >1 month since last check → run new releases function
 - If new releases fill 50 tracks → signal next batch to continue checking
-- Otherwise, resume normal exploration 
+- Otherwise, resume normal exploration
 
 ---
 
@@ -114,17 +124,18 @@ Apple Music shows ~10 tracks in "Playing Next", but for Discord we target **5 so
 
 Like a waiter refilling your cup - when buffer drops below 5, start adding more:
 
-| Buffer Size | Action |
-|-------------|--------|
-| 5 songs | Full - no action needed |
-| 4 songs | Start enriching 1 candidate |
-| 3 songs | Enriching 2 candidates |
-| <3 songs | Priority enrichment mode |
-| 0 songs | User must wait (Quality > Speed) |
+| Buffer Size | Action                           |
+| ----------- | -------------------------------- |
+| 5 songs     | Full - no action needed          |
+| 4 songs     | Start enriching 1 candidate      |
+| 3 songs     | Enriching 2 candidates           |
+| <3 songs    | Priority enrichment mode         |
+| 0 songs     | User must wait (Quality > Speed) |
 
 ### Skip Behavior & Reversion
 
 When user skips repeatedly:
+
 1. **1-2 skips**: Normal - variance is expected
 2. **3+ consecutive skips**: Pivot to different mood/energy, NOT artist ban
 3. **Keep skipping**: Revert to "anchor artists" (safe zone)
@@ -135,6 +146,7 @@ When user skips repeatedly:
 ### Queue Variance (Novelty Injection)
 
 Buffer isn't all identical tracks - includes variance:
+
 - **70%**: Familiar (artist played before OR embedding similarity >0.85)
 - **30%**: Discovery (new artist with embedding similarity 0.6-0.8)
 - **Never**: Similarity <0.5 (too jarring)
@@ -147,15 +159,15 @@ Buffer isn't all identical tracks - includes variance:
 
 ### User Behavior Signals (Weight)
 
-| Signal | Weight | Meaning |
-|--------|--------|---------|
-| **Play-through rate** | HIGH | Did they finish (>80%) or skip early (<15s)? |
-| **Repeat listens** | HIGH | Coming back = strong positive signal |
-| **"More Like This"** | +0.5 | Explicit positive feedback |
-| **"Less Like This"** | -0.5 | Track penalty, -0.2 to similar embeddings |
-| **Quick skip (<15s)** | -0.3 | Negative signal for track |
-| **2+ artist skips/session** | -0.1 | Light artist penalty (not ban) |
-| **Full listen + no skip** | +0.2 | Passive positive signal |
+| Signal                      | Weight | Meaning                                      |
+| --------------------------- | ------ | -------------------------------------------- |
+| **Play-through rate**       | HIGH   | Did they finish (>80%) or skip early (<15s)? |
+| **Repeat listens**          | HIGH   | Coming back = strong positive signal         |
+| **"More Like This"**        | +0.5   | Explicit positive feedback                   |
+| **"Less Like This"**        | -0.5   | Track penalty, -0.2 to similar embeddings    |
+| **Quick skip (<15s)**       | -0.3   | Negative signal for track                    |
+| **2+ artist skips/session** | -0.1   | Light artist penalty (not ban)               |
+| **Full listen + no skip**   | +0.2   | Passive positive signal                      |
 
 ### Skip Penalty Decay System
 
@@ -177,12 +189,11 @@ Artist skip x2: -0.1 affinity (per session, resets next session)
 ### Session Momentum (Energy Flow)
 
 Avoid jarring transitions:
+
 - Track energy/BPM trend across last 5 songs
 - Max allowed jump: **30 BPM** or **0.3 energy delta**
 - Use "transition bridges" (medium-energy tracks) to shift genres
 - Gradual drift: 5 BPM change per song is acceptable
-
-
 
 ---
 
@@ -197,6 +208,7 @@ The gemini_service.py needs cleanup. Changes to cache_manager and deezer_fetch r
 Use Gemini-Flash to extract 3 search keywords from YouTube title:
 
 **Example:**
+
 ```
 YouTube: "Live To Live | Hazbin Hotel Season 2 | Prime Video"
 Search:  "Live To Live Hazbin Hotel Season 2"
@@ -204,6 +216,7 @@ Result:  Usually 1st or 2nd Deezer result
 ```
 
 **Confidence Check:**
+
 - Title similarity score (Levenshtein distance)
 - Artist name match if available
 - Duration within ±10 seconds
@@ -211,6 +224,7 @@ Result:  Usually 1st or 2nd Deezer result
 ### Search Tier 2: Grounded Search (Fallback)
 
 If Tier 1 fails after 3 attempts:
+
 - Use Gemini 2.5-Flash + Google Search grounding
 - Provide last 3 failed queries for context
 - Ask: "What keywords should find this song on Deezer?"
@@ -218,6 +232,7 @@ If Tier 1 fails after 3 attempts:
 ### Search Tier 3: Give Up (Last Resort)
 
 If all fails → song likely isn't a song:
+
 - YouTube podcast, interview, ambient soundscape
 - **Disable autoplay for session**
 - **Unlock VIP slot** for other users
@@ -232,11 +247,11 @@ Last.fm to Deezer is easier - Last.fm is already formatted correctly and maps we
 
 ### Pool Temperature System
 
-| Temperature | Description | Use Case |
-|-------------|-------------|----------|
-| **Hot** | Currently trending/viral | Quick engagement |
-| **Warm** | Related to user history | Personalization |
-| **Cold** | New exploration territory | Discovery |
+| Temperature | Description               | Use Case         |
+| ----------- | ------------------------- | ---------------- |
+| **Hot**     | Currently trending/viral  | Quick engagement |
+| **Warm**    | Related to user history   | Personalization  |
+| **Cold**    | New exploration territory | Discovery        |
 
 ---
 
@@ -261,6 +276,7 @@ Deezer fetches previews
 ```
 
 **Enrichment Workers:**
+
 1. Worker 1: Librosa analysis (BPM, key, energy)
 2. Worker 2: EfficientAT embeddings
 3. Worker 3: Gemini cultural context
@@ -270,6 +286,7 @@ This takes time, but quality > speed. Gets faster as cache builds.
 ### Scenario B: Cache at 500+ Tracks
 
 Pool system can now:
+
 - Check existing embeddings for similarity
 - Skip enrichment for known tracks
 - Use vector search for candidates
@@ -283,14 +300,14 @@ Pool system can now:
 
 ### Time-Based Bias
 
-| Time | Energy Bias | Example |
-|------|-------------|---------|
-| 6am-10am | +0.1 energy | Morning motivation |
-| 10am-2pm | Neutral | Focus/work |
-| 2pm-6pm | +0.05 energy | Afternoon boost |
-| 6pm-10pm | Neutral | Evening variety |
-| 10pm-2am | -0.15 energy | Night chill |
-| 2am-6am | -0.2 energy | Late night ambient |
+| Time     | Energy Bias  | Example            |
+| -------- | ------------ | ------------------ |
+| 6am-10am | +0.1 energy  | Morning motivation |
+| 10am-2pm | Neutral      | Focus/work         |
+| 2pm-6pm  | +0.05 energy | Afternoon boost    |
+| 6pm-10pm | Neutral      | Evening variety    |
+| 10pm-2am | -0.15 energy | Night chill        |
+| 2am-6am  | -0.2 energy  | Late night ambient |
 
 ### Session Context
 
@@ -302,13 +319,13 @@ Pool system can now:
 
 ## Similarity Thresholds (NEW)
 
-| Cosine Similarity | Relationship | Action |
-|-------------------|--------------|--------|
-| >0.95 | Nearly identical | Avoid (too repetitive) |
-| 0.85-0.95 | Very similar | Safe recommendation |
-| 0.70-0.85 | Similar mood/energy | Good discovery |
-| 0.50-0.70 | Moderate similarity | Risky but possible |
-| <0.50 | Different | Never recommend |
+| Cosine Similarity | Relationship        | Action                 |
+| ----------------- | ------------------- | ---------------------- |
+| >0.95             | Nearly identical    | Avoid (too repetitive) |
+| 0.85-0.95         | Very similar        | Safe recommendation    |
+| 0.70-0.85         | Similar mood/energy | Good discovery         |
+| 0.50-0.70         | Moderate similarity | Risky but possible     |
+| <0.50             | Different           | Never recommend        |
 
 ---
 
@@ -326,4 +343,4 @@ Tracks where A+B collaborate: +0.4 boost
 Build "collaboration clusters" for genre bridging
 ```
 
-This enables discovering new artists through trusted connections.  
+This enables discovering new artists through trusted connections.
