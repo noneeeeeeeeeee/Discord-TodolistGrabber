@@ -21,6 +21,10 @@ from .track_resolver import TrackResolver
 from .session_manager import AutoplaySessionManager
 from .bootstrap_manager import BootstrapManager
 
+# V3 Factory Worker Pattern modules
+from .enrichment_worker import EnrichmentWorker, Priority
+from .track_fetcher import TrackFetcher
+
 try:
     from .preview_fetcher import PreviewFetcher
 except ImportError:
@@ -93,6 +97,7 @@ class AutoplayEngineV3:
         self._verbose = DEFAULT_VERBOSITY
         if self._verbose:
             # Configure logging for autoplay V3 modules only (not root logger)
+            # Verbosity 0: WARN+ only, Verbosity 1: INFO+, Verbosity 2: DEBUG+
             autoplay_loggers = [
                 "modules.music.Autoplay_Engine.v3",
                 "modules.music.Autoplay_Engine.v3.autoplayengine_v3",
@@ -103,17 +108,29 @@ class AutoplayEngineV3:
                 "modules.music.Autoplay_Engine.v3.feedback_manager",
                 "modules.music.Autoplay_Engine.v3.novelty_controller",
                 "modules.music.Autoplay_Engine.v3.track_resolver",
+                "modules.music.Autoplay_Engine.v3.deezer_fetch",
+                "modules.music.Autoplay_Engine.v3.preview_fetcher",
+                "modules.music.Autoplay_Engine.v3.bootstrap_manager",
+                "modules.music.Autoplay_Engine.v3.enriching_service",
             ]
+            
+            # Map verbosity to logging level
+            if self._verbose >= 2:
+                log_level = logging.DEBUG
+            elif self._verbose >= 1:
+                log_level = logging.INFO
+            else:
+                log_level = logging.WARNING
 
             # Add console handler to each autoplay logger if not present
             for logger_name in autoplay_loggers:
                 logger = logging.getLogger(logger_name)
-                logger.setLevel(logging.DEBUG)
+                logger.setLevel(log_level)
 
                 # Only add handler if this logger doesn't have one
                 if not logger.handlers:
                     handler = logging.StreamHandler()
-                    handler.setLevel(logging.DEBUG)
+                    handler.setLevel(log_level)
                     formatter = logging.Formatter(
                         "%(asctime)s %(levelname)s [%(name)s] %(message)s"
                     )
@@ -143,8 +160,12 @@ class AutoplayEngineV3:
         max_sessions = int(os.getenv("AUTOPLAY_MAX_SESSIONS", "2"))
         self._session_manager = AutoplaySessionManager(max_sessions=max_sessions)
         
-        # Cold Start Bootstrapper
+        # Cold Start Bootstrapper (legacy - may be deprecated in favor of TrackFetcher)
         self._bootstrap_manager = BootstrapManager(self)
+        
+        # V3 Factory Worker Pattern: Separate track fetching from enrichment
+        self._enrichment_worker = EnrichmentWorker(self)
+        self._track_fetcher = TrackFetcher(self)
 
         # V3 Configuration: Use environment variables if not explicitly provided
         if analysis_mode is None:
@@ -260,6 +281,7 @@ class AutoplayEngineV3:
             "avg_duration": 0.0,
             "in_progress": 0,
         }
+        self._last_summary_time = 0.0  # For level 1 periodic summary logs
 
         self._restore_persistent_queue()
         
@@ -339,8 +361,38 @@ class AutoplayEngineV3:
         # Simple exponential moving average (80/20 split)
         self._analysis_stats["avg_duration"] = (avg * 0.8) + (duration * 0.2)
 
-    def _log_queue_update(self, track_id: str) -> None:
+    def _log_summary_if_due(self) -> None:
+        """Log periodic summary at verbosity level 1 (every 30s when active)."""
         if self._verbose < 1:
+            return
+        
+        now = time.time()
+        # Log every 30 seconds when there's activity
+        if now - self._last_summary_time < 30.0:
+            return
+        
+        stats = self._analysis_stats
+        queued = len(self._analysis_queue)
+        processed = stats.get("processed", 0)
+        failed = stats.get("failed", 0)
+        in_progress = stats.get("in_progress", 0)
+        
+        # Only log if there's activity
+        if queued == 0 and in_progress == 0:
+            return
+        
+        eta = self._format_eta(queued + in_progress)
+        mode_str = "ML" if self._analysis_mode == "ml" else "Non-ML"
+        
+        LOG.info(
+            "🎵 [Autoplay] Analyzing: %d in progress, %d queued, %d done, %d failed (%s, %s)",
+            in_progress, queued, processed, failed, mode_str, eta
+        )
+        self._last_summary_time = now
+
+    def _log_queue_update(self, track_id: str) -> None:
+        """Log when track added to queue. Level 2 only."""
+        if self._verbose < 2:
             return
 
         pending = len(self._analysis_queue)
@@ -354,7 +406,8 @@ class AutoplayEngineV3:
         )
 
     def _log_worker_progress(self, worker_id: int, track_id: str) -> None:
-        if self._verbose < 1:
+        """Log worker progress. Level 2 shows per-track, level 1 is suppressed (batch summary instead)."""
+        if self._verbose < 2:
             return
 
         track_display = track_id if len(track_id) <= 80 else track_id[:77] + "..."
@@ -368,7 +421,7 @@ class AutoplayEngineV3:
         eta = self._format_eta(queued + in_progress)
 
         LOG.info(
-            "👷 Worker %d working on %s (%d/%d songs, %s)",
+            "👷 Worker %d: %s (%d/%d, %s)",
             worker_id,
             track_display,
             max(1, current_job),
@@ -586,6 +639,36 @@ class AutoplayEngineV3:
     def track_resolver(self) -> TrackResolver:
         return self._track_resolver
 
+    @property
+    def cache(self) -> CacheManager:
+        """Access to the cache manager for enrichment entries."""
+        return self._cache
+    
+    @property
+    def gemini(self) -> GeminiService:
+        """Access to the Gemini service for cultural enrichment."""
+        return self._gemini
+    
+    @property
+    def preview_fetcher(self):
+        """Access to the preview fetcher for Deezer audio."""
+        return self._preview_fetcher
+    
+    @property
+    def analyzer(self):
+        """Access to the audio analyzer (EnrichingService)."""
+        return self._analyzer
+    
+    @property
+    def enrichment_worker(self) -> EnrichmentWorker:
+        """Access to the EnrichmentWorker for adding tasks."""
+        return self._enrichment_worker
+    
+    @property
+    def track_fetcher(self) -> TrackFetcher:
+        """Access to the TrackFetcher (Daydreamer)."""
+        return self._track_fetcher
+
     # ========== AUDIO ANALYSIS WORKER POOL ==========
     
     async def start_analysis_workers(self) -> None:
@@ -603,8 +686,9 @@ class AutoplayEngineV3:
             return
         
         mode_str = "Non-ML" if self._analysis_mode == "non-ml" else "ML"
-        LOG.info(
-            f"🚀 Starting {self._analysis_worker_count} {mode_str} analysis workers (Deezer previews only)"
+        self._log_verbose(
+            1, "🚀 Starting %d %s analysis workers", 
+            self._analysis_worker_count, mode_str
         )
         self._analysis_shutdown = False
         for i in range(self._analysis_worker_count):
@@ -615,14 +699,26 @@ class AutoplayEngineV3:
         if self._bootstrap_manager:
             await self._bootstrap_manager.start()
         
+        # Start V3 Factory Worker Pattern modules
+        if self._enrichment_worker:
+            await self._enrichment_worker.start()
+        if self._track_fetcher:
+            await self._track_fetcher.start()
+        
     
     async def stop_analysis_workers(self) -> None:
         """Gracefully shutdown analysis workers."""
         if not self._analysis_workers:
             return
         
-        LOG.info(f"🛑 Stopping {len(self._analysis_workers)} analysis workers...")
+        self._log_verbose(1, "🛑 Stopping %d analysis workers...", len(self._analysis_workers))
         self._analysis_shutdown = True
+        
+        # Stop V3 Factory Worker Pattern modules
+        if self._track_fetcher:
+            await self._track_fetcher.stop()
+        if self._enrichment_worker:
+            await self._enrichment_worker.stop()
         
         # Stop bootstrapper
         if self._bootstrap_manager:
@@ -634,7 +730,7 @@ class AutoplayEngineV3:
         self._active_jobs.clear()
         self._analysis_stats["in_progress"] = 0
         self._persist_analysis_queue_state()
-        LOG.info("✅ Analysis workers stopped")
+        self._log_verbose(1, "✅ Analysis workers stopped")
     
 
     def queue_analysis(
@@ -988,7 +1084,7 @@ class AutoplayEngineV3:
             worker_id: Unique worker identifier for logging
         """
         mode_str = "Non-ML" if self._analysis_mode == "non-ml" else "ML"
-        LOG.info(f"👷 Analysis worker {worker_id} ({mode_str}) started")
+        self._log_verbose(2, "👷 Analysis worker %d (%s) started", worker_id, mode_str)
         
         while not self._analysis_shutdown:
             try:
@@ -1017,6 +1113,9 @@ class AutoplayEngineV3:
                 job_start = time.time()
                 self._active_jobs[worker_id] = job
                 self._persist_analysis_queue_state()
+                
+                # Level 1: Periodic summary, Level 2: Per-track details
+                self._log_summary_if_due()
                 self._log_worker_progress(worker_id, track_id)
                 
                 # Download audio (Deezer preview ONLY - no YouTube fallback)
@@ -1160,13 +1259,13 @@ class AutoplayEngineV3:
                             LOG.warning(f"[Worker {worker_id}] Failed to cleanup audio: {e}")
             
             except asyncio.CancelledError:
-                LOG.info(f"👷 Analysis worker {worker_id} cancelled")
+                self._log_verbose(2, "👷 Analysis worker %d cancelled", worker_id)
                 break
             except Exception as e:
                 LOG.error(f"[Worker {worker_id}] Unexpected error: {e}")
                 await asyncio.sleep(1)  # Prevent tight error loop
         
-        LOG.info(f"👷 Analysis worker {worker_id} stopped")
+        self._log_verbose(2, "👷 Analysis worker %d stopped", worker_id)
     
 
     def get_analysis_stats(self) -> Dict[str, Any]:

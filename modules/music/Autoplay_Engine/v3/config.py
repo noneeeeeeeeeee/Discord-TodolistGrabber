@@ -23,7 +23,20 @@ BUFFER_TARGET_SIZE = 5              # Apple Music-style 5-song buffer
 P1_CANDIDATE_LIMIT = 25             # Max candidates for P1 (user waiting)
 P1_TIMEOUT_SECONDS = 10             # Notify user if P1 takes longer
 
-# Verbosity control for debugging
+# Enrichment Worker Configuration
+PROCESSING_QUEUE_MAX = 200          # Max tracks in enrichment queue
+FIRST_RUN_FETCH_COUNT = 200         # Tracks to fetch on first run (Last.fm)
+DAYDREAM_INTERVAL_SECONDS = 1800    # 30 minutes between daydream cycles
+NEW_RELEASE_CHECK_DAYS = 30         # Days between new release checks
+
+# Gemini Batch Queue Configuration
+GEMINI_BATCH_SIZE = 50              # Max tracks per Gemini API call
+GEMINI_BATCH_TIMEOUT_SECONDS = 8.0  # Seconds to wait before flushing batch
+
+# Verbosity control for console output
+# 0 = Errors only 
+# 1 = Overview 
+# 2 = In-depth 
 DEFAULT_VERBOSITY = int(os.getenv("AUTOPLAY_V3_VERBOSITY", "0"))
 
 # V3 Configuration: Read from environment variables with sensible defaults

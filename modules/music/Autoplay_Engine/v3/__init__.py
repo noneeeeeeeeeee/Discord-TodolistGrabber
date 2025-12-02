@@ -2935,22 +2935,32 @@ class LastFMAutoplayV3:
             cached = await self._engine._cache.get_enrichment(clean_artist, clean_title)
             if cached:
                 self._cache_stats["enrichment_hits"] += 1
-                # Build mood_vector dict from inline fields
+                # Build V3 enrichment dict from cached entry
+                # V3 uses computed_simple_vibe (5D: energy, valence, danceability, acousticness, brightness)
                 mood_vector = None
-                if cached.mood_energy is not None:
+                if cached.computed_simple_vibe and len(cached.computed_simple_vibe) >= 3:
+                    # Map 5D vibe to mood_vector for compatibility
+                    vibe = cached.computed_simple_vibe
                     mood_vector = {
-                        "energy": cached.mood_energy,
-                        "valence": cached.mood_valence,
-                        "tempo": cached.mood_tempo,
-                        "confidence": cached.mood_confidence,
-                        "vector": [cached.mood_energy, cached.mood_valence, cached.mood_tempo],
+                        "energy": vibe[0],  # energy
+                        "valence": vibe[1],  # valence
+                        "tempo": cached.computed_tempo or 0.0,  # BPM from analysis
+                        "confidence": 0.9 if cached.analysis_verified else 0.5,
+                        "vector": vibe[:3],  # First 3 dimensions
                     }
                 
                 enrichment_cache[track_id] = {
                     "tags": cached.tags,
                     "mood": cached.mood,
-                    "energy": cached.energy,
+                    "energy": cached.activity_affinity,  # Cultural context
                     "mood_vector": mood_vector,
+                    "computed_embedding": cached.computed_embedding,
+                    "computed_simple_vibe": cached.computed_simple_vibe,
+                    "computed_tempo": cached.computed_tempo,
+                    "computed_loudness": cached.computed_loudness,
+                    "computed_key": cached.computed_key,
+                    "computed_mode": cached.computed_mode,
+                    "analysis_verified": cached.analysis_verified,
                 }
             else:
                 # Collect for batch enrichment
@@ -3008,22 +3018,30 @@ class LastFMAutoplayV3:
                                     clean_artist, clean_title
                                 )
                                 if cached_entry:
-                                    # Build mood_vector dict from inline fields
+                                    # Build V3 enrichment dict from cached entry
                                     mood_vector = None
-                                    if cached_entry.mood_energy is not None:
+                                    if cached_entry.computed_simple_vibe and len(cached_entry.computed_simple_vibe) >= 3:
+                                        vibe = cached_entry.computed_simple_vibe
                                         mood_vector = {
-                                            "energy": cached_entry.mood_energy,
-                                            "valence": cached_entry.mood_valence,
-                                            "tempo": cached_entry.mood_tempo,
-                                            "confidence": cached_entry.mood_confidence,
-                                            "vector": [cached_entry.mood_energy, cached_entry.mood_valence, cached_entry.mood_tempo],
+                                            "energy": vibe[0],
+                                            "valence": vibe[1],
+                                            "tempo": cached_entry.computed_tempo or 0.0,
+                                            "confidence": 0.9 if cached_entry.analysis_verified else 0.5,
+                                            "vector": vibe[:3],
                                         }
                                     
                                     enrichment_cache[track_id] = {
                                         "tags": cached_entry.tags,
                                         "mood": cached_entry.mood,
-                                        "energy": cached_entry.energy,
+                                        "energy": cached_entry.activity_affinity,
                                         "mood_vector": mood_vector,
+                                        "computed_embedding": cached_entry.computed_embedding,
+                                        "computed_simple_vibe": cached_entry.computed_simple_vibe,
+                                        "computed_tempo": cached_entry.computed_tempo,
+                                        "computed_loudness": cached_entry.computed_loudness,
+                                        "computed_key": cached_entry.computed_key,
+                                        "computed_mode": cached_entry.computed_mode,
+                                        "analysis_verified": cached_entry.analysis_verified,
                                     }
                                 else:
                                     tags = [

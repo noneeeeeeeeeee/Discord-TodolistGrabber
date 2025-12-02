@@ -344,3 +344,233 @@ Build "collaboration clusters" for genre bridging
 ```
 
 This enables discovering new artists through trusted connections.
+
+---
+
+## V3 Modular Architecture (Factory Worker Pattern)
+
+The V3 system is divided into **three independent modules** that operate as a factory pipeline:
+
+### Module 1: Track Fetcher (Daydreamer / Bootstrap Manager)
+
+**Responsibility:** Only manages track discovery and queue filling. Does NOT perform enrichment.
+
+**Scenarios:**
+
+#### Scenario A: First Run (Empty Cache)
+
+```
+Cache empty → Fetch 200 tracks from Last.fm Top Tracks
+    ↓
+Store track names (artist, title) in processing queue
+    ↓
+Signal Enrichment Worker to begin processing
+    ↓
+Done. Wait for next batch cycle.
+```
+
+#### Scenario B: Daydreaming (Cache > 200 tracks)
+
+```
+Cache has data → Start genre exploration based on user telemetry
+    ↓
+Use Last.fm track.getSimilar / tag.getTopTracks for depth-first exploration
+    ↓
+Fetch 50 tracks per 30-minute cycle (configurable via DAYDREAM_INTERVAL)
+    ↓
+Filter duplicates against queue + cache
+    ↓
+Add to processing queue → Stop when 50 added
+```
+
+#### Scenario C: New Releases Check (Monthly)
+
+```
+>1 month since last check → Fetch top 200 new releases
+    ↓
+Compare against queue + cache for duplicates
+    ↓
+Add up to 50 non-duplicate tracks to queue
+    ↓
+If 50 tracks added (queue full) → Signal next batch to continue
+    ↓
+If <50 tracks added → Resume normal Scenario B exploration
+```
+
+**Queue Limit:** Max 200 tracks in processing queue at any time.
+
+---
+
+### Module 2: Enrichment Worker (Factory Pipeline)
+
+**Responsibility:** Process tracks from queue through the enrichment pipeline. Runs independently.
+
+**Pipeline Stages:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    ENRICHMENT PIPELINE                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  STAGE 1: Deezer Resolution                                 │
+│  ┌────────────────────────────────────────────────────┐     │
+│  │ Track from queue → Search Deezer API                │     │
+│  │ → Get preview URL (30s HQ audio)                    │     │
+│  │ → Get Deezer metadata (genres, BPM, ISRC)           │     │
+│  │ → Create cache entry with mapping                   │     │
+│  └────────────────────────────────────────────────────┘     │
+│                           ↓                                  │
+│  STAGE 2: Audio Analysis (Librosa + EfficientAT)            │
+│  ┌────────────────────────────────────────────────────┐     │
+│  │ Download preview → Librosa analysis                 │     │
+│  │ → BPM, key, mode, loudness                          │     │
+│  │ → 5D simple_vibe: [energy, valence, danceability,   │     │
+│  │    acousticness, brightness]                        │     │
+│  │                                                     │     │
+│  │ EfficientAT MobileNet → 512D-2048D embedding        │     │
+│  │ → Semantic audio understanding                      │     │
+│  │ → Store in cache: analysis_verified = True          │     │
+│  └────────────────────────────────────────────────────┘     │
+│                                                              │
+│  PARALLEL: Gemini Cultural Enrichment                       │
+│  ┌────────────────────────────────────────────────────┐     │
+│  │ Batch queue (artist + title only)                   │     │
+│  │ → Wait for 50 tracks OR 8s timeout                  │     │
+│  │ → Single API call with all tracks                   │     │
+│  │ → Get: tags, mood, activity_affinity, daypart       │     │
+│  │ → Store results in cache                            │     │
+│  └────────────────────────────────────────────────────┘     │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Gemini Batch Queue Logic:**
+
+```python
+# Batch fills up OR timeout expires → API call
+if len(batch) >= 50:
+    flush_immediately()
+elif time_since_last_add > 8s:
+    flush_batch()
+else:
+    wait_for_more_tracks()
+```
+
+**Duplicate Filtering:** Before any track enters the pipeline:
+
+1. Check if track_key exists in processing queue (skip if present)
+2. Check if track_key exists in enrichment cache (skip if analysis_verified)
+
+---
+
+### Module 3: Recommender
+
+**Responsibility:** Wait for pool to be enriched, then calculate recommendations.
+
+**Behavior:**
+
+```
+User requests autoplay
+    ↓
+Build candidate pool from cache + Last.fm similar artists
+    ↓
+Filter: Only include tracks where analysis_verified = True
+    ↓
+If pool too small → Wait for Enrichment Worker to process more
+    ↓
+Calculate similarity scores using:
+  - computed_embedding (512D-2048D cosine similarity)
+  - computed_simple_vibe (5D Euclidean distance)
+  - Flow vector (BPM, key compatibility)
+  - Cultural tags overlap
+    ↓
+Apply user preferences (feedback history, skip penalties)
+    ↓
+Return top candidates for 5-song buffer
+```
+
+**Priority System:**
+
+| Priority | Source | Behavior |
+|----------|--------|----------|
+| P1 | User Request | Immediate enrichment, blocks until ready |
+| P2 | Buffer Refill | High priority, runs when buffer < 5 |
+| P3 | Daydreaming | Lowest priority, pauses for P1/P2 |
+
+---
+
+### Module Interaction Diagram
+
+```
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│  TRACK FETCHER   │     │ ENRICHMENT       │     │   RECOMMENDER    │
+│  (Daydreamer)    │     │ WORKER           │     │                  │
+├──────────────────┤     ├──────────────────┤     ├──────────────────┤
+│                  │     │                  │     │                  │
+│ Last.fm/Deezer   │────▶│ Processing Queue │     │ User Request     │
+│ Charts/Similar   │     │ (max 200 tracks) │     │     ↓            │
+│                  │     │      ↓           │     │ Build Pool       │
+│ Add tracks if:   │     │ Deezer  → Preview │     │     ↓            │
+│ - queue < 200    │     │      ↓  & Metadata│     │ Filter by        │
+│ - not duplicate  │     │ Librosa+AT       │     │ analysis_verified│
+│                  │     │      ↓           │     │     ↓            │
+│ Scenarios:       │     │ Cache Entry      │────▶│ Score + Rank     │
+│ A: First run     │     │ verified=True    │     │     ↓            │
+│ B: Daydream      │     │                  │     │ 5-Song Buffer    │
+│ C: New releases  │     │ [Parallel]       │     │                  │
+│                  │     │ Gemini Batch     │     │                  │
+│                  │     │ (50 max, 8s wait)│     │                  │
+└──────────────────┘     └──────────────────┘     └──────────────────┘
+```
+
+---
+
+### Configuration Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DAYDREAM_INTERVAL` | 1800 (30min) | Seconds between daydream cycles |
+| `DAYDREAM_BATCH_SIZE` | 50 | Tracks per daydream cycle |
+| `PROCESSING_QUEUE_MAX` | 200 | Max tracks in processing queue |
+| `FIRST_RUN_FETCH_COUNT` | 200 | Tracks to fetch on first run |
+| `NEW_RELEASE_CHECK_DAYS` | 30 | Days between new release checks |
+| `GEMINI_BATCH_SIZE` | 50 | Max tracks per Gemini API call |
+| `GEMINI_BATCH_TIMEOUT` | 8.0 | Seconds to wait before flushing batch |
+| `BUFFER_TARGET_SIZE` | 5 | Target songs in autoplay buffer |
+
+---
+
+### User Request Priority Flow
+
+```
+User plays song → Autoplay triggered
+    ↓
+Check: Is current track enriched?
+    ↓
+NO → P1 Enrichment (user waits)
+    → Deezer lookup
+    → Audio analysis
+    → Gemini cultural (added to batch)
+    → analysis_verified = True
+    ↓
+YES → Skip to recommendation
+    ↓
+Build candidate pool
+    ↓
+Check: Are all candidates enriched?
+    ↓
+Some missing → Wait for P1 enrichment of candidates
+    → Enrichment Worker processes with high priority
+    ↓
+All ready → Calculate scores → Fill 5-song buffer
+    ↓
+Buffer fills → User continues listening
+    → New songs added as buffer depletes
+    → As cache grows, wait times decrease
+```
+
+**Key Insight:** Early sessions require patience (cold start). As cache builds:
+
+- More tracks pre-enriched by Daydreamer
+- Faster recommendations
+- Eventually near-instant autoplay

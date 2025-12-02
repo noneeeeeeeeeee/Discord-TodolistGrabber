@@ -345,6 +345,81 @@ class DeezerClient:
                 LOG.error(f"❌ Error fetching Deezer charts: {e}")
                 return []
 
+    async def get_new_releases(self, limit: int = 50) -> List[DeezerTrack]:
+        """
+        Fetch new releases from Deezer editorial.
+        Uses /editorial/0/releases endpoint for latest albums/tracks.
+        
+        Args:
+            limit: Maximum number of tracks to return
+            
+        Returns:
+            List of DeezerTrack objects from new releases
+        """
+        if not self.session:
+            LOG.error("❌ No aiohttp session available for new releases")
+            return []
+            
+        # First get new release albums from editorial
+        url = f"{DEEZER_API_BASE}/editorial/0/releases"
+        params = {"limit": min(limit // 2, 25)}  # Get ~25 albums, extract tracks
+        
+        async with self.semaphore:
+            try:
+                timeout = aiohttp.ClientTimeout(total=self.timeout)
+                async with self.session.get(url, params=params, timeout=timeout) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        tracks = []
+                        
+                        # Extract tracks from album releases
+                        for album in data.get("data", []):
+                            album_id = album.get("id")
+                            if album_id:
+                                # Fetch album tracks
+                                album_tracks = await self._get_album_tracks(album_id, limit=3)
+                                tracks.extend(album_tracks)
+                                
+                                if len(tracks) >= limit:
+                                    break
+                        
+                        LOG.info(f"🆕 Fetched {len(tracks)} tracks from Deezer new releases")
+                        return tracks[:limit]
+                    else:
+                        LOG.error(f"❌ Failed to fetch Deezer new releases: {response.status}")
+                        return []
+            except Exception as e:
+                LOG.error(f"❌ Error fetching Deezer new releases: {e}")
+                return []
+
+    async def _get_album_tracks(self, album_id: int, limit: int = 3) -> List[DeezerTrack]:
+        """
+        Fetch tracks from a specific album.
+        
+        Args:
+            album_id: Deezer album ID
+            limit: Maximum tracks to return from this album
+            
+        Returns:
+            List of DeezerTrack objects
+        """
+        if not self.session:
+            return []
+            
+        url = f"{DEEZER_API_BASE}/album/{album_id}/tracks"
+        params = {"limit": limit}
+        
+        try:
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            async with self.session.get(url, params=params, timeout=timeout) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return self._parse_search_results(data)
+                return []
+        except Exception as e:
+            LOG.warning(f"⚠️ Error fetching album {album_id} tracks: {e}")
+            return []
+
     def _parse_search_results(self, data: Dict[str, Any]) -> List[DeezerTrack]:
         """Parse Deezer API response into DeezerTrack objects."""
         tracks = []
