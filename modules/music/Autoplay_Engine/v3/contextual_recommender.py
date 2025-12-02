@@ -469,29 +469,6 @@ class ContextualRecommender:
         return total / count
 
     @staticmethod
-    def _mood_distance(
-        session_vector: Sequence[float],
-        candidate_vector: Sequence[float],
-    ) -> float:
-        """
-        DEPRECATED: Legacy Euclidean distance scorer for V2 compatibility.
-        Use _embedding_similarity() for ML mode or _simple_vibe_similarity() for Non-ML mode.
-        """
-        length = min(len(session_vector), len(candidate_vector))
-        if length == 0:
-            return 0.0
-        sum_sq = 0.0
-        for idx in range(length):
-            session_val = float(session_vector[idx])
-            candidate_val = float(candidate_vector[idx])
-            sum_sq += (session_val - candidate_val) ** 2
-        max_distance = math.sqrt(float(length))
-        if max_distance <= 0:
-            return 0.0
-        distance = math.sqrt(sum_sq) / max_distance
-        return max(0.0, min(1.0, distance))
-
-    @staticmethod
     def _embedding_similarity(
         session_embedding: Sequence[float],
         candidate_embedding: Sequence[float],

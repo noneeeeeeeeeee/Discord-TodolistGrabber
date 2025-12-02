@@ -122,30 +122,36 @@ class MappingEntry:
 
 @dataclass
 class EnrichmentEntry:
+    """
+    V3 Enrichment Entry - Audio analysis results from Librosa + EfficientAT.
+    
+    V3 Architecture: Quality > Speed
+    - All numeric vibes come from Librosa/MobileNet audio analysis
+    - Gemini provides ONLY cultural context (tags, mood text, activity/daypart affinity)
+    - No Gemini-based numeric estimates (removed in V3 cleanup)
+    """
     tags: List[str]
-    mood: Optional[str]
+    mood: Optional[str]  # Text description from Gemini (cultural context only)
     fetched_at: float
-    energy: Optional[str] = None
-    # Extended metadata for V3
-    bpm: Optional[int] = None
-    key: Optional[str] = None
-    activity_affinity: Optional[str] = None  # e.g., "workout", "study", "party"
-    emotional_intensity: Optional[float] = None  # 0.0-1.0
-    daypart_affinity: Optional[str] = None  # e.g., "morning", "evening", "night"
+    
+    # Extended metadata for V3 (from Deezer)
+    bpm: Optional[int] = None  # Deezer metadata, NOT computed
+    key: Optional[str] = None  # Deezer metadata (text like "C minor")
     genres: List[str] = field(default_factory=list)  # Deezer genres
-
-    # ============================================================================
-    # Mood Vector (Gemini) - used as lightweight estimate before audio analysis
-    # ============================================================================
-    mood_energy: Optional[float] = None  # 0.0-1.0 Gemini guess
-    mood_valence: Optional[float] = None  # 0.0-1.0 Gemini guess
-    mood_tempo: Optional[float] = None  # 0.0-1.0 Gemini guess
-    mood_confidence: Optional[float] = None  # 0.0-1.0 Gemini confidence
     
     # ============================================================================
-    # V3 Architecture (CURRENT) - Librosa + EfficientAT MobileNet or Non-ML Mode
+    # Cultural Context (Gemini) - Text-only, no numeric estimates
     # ============================================================================
-    # FLOW VECTOR (4D): For DJ-quality transitions and harmonic mixing (always computed)
+    # NOTE: activity_affinity and daypart_affinity are kept for future use
+    # They are populated by Gemini but NOT used in recommendation scoring currently
+    activity_affinity: Optional[str] = None  # e.g., "workout", "study", "party"
+    daypart_affinity: Optional[str] = None  # e.g., "morning", "evening", "night"
+    emotional_intensity: Optional[float] = None  # 0.0-1.0 (kept for metadata)
+    
+    # ============================================================================
+    # V3 Architecture - Librosa + EfficientAT MobileNet
+    # ============================================================================
+    # FLOW VECTOR (4D): For DJ-quality transitions and harmonic mixing
     computed_tempo: Optional[float] = None  # BPM as float (e.g., 120.0)
     computed_loudness: Optional[float] = None  # Loudness in dB (e.g., -5.883)
     computed_key: Optional[int] = None  # 0-11 (C=0, C#=1, D=2, ..., B=11)
@@ -157,15 +163,10 @@ class EnrichmentEntry:
     computed_embedding_model: Optional[str] = None  # "mn10_as"
     computed_embedding_dim: Optional[int] = None  # Actual dimension (e.g., 1024, 2048)
     
-    # Non-ML Mode: Simplified 5D vibe vector computed from Librosa features only
+    # NON-ML MODE: Simplified 5D vibe vector from Librosa features
     # Used when analysis_mode="non-ml" - no neural network required
-    computed_simple_vibe: Optional[List[float]] = None  # 5D: [energy, valence, danceability, acousticness, brightness]
-    # Gemini estimates (used until Librosa/MobileNet runs)
-    estimated_tempo: Optional[float] = None
-    estimated_loudness: Optional[float] = None
-    estimated_key: Optional[int] = None
-    estimated_mode: Optional[int] = None
-    estimated_simple_vibe: Optional[List[float]] = None  # Gemini 5D guess until audio analysis finishes
+    # 5D: [energy, valence, danceability, acousticness, brightness]
+    computed_simple_vibe: Optional[List[float]] = None
 
     # Analysis pipeline bookkeeping
     analysis_verified: bool = False
@@ -178,136 +179,51 @@ class EnrichmentEntry:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-    # ------------------------------------------------------------------
-    # Feature synthesis helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _clamp01(value: float) -> float:
-        return max(0.0, min(1.0, value))
-
-    def _resolve_energy_score(self) -> float:
-        if isinstance(self.mood_energy, (int, float)):
-            return self._clamp01(float(self.mood_energy))
-
-        if isinstance(self.energy, str):
-            label = self.energy.lower().strip()
-            mapping = {
-                "low": 0.25,
-                "medium": 0.55,
-                "mid": 0.55,
-                "moderate": 0.55,
-                "high": 0.85,
-                "very high": 0.9,
-                "intense": 0.9,
-            }
-            if label in mapping:
-                return mapping[label]
-
-        return 0.5
-
-    def _resolve_valence_score(self) -> float:
-        if isinstance(self.mood_valence, (int, float)):
-            return self._clamp01(float(self.mood_valence))
-
-        valence = 0.5
-        mood_text = (self.mood or "").lower()
-        negative_tokens = ("dark", "somber", "sad", "melancholy", "angst", "moody")
-        positive_tokens = ("happy", "bright", "uplifting", "cheer", "joy", "fun")
-
-        if mood_text:
-            if any(token in mood_text for token in negative_tokens):
-                valence = 0.25
-            elif any(token in mood_text for token in positive_tokens):
-                valence = 0.75
-
-        return valence
-
-    def _estimate_danceability(self) -> float:
-        if isinstance(self.mood_tempo, (int, float)):
-            tempo_score = self._clamp01(float(self.mood_tempo))
-        else:
-            tempo_score = 0.5
-
-        bpm = self.bpm
-        if isinstance(bpm, (int, float)) and bpm > 0:
-            bpm = float(bpm)
-            diff = abs(bpm - 120.0)
-            score = max(0.0, 1.0 - diff / 120.0)
-            tempo_score = max(tempo_score, 0.2 + 0.8 * score)
-
-        return self._clamp01(tempo_score)
-
-    def _estimate_acousticness(self) -> float:
-        combined = {tag.lower() for tag in (self.tags or [])}
-        combined.update(tag.lower() for tag in (self.genres or []))
-
-        acousticness = 0.5
-        if any("acoustic" in tag for tag in combined):
-            acousticness = 0.85
-        elif any(tag in {"electronic", "edm", "synthwave", "dubstep", "industrial"} for tag in combined):
-            acousticness = 0.2
-        elif any(tag in {"folk", "singer-songwriter", "orchestral", "classical"} for tag in combined):
-            acousticness = 0.75
-        elif any(tag in {"rock", "metal", "punk"} for tag in combined):
-            acousticness = 0.35
-
-        return self._clamp01(acousticness)
-
-    def _estimate_instrumentalness(self) -> float:
-        combined = {tag.lower() for tag in (self.tags or [])}
-        combined.update(tag.lower() for tag in (self.genres or []))
-        mood_text = (self.mood or "").lower()
-
-        instrumentalness = 0.2
-        if any(
-            token in combined
-            for token in {"instrumental", "score", "soundtrack", "orchestral", "bgm"}
-        ) or "instrumental" in mood_text:
-            instrumentalness = 0.8
-        elif any(token in combined for token in {"rap", "hip hop", "vocal", "soul", "r&b"}):
-            instrumentalness = 0.1
-
-        return self._clamp01(instrumentalness)
-
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "EnrichmentEntry":
+        """
+        Parse enrichment entry from cache.
+        
+        V3 Architecture: Only loads computed audio analysis fields.
+        Legacy fields (energy string, mood_*, estimated_*) are ignored for backward compat.
+        """
         tags_raw = payload.get("tags") or []
         tags = [str(tag).lower() for tag in tags_raw if str(tag).strip()]
         
-        # Parse genres (Phase 0.5)
+        # Parse genres
         genres_raw = payload.get("genres") or []
         genres = [str(genre).strip() for genre in genres_raw if str(genre).strip()]
         
-        # Parse computed_vibe_vector (5D)
-        gemini_simple_vibe_raw = (
-            payload.get("estimated_simple_vibe")
-            or payload.get("gemini_simple_vibe")
-            or payload.get("simple_vibe_guess")
-        )
-        estimated_simple_vibe = None
-        if isinstance(gemini_simple_vibe_raw, list):
+        # Parse computed_simple_vibe (5D from Librosa)
+        computed_simple_vibe = None
+        csv_raw = payload.get("computed_simple_vibe")
+        if isinstance(csv_raw, list):
             try:
-                cleaned = [max(0.0, min(1.0, float(v))) for v in gemini_simple_vibe_raw[:5]]
+                cleaned = [max(0.0, min(1.0, float(v))) for v in csv_raw[:5]]
+                if len(cleaned) == 5:
+                    computed_simple_vibe = cleaned
             except (TypeError, ValueError):
-                cleaned = []
-            if len(cleaned) == 5:
-                estimated_simple_vibe = cleaned
+                pass
         
-        entry = cls(
+        # Parse computed_embedding (512D-2048D from MobileNet)
+        computed_embedding = None
+        emb_raw = payload.get("computed_embedding")
+        if isinstance(emb_raw, list) and len(emb_raw) >= 512:
+            try:
+                computed_embedding = [float(v) for v in emb_raw]
+            except (TypeError, ValueError):
+                pass
+        
+        return cls(
             tags=tags,
             mood=(str(payload["mood"]).strip() if payload.get("mood") else None),
             fetched_at=float(payload.get("fetched_at", 0.0)),
-            energy=(str(payload["energy"]).strip() if payload.get("energy") else None),
             bpm=(int(payload["bpm"]) if payload.get("bpm") else None),
             key=(str(payload["key"]).strip() if payload.get("key") else None),
+            genres=genres,
             activity_affinity=(
                 str(payload["activity_affinity"]).strip()
                 if payload.get("activity_affinity")
-                else None
-            ),
-            emotional_intensity=(
-                float(payload["emotional_intensity"])
-                if payload.get("emotional_intensity") is not None
                 else None
             ),
             daypart_affinity=(
@@ -315,35 +231,19 @@ class EnrichmentEntry:
                 if payload.get("daypart_affinity")
                 else None
             ),
-            genres=genres,
-            mood_energy=(
-                float(payload["mood_energy"])
-                if payload.get("mood_energy") is not None
-                else None
-            ),
-            mood_valence=(
-                float(payload["mood_valence"])
-                if payload.get("mood_valence") is not None
-                else None
-            ),
-            mood_tempo=(
-                float(payload["mood_tempo"])
-                if payload.get("mood_tempo") is not None
-                else None
-            ),
-            mood_confidence=(
-                float(payload["mood_confidence"])
-                if payload.get("mood_confidence") is not None
-                else None
-            ),
-            computed_loudness=(
-                float(payload["computed_loudness"])
-                if payload.get("computed_loudness") is not None
+            emotional_intensity=(
+                float(payload["emotional_intensity"])
+                if payload.get("emotional_intensity") is not None
                 else None
             ),
             computed_tempo=(
                 float(payload["computed_tempo"])
                 if payload.get("computed_tempo") is not None
+                else None
+            ),
+            computed_loudness=(
+                float(payload["computed_loudness"])
+                if payload.get("computed_loudness") is not None
                 else None
             ),
             computed_key=(
@@ -356,32 +256,18 @@ class EnrichmentEntry:
                 if payload.get("computed_mode") is not None
                 else None
             ),
-            computed_simple_vibe=(
-                [float(v) for v in payload.get("computed_simple_vibe", [])]
-                if isinstance(payload.get("computed_simple_vibe"), list)
+            computed_embedding=computed_embedding,
+            computed_embedding_model=(
+                str(payload["computed_embedding_model"]).strip()
+                if payload.get("computed_embedding_model")
                 else None
             ),
-            estimated_tempo=(
-                float(payload["estimated_tempo"])
-                if payload.get("estimated_tempo") is not None
+            computed_embedding_dim=(
+                int(payload["computed_embedding_dim"])
+                if payload.get("computed_embedding_dim") is not None
                 else None
             ),
-            estimated_loudness=(
-                float(payload["estimated_loudness"])
-                if payload.get("estimated_loudness") is not None
-                else None
-            ),
-            estimated_key=(
-                int(payload["estimated_key"])
-                if payload.get("estimated_key") is not None
-                else None
-            ),
-            estimated_mode=(
-                int(payload["estimated_mode"])
-                if payload.get("estimated_mode") is not None
-                else None
-            ),
-            estimated_simple_vibe=estimated_simple_vibe,
+            computed_simple_vibe=computed_simple_vibe,
             analysis_verified=bool(payload.get("analysis_verified", False)),
             analysis_in_progress=bool(payload.get("analysis_in_progress", False)),
             last_analysis_attempt=(
@@ -390,9 +276,6 @@ class EnrichmentEntry:
                 else None
             ),
         )
-
-        # NO vector synthesis - if None, it means V3 audio analysis hasn't run yet
-        return entry
 
 
 @dataclass

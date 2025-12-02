@@ -130,10 +130,10 @@ def test_cache_manager_enrichment_entry():
     """
     Test that EnrichmentEntry in cache_manager.py stores V3 enrichment data.
     
-    Per v3_reimplementation.md, cached enrichment should include:
-    - Dual Vector Architecture: 5D vibe + 4D flow = 9D total
-    - ML mode: 512D embedding from EfficientAT
-    - Non-ML mode: 5D simple_vibe from Librosa only
+    Per v3_reimplementation.md (Quality > Speed), cached enrichment includes:
+    - Computed fields from Librosa/EfficientAT analysis only
+    - No Gemini-estimated vibe fields (removed in V3 cleanup)
+    - Cultural context from Gemini (tags, mood, activity_affinity, daypart_affinity)
     """
     print("\n" + "="*60)
     print("TEST: Cache Manager EnrichmentEntry Schema")
@@ -146,13 +146,13 @@ def test_cache_manager_enrichment_entry():
         print(f"❌ Could not import EnrichmentEntry: {e}")
         return False
     
-    # Required fields for V3 architecture
-    required_vibe_fields = [
-        # Mood Vector (Gemini estimates)
-        "mood_energy",
-        "mood_valence", 
-        "mood_tempo",
-        "mood_confidence",
+    # Required fields for V3 architecture (Quality > Speed - no Gemini estimates)
+    required_fields = [
+        # Cultural context from Gemini
+        "tags",
+        "mood",
+        "activity_affinity",
+        "daypart_affinity",
         # Flow Vector (Librosa computed)
         "computed_tempo",
         "computed_loudness",
@@ -162,10 +162,13 @@ def test_cache_manager_enrichment_entry():
         "computed_embedding",
         "computed_embedding_model",
         "computed_embedding_dim",
-        # Non-ML Mode: Simple vibe
+        # Non-ML Mode: Simple vibe (Librosa-derived, not Gemini-estimated)
         "computed_simple_vibe",
-        # Gemini estimates (before audio analysis)
-        "estimated_simple_vibe",
+        # Metadata
+        "bpm",
+        "key",
+        "genres",
+        "fetched_at",
     ]
     
     # Create mock entry to test schema
@@ -173,32 +176,29 @@ def test_cache_manager_enrichment_entry():
         tags=["electronic", "ambient"],
         mood="chill",
         fetched_at=1234567890.0,
-        energy="medium",
         bpm=110,
         key="A minor",
         genres=["electronic", "chillout"],
-        # Mood vector (Gemini)
-        mood_energy=0.5,
-        mood_valence=0.6,
-        mood_tempo=0.55,
-        mood_confidence=0.8,
-        # Flow vector (Librosa)
+        # Cultural context from Gemini
+        activity_affinity={"workout": 0.3, "chill": 0.9},
+        daypart_affinity={"evening": 0.8, "night": 0.7},
+        emotional_intensity=0.4,
+        # Flow vector (Librosa computed)
         computed_tempo=110.5,
         computed_loudness=-12.3,
         computed_key=9,  # A
         computed_mode=0,  # Minor
-        # ML embedding
+        # ML embedding (EfficientAT)
         computed_embedding=[0.1] * 512,
         computed_embedding_model="mn10_as",
         computed_embedding_dim=512,
-        # Non-ML vibe
+        # Simple vibe (Librosa-derived only)
         computed_simple_vibe=[0.5, 0.6, 0.55, 0.7, 0.4],
-        estimated_simple_vibe=[0.4, 0.5, 0.5, 0.6, 0.5],
     )
     
     # Verify all required fields exist
     missing_fields = []
-    for field in required_vibe_fields:
+    for field in required_fields:
         if not hasattr(mock_entry, field):
             missing_fields.append(field)
     
@@ -206,7 +206,7 @@ def test_cache_manager_enrichment_entry():
         print(f"❌ Missing fields in EnrichmentEntry: {missing_fields}")
         return False
     
-    print("✅ EnrichmentEntry has all Dual Vector Architecture fields")
+    print("✅ EnrichmentEntry has all V3 required fields")
     
     # Verify computed_simple_vibe is 5D
     if mock_entry.computed_simple_vibe and len(mock_entry.computed_simple_vibe) != 5:
@@ -235,11 +235,15 @@ def test_gemini_cultural_context():
     """
     Test that GeminiService returns cultural context per v3_reimplementation.md.
     
-    GeminiAPI enrichment should include:
-    - vibe_situation: Use cases ("gym workout", "dinner party")
-    - lyrical_themes: Content themes ("heartbreak", "victory")
-    - similar_artists: Related artists (list of 3)
-    - era_scene: Era/scene classification ("90s Grunge", "2010s EDM")
+    GeminiAPI enrichment (via enrich_tracks_batch) should include:
+    - tags: Genre/mood tags
+    - mood: Text description of mood
+    - activity_affinity: Use case affinities (dict)
+    - daypart_affinity: Time-of-day affinities (dict)
+    - emotional_intensity: Intensity score (float)
+    
+    Note: In V3 (Quality > Speed), Gemini does NOT estimate simple_vibe.
+    All vibe vectors come from Librosa/EfficientAT audio analysis.
     """
     print("\n" + "="*60)
     print("TEST: Gemini Cultural Context Fields")
@@ -252,34 +256,32 @@ def test_gemini_cultural_context():
         print(f"❌ Could not import GeminiService: {e}")
         return False
     
-    # Check that _build_mood_prompt includes cultural context fields
-    prompt = GeminiService._build_mood_prompt(
-        tags=["electronic", "uplifting"],
-        genre="EDM",
-        description="Festival anthem"
-    )
-    
-    required_in_prompt = [
-        "vibe_situation",
-        "lyrical_themes",
-        "similar_artists",
-        "era_scene",
+    # Check that GeminiService has required methods for V3
+    required_methods = [
+        "enrich_tracks_batch",  # Main enrichment method
+        "generate_deezer_query",  # Query generation
+        "parse_tracks",  # Track parsing from text
     ]
     
     missing = []
-    for field in required_in_prompt:
-        if field not in prompt:
-            missing.append(field)
+    for method in required_methods:
+        if not hasattr(GeminiService, method):
+            missing.append(method)
     
     if missing:
-        print(f"❌ Mood prompt missing cultural context fields: {missing}")
+        print(f"❌ GeminiService missing required methods: {missing}")
         return False
     
-    print("✅ Gemini mood prompt requests all cultural context fields")
-    print(f"   - vibe_situation (use cases)")
-    print(f"   - lyrical_themes (content themes)")
-    print(f"   - similar_artists (related artists)")
-    print(f"   - era_scene (era/scene)")
+    print("✅ GeminiService has all required methods")
+    print("   - enrich_tracks_batch (cultural context)")
+    print("   - generate_deezer_query (search query generation)")
+    print("   - parse_tracks (track name parsing)")
+    
+    # Verify _build_mood_prompt was removed (V3 Quality > Speed)
+    if hasattr(GeminiService, '_build_mood_prompt'):
+        print("⚠️ GeminiService still has _build_mood_prompt (deprecated in V3)")
+    else:
+        print("✅ GeminiService correctly removed _build_mood_prompt")
     
     print("\n✅ All Gemini cultural context tests passed!")
     return True

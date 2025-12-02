@@ -1107,12 +1107,7 @@ class AutoplayEngineV3:
                             elif analysis.analysis_mode == "non-ml":
                                 # Non-ML Mode: Store simple vibe
                                 entry.computed_simple_vibe = analysis.simple_vibe
-                            # Clear estimated guesses once verified
-                            entry.estimated_simple_vibe = None
-                            entry.estimated_tempo = None
-                            entry.estimated_loudness = None
-                            entry.estimated_key = None
-                            entry.estimated_mode = None
+                            # Mark as verified
                             entry.analysis_verified = True
                             entry.analysis_in_progress = False
                             entry.last_analysis_attempt = time.time()
@@ -1502,13 +1497,9 @@ class AutoplayEngineV3:
             if genre_text:
                 genres = [genre_text]
 
+        # V3: Extract mood text from response (cultural context only)
         mood_vector_data = response.get("mood_vector")
-        mood_energy = mood_valence = mood_tempo = mood_confidence = None
         if isinstance(mood_vector_data, dict):
-            mood_energy = _safe_float(mood_vector_data.get("energy"))
-            mood_valence = _safe_float(mood_vector_data.get("valence"))
-            mood_tempo = _safe_float(mood_vector_data.get("tempo"))
-            mood_confidence = _safe_float(mood_vector_data.get("confidence"))
             raw_mood_label = mood_vector_data.get("mood")
             if not mood_value and isinstance(raw_mood_label, str):
                 stripped = raw_mood_label.strip()
@@ -1528,7 +1519,6 @@ class AutoplayEngineV3:
             tags=tags,
             mood=mood_value,
             fetched_at=time.time(),
-            energy=energy,
             bpm=_safe_int(bpm_val),
             key=str(key_val).strip() if isinstance(key_val, str) and key_val.strip() else None,
             activity_affinity=(
@@ -1543,30 +1533,15 @@ class AutoplayEngineV3:
                 else None
             ),
             genres=genres,
-            mood_energy=mood_energy,
-            mood_valence=mood_valence,
-            mood_tempo=mood_tempo,
-            mood_confidence=mood_confidence,
             computed_loudness=None,
             computed_tempo=None,
             computed_key=None,
             computed_mode=None,
         )
 
-        vibe_guess = response.get("simple_vibe_guess") or response.get("vibe_guess")
-        if isinstance(vibe_guess, list):
-            cleaned: List[float] = []
-            for value in vibe_guess[:5]:
-                try:
-                    cleaned.append(max(0.0, min(1.0, float(value))))
-                except (TypeError, ValueError):
-                    cleaned = []
-                    break
-            if len(cleaned) == 5:
-                entry.estimated_simple_vibe = cleaned
-
         # === AUDIO ANALYSIS PHASE ===
         # Queue Librosa+MobileNet analysis so flow/simple vibe fields fill in asynchronously
+        # V3 Architecture: Quality > Speed - no Gemini estimates, wait for real analysis
         if youtube_id:
             queued = self.queue_audio_analysis(artist, title, youtube_id)
             if queued:
@@ -1636,9 +1611,7 @@ class AutoplayEngineV3:
                     "title": title,
                     "tags": tags[:5],
                     "mood": mood_value,
-                    "energy": energy,
                     "computed_simple_vibe": entry.computed_simple_vibe,
-                    "estimated_simple_vibe": entry.estimated_simple_vibe,
                     "genres": entry.genres,
                     "computed_loudness": entry.computed_loudness,
                     "computed_tempo": entry.computed_tempo,
@@ -1658,12 +1631,15 @@ class AutoplayEngineV3:
         track_key: str,
         entry: EnrichmentEntry,
     ) -> Dict[str, Any]:
-        """Normalize enrichment payload for downstream consumers."""
-        # No vector synthesis - return None until EfficientAT finishes analyzing
+        """
+        Normalize enrichment payload for downstream consumers.
+        
+        V3 Architecture: Only returns computed audio analysis fields.
+        No Gemini-based estimates (Quality > Speed).
+        """
         return {
             "tags": list(entry.tags),
             "mood": entry.mood,
-            "energy": entry.energy,
             "mood_vector": self._build_mood_payload(entry, track_key=track_key),
             "bpm": entry.bpm,
             "key": entry.key,
@@ -1672,23 +1648,13 @@ class AutoplayEngineV3:
             "daypart_affinity": entry.daypart_affinity,
             "genres": list(entry.genres),
             "computed_simple_vibe": list(entry.computed_simple_vibe or []),
-            "estimated_simple_vibe": list(entry.estimated_simple_vibe or []),
             "computed_embedding": list(entry.computed_embedding or []),
             "computed_embedding_model": entry.computed_embedding_model,
             "computed_embedding_dim": entry.computed_embedding_dim,
-            "gemini_simple_vibe": list(entry.estimated_simple_vibe or []),
             "computed_loudness": entry.computed_loudness,
             "computed_tempo": entry.computed_tempo,
             "computed_key": entry.computed_key,
             "computed_mode": entry.computed_mode,
-            "estimated_tempo": entry.estimated_tempo,
-            "estimated_loudness": entry.estimated_loudness,
-            "estimated_key": entry.estimated_key,
-            "estimated_mode": entry.estimated_mode,
-            "mood_energy": entry.mood_energy,
-            "mood_valence": entry.mood_valence,
-            "mood_tempo": entry.mood_tempo,
-            "mood_confidence": entry.mood_confidence,
             "analysis_verified": entry.analysis_verified,
             "analysis_in_progress": entry.analysis_in_progress,
             "last_analysis_attempt": entry.last_analysis_attempt,
@@ -1700,19 +1666,17 @@ class AutoplayEngineV3:
         *,
         track_key: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Translate an enrichment entry into the unified 5D vibe payload."""
-        vector = None
-        vibe_source = "heuristic"
-        if entry.computed_simple_vibe:
-            vector = list(entry.computed_simple_vibe)
-            vibe_source = "analysis"
-        elif entry.estimated_simple_vibe:
-            vector = list(entry.estimated_simple_vibe)
-            vibe_source = "estimate"
+        """
+        Translate an enrichment entry into the unified 5D vibe payload.
+        
+        V3 Architecture: Only uses computed_simple_vibe from Librosa/MobileNet analysis.
+        Returns None if audio analysis hasn't been completed yet (Quality > Speed).
+        """
+        if not entry.computed_simple_vibe:
+            return None  # No Gemini fallback - wait for audio analysis
 
-        if not vector:
-            return None
-
+        vector = list(entry.computed_simple_vibe)
+        
         payload: Dict[str, Any] = {
             "vector": vector,
             "dimensions": [
@@ -1720,19 +1684,15 @@ class AutoplayEngineV3:
                 "valence",
                 "danceability",
                 "acousticness",
-                "instrumentalness",
+                "brightness",
             ],
             "energy": vector[0] if len(vector) > 0 else None,
             "valence": vector[1] if len(vector) > 1 else None,
             "danceability": vector[2] if len(vector) > 2 else None,
             "acousticness": vector[3] if len(vector) > 3 else None,
-            "instrumentalness": vector[4] if len(vector) > 4 else None,
-            "tempo": entry.mood_tempo,
-            "confidence": entry.mood_confidence,
+            "brightness": vector[4] if len(vector) > 4 else None,
             "mood": entry.mood,
-            "source": vibe_source,
-            "legacy_energy": entry.mood_energy,
-            "legacy_valence": entry.mood_valence,
+            "source": "analysis",
         }
 
         if track_key:
@@ -2229,97 +2189,16 @@ class AutoplayEngineV3:
         self,
         artist: str,
         title: str,
-        *,
-        tags: Optional[Sequence[str]] = None,
-        genre: Optional[str] = None,
-        description: Optional[str] = None,
-        force_refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:
+        """
+        Get the 5D vibe vector for a track from cache. 
+        V3 Architecture: Only returns vectors computed by Librosa/MobileNet audio analysis.
+        """
         key = self._make_track_key(artist, title)
         entry = await self._cache.get_enrichment(artist, title)
-        if entry and not force_refresh:
-            return self._build_mood_payload(entry, track_key=key)
-
-        if not self._gemini.is_available:
-            LOG.debug("Gemini unavailable; skipping mood vector classification")
-            return self._build_mood_payload(entry, track_key=key) if entry else None
-
-        def _safe_float(value: Any, fallback: float = 0.5) -> float:
-            try:
-                if value is None or value == "":
-                    return fallback
-                return float(value)
-            except (TypeError, ValueError):
-                return fallback
-
-        metadata_tags: List[str] = []
-        if tags:
-            metadata_tags.extend(str(tag) for tag in tags if isinstance(tag, str))
-        if entry:
-            metadata_tags.extend(entry.tags)
-        if metadata_tags:
-            metadata_tags = list(dict.fromkeys(metadata_tags))
-
-        metadata = {
-            "tags": metadata_tags,
-            "genre": genre or (entry.genres[0] if entry and entry.genres else ""),
-            "description": description or "",
-        }
-
-        try:
-            response = await self._gemini.classify_mood_vector(metadata)
-        except Exception as exc:
-            LOG.warning("Gemini mood classification failed: %s", exc)
-            return self._build_mood_payload(entry, track_key=key) if entry else None
-
-        if not response:
-            return self._build_mood_payload(entry, track_key=key) if entry else None
-
-        energy = _safe_float(response.get("energy"))
-        valence = _safe_float(response.get("valence"))
-        tempo_norm = _safe_float(response.get("tempo"))
-        confidence = _safe_float(response.get("confidence"))
-        mood_label = str(response.get("mood", "")).strip() or None
-
-        if entry:
-            entry.mood_energy = energy
-            entry.mood_valence = valence
-            entry.mood_tempo = tempo_norm
-            entry.mood_confidence = confidence
-            if mood_label and not entry.mood:
-                entry.mood = mood_label
-            # NO vector synthesis - only background analysis can fill computed_simple_vibe
-            await self._cache.set_enrichment(artist, title, entry)
-            payload = self._build_mood_payload(entry, track_key=key)
-            if payload is not None:
-                payload.setdefault("source", "gemini")
-                payload["confidence"] = confidence
-                payload["tempo"] = tempo_norm
-                payload["mood"] = mood_label or payload.get("mood")
-            return payload
-
-        vibe_vector = [energy, valence, 0.5, 0.5, 0.5]
-        payload = {
-            "id": key,
-            "vector": vibe_vector,
-            "dimensions": [
-                "energy",
-                "valence",
-                "danceability",
-                "acousticness",
-                "instrumentalness",
-            ],
-            "energy": energy,
-            "valence": valence,
-            "danceability": vibe_vector[2],
-            "acousticness": vibe_vector[3],
-            "instrumentalness": vibe_vector[4],
-            "tempo": tempo_norm,
-            "confidence": confidence,
-            "mood": mood_label,
-            "source": "gemini",
-        }
-        return payload
+        if not entry:
+            return None
+        return self._build_mood_payload(entry, track_key=key)
 
     @staticmethod
     def _make_track_key(artist: str, title: str) -> str:

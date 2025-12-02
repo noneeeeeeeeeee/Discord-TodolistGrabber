@@ -788,33 +788,13 @@ Return the BEST GUESS metadata for Last.fm scrobbling:
             )
             tags = record.get("tags") or []
             moods = record.get("moods") or []
-            energy = record.get("energy")
-            bpm = record.get("bpm")
-            key = record.get("key")
             activity_affinity = record.get("activity_affinity")
             emotional_intensity = record.get("emotional_intensity")
             daypart_affinity = record.get("daypart_affinity")
-            mood_vector = record.get("mood_vector")
-
-            vibe_guess_raw = record.get("simple_vibe_guess") or record.get("vibe_guess")
-            vibe_guess: Optional[List[float]] = None
-            if isinstance(vibe_guess_raw, list):
-                cleaned: List[float] = []
-                for value in vibe_guess_raw[:5]:
-                    try:
-                        cleaned.append(max(0.0, min(1.0, float(value))))
-                    except (TypeError, ValueError):
-                        cleaned = []
-                        break
-                if len(cleaned) == 5:
-                    vibe_guess = cleaned
 
             payload_entry = {
                 "tags": tags if isinstance(tags, list) else [],
                 "moods": moods if isinstance(moods, list) else [],
-                "energy": energy if isinstance(energy, str) else None,
-                "bpm": int(bpm) if bpm and str(bpm).isdigit() else None,
-                "key": str(key).strip() if key else None,
                 "activity_affinity": (
                     str(activity_affinity).strip() if activity_affinity else None
                 ),
@@ -826,8 +806,6 @@ Return the BEST GUESS metadata for Last.fm scrobbling:
                 "daypart_affinity": (
                     str(daypart_affinity).strip() if daypart_affinity else None
                 ),
-                "mood_vector": mood_vector if isinstance(mood_vector, dict) else None,
-                "simple_vibe_guess": vibe_guess,
             }
             if track_id and track_id in unmatched:
                 result_map[track_id] = payload_entry
@@ -863,15 +841,14 @@ Return the BEST GUESS metadata for Last.fm scrobbling:
             else "Use only widely known music knowledge."
         )
         instructions = (
-            "You are enriching music metadata. Return JSON with a 'results' array. "
+            "You are enriching music metadata for cultural context. Return JSON with a 'results' array. "
             "Each result must echo the input 'id' and include:\n"
             "- 'tags' (list of canonical genres, e.g., ['pop', 'rock', 'electronic'])\n"
-            "- 'moods' (up to 3 descriptive moods, e.g., ['energetic', 'uplifting', 'danceable'])\n"
-            "- 'energy' (single word: low, medium, high)\n"
-            "- 'mood' (single descriptive word for overall mood, e.g., 'happy', 'melancholic', 'intense')\n"
-            "- 'simple_vibe_guess' (5 floats between 0-1: [energy, valence, danceability, acousticness, brightness])\n"
+            "- 'moods' (up to 3 descriptive moods as text, e.g., ['energetic', 'uplifting', 'danceable'])\n"
+            "- 'activity_affinity' (best use case: 'workout', 'study', 'party', 'chill', 'commute')\n"
+            "- 'daypart_affinity' (best time: 'morning', 'afternoon', 'evening', 'night', 'late_night')\n"
             f"{grounding_hint} If unsure, return empty arrays or null values.\n"
-            "Note: Audio features (tempo, key, loudness) are computed separately and should NOT be included."
+            "Note: Audio features (tempo, key, loudness, energy) are computed via Librosa/MobileNet and should NOT be guessed."
         )
         return (
             f"{instructions}\n\n"
@@ -1346,29 +1323,6 @@ Return the BEST GUESS metadata for Last.fm scrobbling:
             '  "primary_entity": "Hazbin Hotel"\n'
             "}\n\n"
             "Now parse the provided input and return JSON only."
-        )
-
-    @staticmethod
-    def _build_mood_prompt(tags: List[str], genre: str, description: str) -> str:
-        tags_text = ", ".join(str(tag) for tag in tags) if tags else "(none)"
-        genre_text = genre or "(unknown)"
-        description_text = description or ""
-        return (
-            "You are enriching music metadata for a recommendation engine.\n"
-            "Infer high-level mood and energy signals given the supplied context.\n"
-            "Also provide cultural context tags.\n"
-            "Respond with JSON containing:\n"
-            "- 'energy', 'valence', 'tempo' (each 0..1)\n"
-            "- 'mood' (single descriptive word)\n"
-            "- 'confidence' (0..1)\n"
-            "- 'vibe_situation' (e.g., 'gym workout', 'dinner party', 'studying')\n"
-            "- 'lyrical_themes' (e.g., 'heartbreak', 'victory', 'social commentary')\n"
-            "- 'similar_artists' (list of 3 artist names)\n"
-            "- 'era_scene' (e.g., '90s Grunge', '2010s EDM')\n\n"
-            f"Tags: {tags_text}\n"
-            f"Genre: {genre_text}\n"
-            f"Description: {description_text}\n"
-            "Return only the JSON object."
         )
 
     # ------------------------------------------------------------------

@@ -3163,29 +3163,6 @@ class LastFMAutoplayV3:
                     if isinstance(m, str) and m.strip()
                 ]
                 mood_value = moods[0] if moods else None
-                energy = (
-                    payload.get("energy")
-                    if isinstance(payload.get("energy"), str)
-                    else None
-                )
-
-                # Gemini 4D mood vector (legacy) + compute fallback vibe
-                mood_energy = None
-                mood_valence = None
-                mood_tempo = None
-                mood_confidence = None
-
-                mood_vector_data = payload.get("mood_vector")
-                if isinstance(mood_vector_data, dict):
-                    mood_energy = _safe_float(mood_vector_data.get("energy"))
-                    mood_valence = _safe_float(mood_vector_data.get("valence"))
-                    mood_tempo = _safe_float(mood_vector_data.get("tempo"))
-                    mood_confidence = _safe_float(mood_vector_data.get("confidence"))
-                    raw_mood_label = mood_vector_data.get("mood")
-                    if not mood_value and isinstance(raw_mood_label, str):
-                        stripped = raw_mood_label.strip()
-                        if stripped:
-                            mood_value = stripped
 
                 raw_genres = payload.get("genres")
                 genres: List[str] = []
@@ -3200,6 +3177,7 @@ class LastFMAutoplayV3:
                 elif isinstance(payload.get("genre"), str) and payload["genre"].strip():
                     genres = [payload["genre"].strip()]
 
+                # V3: Only load computed audio analysis fields
                 raw_simple_vibe = (
                     payload.get("computed_simple_vibe")
                     or payload.get("computed_vibe_vector")
@@ -3221,23 +3199,6 @@ class LastFMAutoplayV3:
                 computed_tempo = _safe_float(payload.get("computed_tempo"))
                 computed_key = _safe_int(payload.get("computed_key"))
                 computed_mode = _safe_int(payload.get("computed_mode"))
-                estimated_tempo = _safe_float(payload.get("estimated_tempo"))
-                estimated_loudness = _safe_float(payload.get("estimated_loudness"))
-                estimated_key = _safe_int(payload.get("estimated_key"))
-                estimated_mode = _safe_int(payload.get("estimated_mode"))
-
-                estimated_simple_vibe: Optional[List[float]] = None
-                vibe_guess_raw = payload.get("simple_vibe_guess") or payload.get("vibe_guess")
-                if isinstance(vibe_guess_raw, list):
-                    temp_vals: List[float] = []
-                    for val in vibe_guess_raw[:5]:
-                        parsed = _safe_float(val)
-                        if parsed is None:
-                            temp_vals = []
-                            break
-                        temp_vals.append(max(0.0, min(1.0, parsed)))
-                    if len(temp_vals) == 5:
-                        estimated_simple_vibe = temp_vals
 
                 bpm_val = payload.get("bpm")
                 key_val = payload.get("key")
@@ -3251,7 +3212,6 @@ class LastFMAutoplayV3:
                     tags=tags,
                     mood=mood_value,
                     fetched_at=time.time(),
-                    energy=energy,
                     bpm=_safe_int(bpm_val),
                     key=(
                         str(key_val).strip()
@@ -3270,23 +3230,14 @@ class LastFMAutoplayV3:
                         else None
                     ),
                     genres=genres,
-                    mood_energy=mood_energy,
-                    mood_valence=mood_valence,
-                    mood_tempo=mood_tempo,
-                    mood_confidence=mood_confidence,
                     computed_simple_vibe=computed_simple_vibe,
                     computed_loudness=computed_loudness,
                     computed_tempo=computed_tempo,
                     computed_key=computed_key,
                     computed_mode=computed_mode,
-                    estimated_tempo=estimated_tempo,
-                    estimated_loudness=estimated_loudness,
-                    estimated_key=estimated_key,
-                    estimated_mode=estimated_mode,
-                    estimated_simple_vibe=estimated_simple_vibe,
                 )
 
-                # Vibe vectors now computed during analysis or inferred from enrichment
+                # V3: No Gemini vibe estimates - wait for Librosa/MobileNet analysis
 
                 await self._engine._cache.set_enrichment(
                     artist, title, enrichment_entry
