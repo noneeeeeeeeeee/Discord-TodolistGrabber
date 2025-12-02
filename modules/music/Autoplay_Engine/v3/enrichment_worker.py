@@ -23,9 +23,10 @@ from .config import (
     DEFAULT_VERBOSITY,
     GEMINI_BATCH_SIZE,
     GEMINI_BATCH_TIMEOUT_SECONDS,
+    PRIORITY_DAYDREAM,
 )
 from .deezer_fetch import DeezerClient
-from .cache_manager import EnrichmentEntry
+from .cache_manager import EnrichmentEntry, MappingEntry
 
 if TYPE_CHECKING:
     from .autoplayengine_v3 import AutoplayEngineV3
@@ -463,12 +464,32 @@ class EnrichmentWorker:
             entry.bpm = task.deezer_bpm
             await self.engine._cache.set_enrichment(task.artist, task.title, entry)
             
+            # Create mapping entry with preview URL (required for queue_analysis)
+            mapping = MappingEntry(
+                youtube_id="deezer_preview",  # Placeholder - Deezer-only architecture
+                url="",
+                timestamp=time.time(),
+                preview_url=task.preview_url,
+                preview_duration_ms=30000,  # Deezer previews are 30s
+                preview_fetched_at=time.time(),
+                deezer_track_id=str(task.deezer_id) if task.deezer_id else None,
+                ingest_source="enrichment_worker",
+            )
+            await self.engine._cache.set_mapping(task.artist, task.title, mapping)
+            
+            # Map priority to engine's priority system
+            engine_priority = PRIORITY_DAYDREAM  # Default to lowest
+            if task.priority == Priority.USER:
+                engine_priority = 1  # PRIORITY_ACTIVE
+            elif task.priority == Priority.BUFFER:
+                engine_priority = 2  # PRIORITY_BUFFER
+            
             # Queue for EfficientAT analysis (uses engine's worker system)
-            success = await self.engine._queue_analysis(
-                task.artist,
-                task.title,
-                task.preview_url,
-                priority=task.priority,
+            # queue_analysis expects: track_id (artist::title format), youtube_url (for compat), priority
+            success = self.engine.queue_analysis(
+                track_key,
+                "deezer_preview",  # Placeholder URL - actual preview is in mapping
+                priority=engine_priority,
             )
             
             if success:
