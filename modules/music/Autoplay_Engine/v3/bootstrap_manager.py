@@ -2,27 +2,49 @@ import asyncio
 import logging
 import json
 import time
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Set, Optional, List, Dict, Any, Callable
 
 from .deezer_fetch import DeezerClient
+from .lastfm_client import LastFMClient
 from .cache_manager import MappingEntry, EnrichmentEntry
-from .config import PRIORITY_DAYDREAM, MAX_QUEUE_BACKLOG, DEFAULT_VERBOSITY
+from .config import (
+    PRIORITY_DAYDREAM,
+    MAX_QUEUE_BACKLOG,
+    DEFAULT_VERBOSITY,
+    FIRST_RUN_FETCH_COUNT,
+    DAYDREAM_BATCH_SIZE,
+    DAYDREAM_INTERVAL_SECONDS,
+    NEW_RELEASE_CHECK_DAYS,
+)
 
 if TYPE_CHECKING:
     from .autoplayengine_v3 import AutoplayEngineV3
 
 LOG = logging.getLogger(__name__)
 
+
+class DaydreamScenario(Enum):
+    """Current daydream scenario based on cache state."""
+    FIRST_RUN = "first_run"          # Scenario A: Empty cache, fetch 200 from Last.fm
+    DAYDREAMING = "daydreaming"      # Scenario B: Explore tracks via Last.fm similar/tags
+    NEW_RELEASES = "new_releases"    # Scenario C: Monthly new releases from Deezer
+    IDLE = "idle"                    # Cache full, waiting
+
 class BootstrapManager:
     """
     Manages cold-start bootstrapping ("Daydreaming") by fetching popular tracks 
     from Last.fm/Deezer and feeding them into the analysis queue.
     
+    Implements three scenarios from v3_reimplementation.md:
+    - Scenario A: First Run - Fetch 200 tracks from Last.fm charts
+    - Scenario B: Daydreaming - Explore tracks via Last.fm similar/tags  
+    - Scenario C: New Releases - Monthly check from Deezer editorial
+    
     Key behaviors:
     - Only runs when NO active sessions 
     - Pauses immediately when a user session starts
-    - Actually analyzes tracks (downloads preview, runs EfficientAT)
     - Builds cache proactively for future recommendations
     - Priority 3 (lowest) - never blocks user requests
     """
@@ -33,8 +55,15 @@ class BootstrapManager:
         self._is_running = False
         self._is_paused = False  # Paused when sessions are active
         self._task: Optional[asyncio.Task] = None
-        self._bootstrap_limit = 200  # Stop after bootstrapping this many tracks
+        self._bootstrap_limit = FIRST_RUN_FETCH_COUNT  # Stop after bootstrapping this many tracks
         self._verbose = DEFAULT_VERBOSITY
+        
+        # Scenario tracking
+        self._current_scenario = DaydreamScenario.IDLE
+        self._exploration_tags: List[str] = ["pop", "rock", "hip-hop", "electronic", "indie", "r&b"]
+        self._current_tag_index = 0
+        self._last_new_release_check = 0.0
+        self._new_release_continuation = False
         
         # Persistence
         self._state_file = Path("cache/music/bootstrap_state.json")
@@ -60,6 +89,10 @@ class BootstrapManager:
                 with open(self._state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self._bootstrapped_tracks = set(data.get("bootstrapped_tracks", []))
+                    self._exploration_tags = data.get("exploration_tags", self._exploration_tags)
+                    self._current_tag_index = data.get("current_tag_index", 0)
+                    self._last_new_release_check = data.get("last_new_release_check", 0.0)
+                    self._new_release_continuation = data.get("new_release_continuation", False)
                     self._vlog(1, "🌱 [Bootstrap] Resuming: %d tracks already cached", len(self._bootstrapped_tracks))
             except Exception as e:
                 LOG.warning(f"⚠️ [Bootstrap] Failed to load state: {e}")
@@ -70,7 +103,12 @@ class BootstrapManager:
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self._state_file, "w", encoding="utf-8") as f:
                 json.dump({
-                    "bootstrapped_tracks": list(self._bootstrapped_tracks)
+                    "bootstrapped_tracks": list(self._bootstrapped_tracks),
+                    "exploration_tags": self._exploration_tags,
+                    "current_tag_index": self._current_tag_index,
+                    "last_new_release_check": self._last_new_release_check,
+                    "new_release_continuation": self._new_release_continuation,
+                    "saved_at": time.time(),
                 }, f)
         except Exception as e:
             LOG.warning(f"⚠️ [Bootstrap] Failed to save state: {e}")
@@ -100,6 +138,32 @@ class BootstrapManager:
         if hasattr(self.engine, '_session_manager'):
             return self.engine._session_manager.has_active_sessions()
         return False
+    
+    def _determine_scenario(self) -> DaydreamScenario:
+        """
+        Determine which daydream scenario to run based on cache state.
+        
+        Returns:
+            DaydreamScenario enum value
+        """
+        # Scenario A: First run if we have fewer than half the target tracks
+        if len(self._bootstrapped_tracks) < self._bootstrap_limit // 2:
+            return DaydreamScenario.FIRST_RUN
+        
+        # Scenario C: New releases if enough time has passed (or continuation)
+        if self._new_release_continuation:
+            return DaydreamScenario.NEW_RELEASES
+        
+        days_since_check = (time.time() - self._last_new_release_check) / 86400
+        if days_since_check >= NEW_RELEASE_CHECK_DAYS:
+            return DaydreamScenario.NEW_RELEASES
+        
+        # Scenario B: Normal daydreaming (exploration)
+        if len(self._bootstrapped_tracks) < self._bootstrap_limit:
+            return DaydreamScenario.DAYDREAMING
+        
+        # Cache is full, idle mode
+        return DaydreamScenario.IDLE
 
     async def _ensure_cache_entries(self, artist: str, title: str, track) -> bool:
         """
@@ -330,15 +394,209 @@ class BootstrapManager:
         
         return enriched_count
 
+    # ==========================================
+    # SCENARIO METHODS: Fetch tracks for each scenario
+    # ==========================================
+    
+    async def _scenario_first_run(self) -> List:
+        """
+        Scenario A: First run - cache is empty or very small.
+        Fetch 200 tracks from Last.fm global charts to seed the pool.
+        
+        Returns:
+            List of DeezerTrack objects (verified via Deezer for preview URLs)
+        """
+        self._vlog(1, "🚀 [Scenario A] First run - fetching %d tracks from Last.fm charts", 
+                   FIRST_RUN_FETCH_COUNT)
+        
+        verified_tracks = []
+        
+        try:
+            # Fetch from Last.fm chart.getTopTracks
+            async with LastFMClient(max_concurrent=5, timeout=10.0) as lastfm:
+                lastfm_tracks = await lastfm.get_top_tracks(limit=FIRST_RUN_FETCH_COUNT)
+            
+            if not lastfm_tracks:
+                self._vlog(1, "⚠️ [Scenario A] No tracks from Last.fm, falling back to Deezer charts")
+                async with DeezerClient(max_concurrent=10, timeout=5.0) as deezer:
+                    return await deezer.get_charts(limit=FIRST_RUN_FETCH_COUNT)
+            
+            self._vlog(1, "📊 [Scenario A] Got %d tracks from Last.fm, verifying via Deezer...", 
+                      len(lastfm_tracks))
+            
+            # Verify each track via Deezer to get preview URLs
+            async with DeezerClient(max_concurrent=10, timeout=5.0) as deezer:
+                for track_info in lastfm_tracks:
+                    try:
+                        artist = track_info.get("artist", "")
+                        title = track_info.get("title", "")
+                        
+                        if not artist or not title:
+                            continue
+                        
+                        # Search Deezer for this track
+                        results = await deezer.search_track(artist, title)
+                        if results and results[0].preview_url:
+                            verified_tracks.append(results[0])
+                            
+                    except Exception as e:
+                        self._vlog(2, "⚠️ [Scenario A] Failed to verify %s: %s", 
+                                  track_info.get("title", "?"), str(e)[:30])
+                        continue
+            
+            self._vlog(1, "✅ [Scenario A] Verified %d/%d tracks via Deezer", 
+                      len(verified_tracks), len(lastfm_tracks))
+            
+        except Exception as e:
+            LOG.error(f"❌ [Scenario A] Error: {e}", exc_info=True)
+        
+        return verified_tracks
+    
+    async def _scenario_daydreaming(self) -> List:
+        """
+        Scenario B: Normal daydreaming - explore based on user listening patterns.
+        Uses Last.fm similar tracks or tag-based discovery.
+        
+        Returns:
+            List of DeezerTrack objects
+        """
+        self._vlog(1, "🌱 [Scenario B] Daydreaming - exploration mode")
+        
+        verified_tracks = []
+        
+        try:
+            # Get seed tracks from recently played or cached pool
+            seed_tracks = await self._get_seed_tracks_for_exploration()
+            
+            async with LastFMClient(max_concurrent=5, timeout=10.0) as lastfm:
+                async with DeezerClient(max_concurrent=10, timeout=5.0) as deezer:
+                    
+                    # Strategy 1: Similar tracks to seeds
+                    if seed_tracks:
+                        for seed_artist, seed_title in seed_tracks[:3]:  # Top 3 seeds
+                            try:
+                                similar = await lastfm.get_similar_tracks(
+                                    seed_artist, seed_title, limit=10
+                                )
+                                for track_info in similar:
+                                    artist = track_info.get("artist", "")
+                                    title = track_info.get("title", "")
+                                    if artist and title:
+                                        results = await deezer.search_track(artist, title)
+                                        if results and results[0].preview_url:
+                                            verified_tracks.append(results[0])
+                            except Exception as e:
+                                self._vlog(2, "⚠️ [Scenario B] Similar tracks error: %s", str(e)[:30])
+                    
+                    # Strategy 2: Tag-based discovery
+                    if len(verified_tracks) < DAYDREAM_BATCH_SIZE:
+                        for tag in self._exploration_tags[:2]:  # Top 2 tags
+                            try:
+                                tag_tracks = await lastfm.get_tag_top_tracks(tag, limit=10)
+                                for track_info in tag_tracks:
+                                    artist = track_info.get("artist", "")
+                                    title = track_info.get("title", "")
+                                    if artist and title:
+                                        results = await deezer.search_track(artist, title)
+                                        if results and results[0].preview_url:
+                                            verified_tracks.append(results[0])
+                            except Exception as e:
+                                self._vlog(2, "⚠️ [Scenario B] Tag discovery error: %s", str(e)[:30])
+            
+            # Fallback: Deezer charts if no exploration results
+            if not verified_tracks:
+                self._vlog(1, "⚠️ [Scenario B] No exploration results, falling back to Deezer charts")
+                async with DeezerClient(max_concurrent=10, timeout=5.0) as deezer:
+                    verified_tracks = await deezer.get_charts(limit=DAYDREAM_BATCH_SIZE)
+            
+            self._vlog(1, "✅ [Scenario B] Found %d exploration tracks", len(verified_tracks))
+            
+        except Exception as e:
+            LOG.error(f"❌ [Scenario B] Error: {e}", exc_info=True)
+        
+        return verified_tracks
+    
+    async def _scenario_new_releases(self) -> List:
+        """
+        Scenario C: Monthly new releases check.
+        Fetch latest releases from Deezer to keep recommendations fresh.
+        
+        Returns:
+            List of DeezerTrack objects
+        """
+        self._vlog(1, "🆕 [Scenario C] Checking new releases from Deezer")
+        
+        verified_tracks = []
+        
+        try:
+            async with DeezerClient(max_concurrent=10, timeout=5.0) as deezer:
+                new_releases = await deezer.get_new_releases(limit=50)
+                
+                # Filter to tracks with preview URLs
+                for track in new_releases:
+                    if track.preview_url:
+                        verified_tracks.append(track)
+            
+            if verified_tracks:
+                self._last_new_release_check = time.time()
+                self._new_release_continuation = len(verified_tracks) >= 40  # Continue if many new
+                self._save_state()
+                
+                self._vlog(1, "✅ [Scenario C] Found %d new releases with previews", 
+                          len(verified_tracks))
+            else:
+                self._vlog(1, "⚠️ [Scenario C] No new releases with previews")
+                self._new_release_continuation = False
+                
+        except Exception as e:
+            LOG.error(f"❌ [Scenario C] Error: {e}", exc_info=True)
+        
+        return verified_tracks
+    
+    async def _get_seed_tracks_for_exploration(self) -> List[tuple]:
+        """
+        Get seed tracks for exploration (Scenario B).
+        Uses recently played tracks or random from cache.
+        
+        Returns:
+            List of (artist, title) tuples
+        """
+        seeds = []
+        
+        try:
+            # Strategy 1: Recent session tracks
+            if hasattr(self.engine, '_session_manager'):
+                recent = self.engine._session_manager.get_recent_tracks(limit=5)
+                for track_key in recent:
+                    if "::" in track_key:
+                        parts = track_key.split("::", 1)
+                        seeds.append((parts[0], parts[1]))
+            
+            # Strategy 2: Sample from bootstrapped pool
+            if not seeds and self._bootstrapped_tracks:
+                import random
+                sample = random.sample(
+                    list(self._bootstrapped_tracks), 
+                    min(5, len(self._bootstrapped_tracks))
+                )
+                for track_key in sample:
+                    if "::" in track_key:
+                        parts = track_key.split("::", 1)
+                        seeds.append((parts[0], parts[1]))
+                        
+        except Exception as e:
+            self._vlog(2, "⚠️ [Exploration] Failed to get seed tracks: %s", str(e)[:50])
+        
+        return seeds
+
     async def _bootstrap_loop(self):
         """
         Main daydream loop - only runs when no active sessions.
         
-        This implements the "Priority 3" background analysis:
-        - Fetches tracks from Deezer charts / Last.fm trending
-        - Verifies via Deezer and gets preview URL
-        - Queues for EfficientAT analysis
-        - Does NOT resolve YouTube (deferred until song is chosen)
+        Implements Priority 3 background analysis using three scenarios:
+        - Scenario A: First run - seed with Last.fm top tracks
+        - Scenario B: Daydreaming - explore via similar tracks/tags
+        - Scenario C: New releases - monthly Deezer new releases check
         """
         self._vlog(2, "🌱 Starting bootstrap loop (Daydream mode)")
         # Initial delay to let other services settle
@@ -392,18 +650,31 @@ class BootstrapManager:
                     continue
 
                 # ========================================
-                # STEP 1: Fetch chart tracks from Deezer
+                # STEP 1: Determine scenario and fetch tracks
                 # ========================================
-                self._vlog(2, "🌱 [Daydream] Fetching chart tracks...")
-                async with DeezerClient(max_concurrent=10, timeout=5.0) as client:
-                    tracks = await client.get_charts(limit=50)
+                scenario = self._determine_scenario()
+                self._vlog(1, "🎯 [Daydream] Running scenario: %s", scenario.value)
+                
+                if scenario == DaydreamScenario.IDLE:
+                    self._vlog(1, "💤 [Daydream] Cache full, entering idle mode")
+                    await asyncio.sleep(3600)  # Check hourly
+                    continue
+                
+                # Fetch tracks based on scenario
+                if scenario == DaydreamScenario.FIRST_RUN:
+                    tracks = await self._scenario_first_run()
+                elif scenario == DaydreamScenario.NEW_RELEASES:
+                    tracks = await self._scenario_new_releases()
+                else:  # DAYDREAMING
+                    tracks = await self._scenario_daydreaming()
                 
                 if not tracks:
-                    LOG.warning("⚠️ [Daydream] No chart tracks returned")
+                    LOG.warning("⚠️ [Daydream] No tracks returned for scenario %s", scenario.value)
                     await asyncio.sleep(300)
                     continue
                 
-                self._vlog(1, "🌱 [Daydream] Processing %d chart tracks...", len(tracks))
+                self._vlog(1, "🌱 [Daydream] Processing %d tracks from %s scenario...", 
+                          len(tracks), scenario.value)
                 
                 # ========================================
                 # STEP 1.5: Queue Gemini cultural enrichment for all tracks

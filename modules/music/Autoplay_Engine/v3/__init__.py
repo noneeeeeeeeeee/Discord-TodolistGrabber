@@ -3107,6 +3107,66 @@ class LastFMAutoplayV3:
             if result is not None:
                 prepared.append(result)
 
+        # V3: Check for candidates missing audio analysis (analysis_verified)
+        # Per design: "If not enriched, process it as prio 1. User waits."
+        candidates_needing_analysis = []
+        for prepared_entry in prepared:
+            track_id = prepared_entry.features.track_id
+            enrichment = enrichment_cache.get(track_id)
+            if not enrichment or not enrichment.get("analysis_verified"):
+                artist, title = parsed_metadata.get(
+                    track_id, (prepared_entry.features.artist, prepared_entry.features.title)
+                )
+                candidates_needing_analysis.append((artist, title))
+        
+        # Request P1 enrichment for candidates missing audio analysis
+        if candidates_needing_analysis and hasattr(self._engine, '_enrichment_worker'):
+            if self._verbose >= 1:
+                LOG.info(
+                    "⏳ [P1 Enrichment] %d candidates need audio analysis, requesting priority enrichment...",
+                    len(candidates_needing_analysis)
+                )
+            
+            # Batch request P1 (BUFFER priority) enrichment
+            enriched_count = await self._engine._enrichment_worker.enrich_batch_for_buffer(
+                candidates_needing_analysis,
+                max_wait=30.0,  # Wait up to 30s for enrichment
+            )
+            
+            if self._verbose >= 1:
+                LOG.info(
+                    "✅ [P1 Enrichment] Enriched %d/%d candidates",
+                    enriched_count, len(candidates_needing_analysis)
+                )
+            
+            # Re-fetch enrichment data for newly enriched candidates
+            if enriched_count > 0:
+                for prepared_entry in prepared:
+                    track_id = prepared_entry.features.track_id
+                    enrichment = enrichment_cache.get(track_id)
+                    if not enrichment or not enrichment.get("analysis_verified"):
+                        artist, title = parsed_metadata.get(
+                            track_id, (prepared_entry.features.artist, prepared_entry.features.title)
+                        )
+                        # Re-check cache for updated entry
+                        cached = await self._engine._cache.get_enrichment(artist, title)
+                        if cached and cached.analysis_verified:
+                            # Update features with new audio analysis data
+                            if cached.computed_embedding:
+                                prepared_entry.features.computed_embedding = cached.computed_embedding
+                                prepared_entry.features.computed_embedding_model = cached.computed_embedding_model
+                                prepared_entry.features.computed_embedding_dim = len(cached.computed_embedding)
+                            if cached.computed_simple_vibe:
+                                prepared_entry.features.computed_simple_vibe = cached.computed_simple_vibe
+                            if cached.computed_tempo is not None:
+                                prepared_entry.features.computed_tempo = cached.computed_tempo
+                            if cached.computed_loudness is not None:
+                                prepared_entry.features.computed_loudness = cached.computed_loudness
+                            if cached.computed_key is not None:
+                                prepared_entry.features.computed_key = cached.computed_key
+                            if cached.computed_mode is not None:
+                                prepared_entry.features.computed_mode = cached.computed_mode
+        
         # Log cache performance summary
         if self._verbose >= 1:
             total_checks = (

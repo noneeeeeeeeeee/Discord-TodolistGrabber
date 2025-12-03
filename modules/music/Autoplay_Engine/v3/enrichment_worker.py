@@ -54,7 +54,8 @@ class EnrichmentTask:
     deezer_id: Optional[int] = None
     preview_url: Optional[str] = None
     genres: List[str] = field(default_factory=list)
-    deezer_bpm: Optional[int] = None
+    deezer_bpm: Optional[float] = None
+    deezer_gain: Optional[float] = None  # Loudness in dB
     
     # Processing state
     stage: int = 0  # 0=queued, 1=deezer_resolved, 2=analyzing, 3=complete
@@ -76,6 +77,7 @@ class EnrichmentTask:
             "preview_url": self.preview_url,
             "genres": self.genres,
             "deezer_bpm": self.deezer_bpm,
+            "deezer_gain": self.deezer_gain,
             "stage": self.stage,
             "error": self.error,
         }
@@ -92,6 +94,7 @@ class EnrichmentTask:
             preview_url=data.get("preview_url"),
             genres=data.get("genres", []),
             deezer_bpm=data.get("deezer_bpm"),
+            deezer_gain=data.get("deezer_gain"),
             stage=data.get("stage", 0),
             error=data.get("error"),
         )
@@ -404,8 +407,9 @@ class EnrichmentWorker:
         Gets:
         - Deezer track ID
         - Preview URL (30s HQ audio)
-        - Genres
-        - BPM (if available)
+        - BPM (from track details API)
+        - Gain/loudness (from track details API)
+        - Album, duration, explicit flag
         """
         async with DeezerClient(max_concurrent=5, timeout=10.0) as client:
             # Search for track - returns a list of results
@@ -421,12 +425,21 @@ class EnrichmentWorker:
             
             task.deezer_id = int(result.id) if result.id else None
             task.preview_url = result.preview_url
-            task.genres = result.genres if hasattr(result, 'genres') else []
-            task.deezer_bpm = result.bpm if hasattr(result, 'bpm') else None
+            task.genres = result.genres if hasattr(result, 'genres') and result.genres else []
+            
+            # Fetch detailed metadata (BPM, gain) from track details API
+            if task.deezer_id:
+                details = await client.get_track_details(str(task.deezer_id))
+                if details:
+                    task.deezer_bpm = details.get("bpm")
+                    # Store gain for later use in enrichment entry
+                    if hasattr(task, 'deezer_gain'):
+                        task.deezer_gain = details.get("gain")
             
             self._stats["deezer_resolved"] += 1
-            self._vlog(2, "✅ [Worker] Deezer resolved: %s (preview: %s)", 
-                      task.track_key, "yes" if task.preview_url else "no")
+            self._vlog(2, "✅ [Worker] Deezer resolved: %s (preview: %s, bpm: %s)", 
+                      task.track_key, "yes" if task.preview_url else "no",
+                      task.deezer_bpm or "N/A")
             
             return task.preview_url is not None
     

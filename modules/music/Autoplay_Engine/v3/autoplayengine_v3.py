@@ -23,7 +23,6 @@ from .bootstrap_manager import BootstrapManager
 
 # V3 Factory Worker Pattern modules
 from .enrichment_worker import EnrichmentWorker, Priority
-from .track_fetcher import TrackFetcher
 
 try:
     from .preview_fetcher import PreviewFetcher
@@ -160,12 +159,11 @@ class AutoplayEngineV3:
         max_sessions = int(os.getenv("AUTOPLAY_MAX_SESSIONS", "2"))
         self._session_manager = AutoplaySessionManager(max_sessions=max_sessions)
         
-        # Cold Start Bootstrapper (legacy - may be deprecated in favor of TrackFetcher)
+        # Cold Start Bootstrapper (Daydreamer) - handles background track discovery
         self._bootstrap_manager = BootstrapManager(self)
         
-        # V3 Factory Worker Pattern: Separate track fetching from enrichment
+        # V3 Factory Worker Pattern: Enrichment pipeline for tracks
         self._enrichment_worker = EnrichmentWorker(self)
-        self._track_fetcher = TrackFetcher(self)
 
         # V3 Configuration: Use environment variables if not explicitly provided
         if analysis_mode is None:
@@ -665,9 +663,9 @@ class AutoplayEngineV3:
         return self._enrichment_worker
     
     @property
-    def track_fetcher(self) -> TrackFetcher:
-        """Access to the TrackFetcher (Daydreamer)."""
-        return self._track_fetcher
+    def bootstrap_manager(self) -> BootstrapManager:
+        """Access to the BootstrapManager (Daydreamer)."""
+        return self._bootstrap_manager
 
     # ========== AUDIO ANALYSIS WORKER POOL ==========
     
@@ -695,15 +693,13 @@ class AutoplayEngineV3:
             task = asyncio.create_task(self._analysis_worker_loop(worker_id=i))
             self._analysis_workers.append(task)
             
-        # Start bootstrapper
+        # Start bootstrapper (Daydreamer)
         if self._bootstrap_manager:
             await self._bootstrap_manager.start()
         
-        # Start V3 Factory Worker Pattern modules
+        # Start V3 Factory Worker Pattern - Enrichment Worker
         if self._enrichment_worker:
             await self._enrichment_worker.start()
-        if self._track_fetcher:
-            await self._track_fetcher.start()
         
     
     async def stop_analysis_workers(self) -> None:
@@ -714,9 +710,7 @@ class AutoplayEngineV3:
         self._log_verbose(1, "🛑 Stopping %d analysis workers...", len(self._analysis_workers))
         self._analysis_shutdown = True
         
-        # Stop V3 Factory Worker Pattern modules
-        if self._track_fetcher:
-            await self._track_fetcher.stop()
+        # Stop V3 Factory Worker Pattern - Enrichment Worker
         if self._enrichment_worker:
             await self._enrichment_worker.stop()
         

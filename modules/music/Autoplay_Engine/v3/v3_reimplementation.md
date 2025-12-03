@@ -6,6 +6,19 @@ Quality over speed. Users have to wait for a certain amount of time for cold sta
 
 ---
 
+## Implementation Status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| BootstrapManager | ✅ Complete | Scenarios A/B/C with Last.fm integration |
+| EnrichmentWorker | ✅ Complete | 4-stage pipeline with priority queue |
+| LastFMClient | ✅ Complete | Top tracks, similar, tag-based discovery |
+| DeezerClient | ✅ Complete | Metadata fetch with BPM, gain, genres |
+| Recommender P1 Wait | ✅ Complete | Waits for analysis_verified before scoring |
+| Cache Sharding | ✅ Complete | enrichment_v3_*.json files, 500 entries each |
+
+---
+
 ## Machine Learning Enrichment (4-Factor System)
 
 The Enrichment includes 4 different factors from Librosa, EfficientAT, Deezer, and GeminiAPI. All are crucial and have NO fallbacks.
@@ -351,151 +364,197 @@ This enables discovering new artists through trusted connections.
 
 The V3 system is divided into **three independent modules** that operate as a factory pipeline:
 
-### Module 1: Track Fetcher (Daydreamer / Bootstrap Manager)
+### Module 1: BootstrapManager (Daydreamer)
+
+**File:** `bootstrap_manager.py`
+**Status:** ✅ Implemented
 
 **Responsibility:** Only manages track discovery and queue filling. Does NOT perform enrichment.
+
+**Key Features:**
+- Uses `DaydreamScenario` enum for state management
+- Integrates `LastFMClient` for chart/similar/tag APIs
+- Persists state between restarts
+- Pauses when user sessions are active (P1/P2 have priority)
 
 **Scenarios:**
 
 #### Scenario A: First Run (Empty Cache)
 
-```
-Cache empty → Fetch 200 tracks from Last.fm Top Tracks
+```text
+Cache empty → Fetch 200 tracks from Last.fm chart.getTopTracks
     ↓
-Store track names (artist, title) in processing queue
+Verify each via Deezer → Get preview URL + metadata
     ↓
-Signal Enrichment Worker to begin processing
+Add to enrichment queue with P3 (DAYDREAM) priority
     ↓
 Done. Wait for next batch cycle.
 ```
 
 #### Scenario B: Daydreaming (Cache > 200 tracks)
 
-```
-Cache has data → Start genre exploration based on user telemetry
+```text
+Cache has data → Get seed tracks from recent sessions
     ↓
-Use Last.fm track.getSimilar / tag.getTopTracks for depth-first exploration
+Use Last.fm track.getSimilar + tag.getTopTracks
     ↓
-Fetch 50 tracks per 30-minute cycle (configurable via DAYDREAM_INTERVAL)
+Verify via Deezer → Get preview URLs
     ↓
-Filter duplicates against queue + cache
-    ↓
-Add to processing queue → Stop when 50 added
+Add to enrichment queue (P3 priority)
 ```
 
 #### Scenario C: New Releases Check (Monthly)
 
-```
->1 month since last check → Fetch top 200 new releases
+```text
+>30 days since last check → Fetch from Deezer editorial/releases
     ↓
-Compare against queue + cache for duplicates
+Filter tracks with preview URLs
     ↓
-Add up to 50 non-duplicate tracks to queue
+Add to enrichment queue (P3 priority)
     ↓
-If 50 tracks added (queue full) → Signal next batch to continue
-    ↓
-If <50 tracks added → Resume normal Scenario B exploration
+Continue if batch full, else resume Scenario B
 ```
 
 **Queue Limit:** Max 200 tracks in processing queue at any time.
 
 ---
 
-### Module 2: Enrichment Worker (Factory Pipeline)
+### Module 2: EnrichmentWorker (Factory Pipeline)
 
-**Responsibility:** Process tracks from queue through the enrichment pipeline. Runs independently.
+**File:** `enrichment_worker.py`
+**Status:** ✅ Implemented
+
+**Responsibility:** Process tracks from queue through the 4-stage enrichment pipeline. Runs independently with priority support.
+
+**Priority System:**
+
+| Priority | Value | Use Case | Behavior |
+|----------|-------|----------|----------|
+| USER | 1 | Track user is playing | Immediate, blocks until complete |
+| BUFFER | 2 | Buffer refill | High priority, 30s wait max |
+| DAYDREAM | 3 | Background crawling | Lowest, pauses for P1/P2 |
 
 **Pipeline Stages:**
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                    ENRICHMENT PIPELINE                       │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│  STAGE 1: Deezer Resolution                                 │
+│  STAGE 1: Deezer Resolution + Metadata                      │
 │  ┌────────────────────────────────────────────────────┐     │
-│  │ Track from queue → Search Deezer API                │     │
-│  │ → Get preview URL (30s HQ audio)                    │     │
-│  │ → Get Deezer metadata (genres, BPM, ISRC)           │     │
-│  │ → Create cache entry with mapping                   │     │
+│  │ search_track(artist, title) → DeezerTrack          │     │
+│  │ get_track_details(id) → Full metadata:             │     │
+│  │   - preview_url (30s HQ audio)                     │     │
+│  │   - bpm, gain (dB), explicit, isrc, genres         │     │
+│  │ → Create MappingEntry + EnrichmentEntry            │     │
 │  └────────────────────────────────────────────────────┘     │
 │                           ↓                                  │
 │  STAGE 2: Audio Analysis (Librosa + EfficientAT)            │
 │  ┌────────────────────────────────────────────────────┐     │
-│  │ Download preview → Librosa analysis                 │     │
-│  │ → BPM, key, mode, loudness                          │     │
+│  │ Download preview → queue_analysis()                 │     │
 │  │ → 5D simple_vibe: [energy, valence, danceability,   │     │
 │  │    acousticness, brightness]                        │     │
-│  │                                                     │     │
-│  │ EfficientAT MobileNet → 512D-2048D embedding        │     │
-│  │ → Semantic audio understanding                      │     │
-│  │ → Store in cache: analysis_verified = True          │     │
+│  │ → 4D flow: [loudness, tempo, key, mode]             │     │
+│  │ → 512D-2048D EfficientAT embedding                  │     │
+│  │ → Store: analysis_verified = True                   │     │
 │  └────────────────────────────────────────────────────┘     │
 │                                                              │
-│  PARALLEL: Gemini Cultural Enrichment                       │
+│  PARALLEL: Gemini Cultural Enrichment (Batched)             │
 │  ┌────────────────────────────────────────────────────┐     │
 │  │ Batch queue (artist + title only)                   │     │
 │  │ → Wait for 50 tracks OR 8s timeout                  │     │
-│  │ → Single API call with all tracks                   │     │
-│  │ → Get: tags, mood, activity_affinity, daypart       │     │
-│  │ → Store results in cache                            │     │
+│  │ → Single API call → tags, mood, activity, daypart   │     │
 │  └────────────────────────────────────────────────────┘     │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Gemini Batch Queue Logic:**
+**Key Methods:**
 
 ```python
-# Batch fills up OR timeout expires → API call
-if len(batch) >= 50:
-    flush_immediately()
-elif time_since_last_add > 8s:
-    flush_batch()
-else:
-    wait_for_more_tracks()
+# Add single track (used by Recommender for P1)
+await worker.add_task(artist, title, Priority.USER, source="user")
+
+# Batch add (used by BootstrapManager for P3)
+await worker.add_batch(tracks, Priority.DAYDREAM, source="lastfm")
+
+# Wait for P1 enrichment (blocks until complete)
+success = await worker.enrich_for_user(artist, title, timeout=30.0)
+
+# Wait for buffer batch (partial completion ok)
+count = await worker.enrich_batch_for_buffer(tracks, max_wait=30.0)
 ```
 
 **Duplicate Filtering:** Before any track enters the pipeline:
 
 1. Check if track_key exists in processing queue (skip if present)
-2. Check if track_key exists in enrichment cache (skip if analysis_verified)
+2. Check if track_key exists in enrichment cache with `analysis_verified=True`
 
 ---
 
-### Module 3: Recommender
+### Module 3: Recommender (Wait for Enrichment)
 
-**Responsibility:** Wait for pool to be enriched, then calculate recommendations.
+**Files:** `contextual_recommender.py`, `__init__.py` (`_prepare_candidates`)
+**Status:** ✅ Implemented
 
-**Behavior:**
+**Responsibility:** Wait for candidates to be enriched, then calculate recommendations.
 
+**Key Behavior: P1 Wait for Enrichment**
+
+Per design: *"If not enriched, process it as prio 1. User waits."*
+
+```python
+# In _prepare_candidates():
+# After fetching candidates, check analysis_verified
+candidates_needing_analysis = [
+    (artist, title) for prepared_entry in prepared
+    if not enrichment.get("analysis_verified")
+]
+
+# Request P1/P2 enrichment and wait
+if candidates_needing_analysis:
+    enriched_count = await worker.enrich_batch_for_buffer(
+        candidates_needing_analysis,
+        max_wait=30.0,  # User waits up to 30s
+    )
+    # Re-fetch enrichment data for newly enriched candidates
 ```
+
+**Recommendation Flow:**
+
+```text
 User requests autoplay
     ↓
 Build candidate pool from cache + Last.fm similar artists
     ↓
-Filter: Only include tracks where analysis_verified = True
+Check: Do candidates have analysis_verified = True?
     ↓
-If pool too small → Wait for Enrichment Worker to process more
+NO → Request BUFFER priority enrichment (P2)
+    → Wait up to 30s for audio analysis
+    → Re-fetch embeddings/flow vector
+    ↓
+YES → Skip to scoring
     ↓
 Calculate similarity scores using:
-  - computed_embedding (512D-2048D cosine similarity)
-  - computed_simple_vibe (5D Euclidean distance)
-  - Flow vector (BPM, key compatibility)
-  - Cultural tags overlap
+    - computed_embedding (512D-2048D cosine similarity)
+    - computed_simple_vibe (5D Euclidean distance)
+    - Flow vector (BPM, key compatibility)
+    - Cultural tags overlap
     ↓
 Apply user preferences (feedback history, skip penalties)
     ↓
 Return top candidates for 5-song buffer
 ```
 
-**Priority System:**
+**Cold Start Thresholds (Progressive Logic):**
 
-| Priority | Source | Behavior |
-|----------|--------|----------|
-| P1 | User Request | Immediate enrichment, blocks until ready |
-| P2 | Buffer Refill | High priority, runs when buffer < 5 |
-| P3 | Daydreaming | Lowest priority, pauses for P1/P2 |
+| Cache Size | Mode | Behavior |
+|------------|------|----------|
+| 0-100 | DISABLED | Show "Building taste profile..." |
+| 100-300 | LIMITED | Conservative matching only |
+| 300-500 | BASIC | Genre-based recommendations |
+| 500+ | FULL | Embedding similarity unlocked |
 
 ---
 
@@ -537,6 +596,60 @@ Return top candidates for 5-song buffer
 | `GEMINI_BATCH_SIZE` | 50 | Max tracks per Gemini API call |
 | `GEMINI_BATCH_TIMEOUT` | 8.0 | Seconds to wait before flushing batch |
 | `BUFFER_TARGET_SIZE` | 5 | Target songs in autoplay buffer |
+| `ENRICHMENT_SHARD_MAX_ENTRIES` | 500 | Max entries per enrichment shard |
+
+---
+
+### Cache Sharding (Enrichment)
+
+**File:** `cache_manager.py`
+**Status:** ✅ Implemented
+
+Enrichment cache is split into multiple shard files to prevent single large file issues:
+
+```text
+cache/music/
+├── enrichment_v3_0.json    (≤500 entries)
+├── enrichment_v3_1.json    (≤500 entries)
+├── enrichment_v3_2.json    (≤500 entries)
+└── ...
+```
+
+**Key Features:**
+
+- **Automatic Migration**: Legacy `enrichment_v2.json` auto-migrates to shards on first load
+- **Fast Lookup**: Key-to-shard mapping (`_enrichment_key_to_shard`) for O(1) lookups
+- **Incremental Saves**: Only the modified shard is saved, not all shards
+- **Backward Compatible**: `_enrichment_cache` property still works for legacy code
+
+**Shard Assignment Logic:**
+
+```python
+# When adding a new entry:
+for shard_id, shard_data in shards.items():
+    if len(shard_data) < 500:  # SHARD_MAX_ENTRIES
+        shard_data[key] = entry
+        return shard_id
+
+# All shards full → create new shard
+new_shard_id = next_shard_id
+shards[new_shard_id] = {key: entry}
+```
+
+**Cache Stats Output:**
+
+```json
+{
+  "enrichment": 1523,
+  "enrichment_shards": 4,
+  "enrichment_shard_details": {
+    "shard_0": {"entries": 500, "size_kb": 412.5},
+    "shard_1": {"entries": 500, "size_kb": 398.2},
+    "shard_2": {"entries": 500, "size_kb": 405.1},
+    "shard_3": {"entries": 23, "size_kb": 18.9}
+  }
+}
+```
 
 ---
 

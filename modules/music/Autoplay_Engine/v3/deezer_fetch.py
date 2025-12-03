@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,6 +39,11 @@ class DeezerTrack:
     album: str
     duration_ms: int
     preview_url: Optional[str] = None
+    bpm: Optional[float] = None
+    gain: Optional[float] = None  # Loudness in dB
+    explicit: bool = False
+    isrc: Optional[str] = None
+    genres: List[str] = field(default_factory=list)
 
 
 @dataclass

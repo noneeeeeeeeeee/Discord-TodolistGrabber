@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, asdict, field
@@ -15,6 +17,11 @@ __all__ = [
 ]
 
 _SECONDS_PER_DAY = 86400
+
+# Sharding configuration
+_ENRICHMENT_SHARD_PREFIX = "enrichment_v3_"
+_ENRICHMENT_SHARD_MAX_ENTRIES = 500  # Max entries per shard file
+_ENRICHMENT_SHARD_MAX_SIZE_MB = 5  # Max file size per shard in MB
 
 
 @dataclass
@@ -134,19 +141,17 @@ class EnrichmentEntry:
     mood: Optional[str]  # Text description from Gemini (cultural context only)
     fetched_at: float
     
-    # Extended metadata for V3 (from Deezer)
-    bpm: Optional[int] = None  # Deezer metadata, NOT computed
-    key: Optional[str] = None  # Deezer metadata (text like "C minor")
-    genres: List[str] = field(default_factory=list)  # Deezer genres
+    # Extended metadata for V3 
+    bpm: Optional[int] = None  
+    key: Optional[str] = None  
+    genres: List[str] = field(default_factory=list)  
     
     # ============================================================================
-    # Cultural Context (Gemini) - Text-only, no numeric estimates
+    # Cultural Context (Gemini) 
     # ============================================================================
-    # NOTE: activity_affinity and daypart_affinity are kept for future use
-    # They are populated by Gemini but NOT used in recommendation scoring currently
-    activity_affinity: Optional[str] = None  # e.g., "workout", "study", "party"
-    daypart_affinity: Optional[str] = None  # e.g., "morning", "evening", "night"
-    emotional_intensity: Optional[float] = None  # 0.0-1.0 (kept for metadata)
+    activity_affinity: Optional[str] = None  
+    daypart_affinity: Optional[str] = None  
+    emotional_intensity: Optional[float] = None  
     
     # ============================================================================
     # V3 Architecture - Librosa + EfficientAT MobileNet
@@ -157,14 +162,14 @@ class EnrichmentEntry:
     computed_key: Optional[int] = None  # 0-11 (C=0, C#=1, D=2, ..., B=11)
     computed_mode: Optional[int] = None  # 0=minor, 1=major
     
-    # ML MODE: Learned high-dimensional embedding (512D-2048D)
+    # ML MODE: Learned high-dimensional embedding 
     # Used when analysis_mode="ml" with EfficientAT (MobileNetV3)
     computed_embedding: Optional[List[float]] = None  # 512D-2048D learned embedding
     computed_embedding_model: Optional[str] = None  # "mn10_as"
     computed_embedding_dim: Optional[int] = None  # Actual dimension (e.g., 1024, 2048)
     
     # NON-ML MODE: Simplified 5D vibe vector from Librosa features
-    # Used when analysis_mode="non-ml" - no neural network required
+    # Used when analysis_mode="non-ml" 
     # 5D: [energy, valence, danceability, acousticness, brightness]
     computed_simple_vibe: Optional[List[float]] = None
 
@@ -373,7 +378,7 @@ class CollaborativeSnapshot:
 
 
 class CacheManager:
-    """Persistent cache for autoplay V3 subsystems."""
+    """Persistent cache for autoplay V3 subsystems with sharding support."""
 
     def __init__(
         self,
@@ -391,18 +396,131 @@ class CacheManager:
         self._parsing_ttl = parsing_ttl_days * _SECONDS_PER_DAY
 
         self._mapping_file = self._cache_dir / "mappings_v2.json"
-        self._enrichment_file = self._cache_dir / "enrichment_v2.json"
+        self._enrichment_file = self._cache_dir / "enrichment_v2.json"  # Legacy single file
         self._parsing_file = self._cache_dir / "parsing_v2.json"
         self._collab_file = self._cache_dir / "collaborative_embeddings.json"
         self._ingest_queue_file = self._cache_dir / "analysis_queue.json"
 
         self._mapping_cache = self._load_map(self._mapping_file, MappingEntry)
-        self._enrichment_cache = self._load_map(self._enrichment_file, EnrichmentEntry)
         self._parsing_cache = self._load_map(self._parsing_file, ParsingEntry)
         self._collaborative_snapshot = self._load_collaborative()
+        
+        # Sharded enrichment cache
+        self._enrichment_shards: Dict[int, Dict[str, EnrichmentEntry]] = {}
+        self._enrichment_key_to_shard: Dict[str, int] = {}  # Maps key -> shard_id for fast lookup
+        self._next_shard_id = 0
+        self._load_enrichment_shards()
 
         self._lock = asyncio.Lock()
         self._ingest_lock = threading.Lock()
+    
+    # ------------------------------------------------------------------
+    # Enrichment cache sharding helpers
+    # ------------------------------------------------------------------
+    def _get_shard_files(self) -> List[Path]:
+        """Get all enrichment shard files in order."""
+        shard_files = []
+        for f in sorted(self._cache_dir.glob(f"{_ENRICHMENT_SHARD_PREFIX}*.json")):
+            shard_files.append(f)
+        return shard_files
+    
+    def _load_enrichment_shards(self) -> None:
+        """Load all enrichment shards + migrate from legacy single file."""
+        import logging
+        LOG = logging.getLogger(__name__)
+        
+        # First, try to load legacy enrichment_v2.json and migrate
+        legacy_entries: Dict[str, EnrichmentEntry] = {}
+        if self._enrichment_file.exists():
+            legacy_entries = self._load_map(self._enrichment_file, EnrichmentEntry)
+            if legacy_entries:
+                LOG.info(f"📦 [Cache] Migrating {len(legacy_entries)} entries from legacy enrichment_v2.json")
+        
+        # Load existing shards
+        shard_files = self._get_shard_files()
+        for shard_file in shard_files:
+            try:
+                # Extract shard ID from filename
+                shard_name = shard_file.stem  # e.g., "enrichment_v3_0"
+                shard_id = int(shard_name.replace(_ENRICHMENT_SHARD_PREFIX, ""))
+                
+                shard_data = self._load_map(shard_file, EnrichmentEntry)
+                self._enrichment_shards[shard_id] = shard_data
+                
+                # Build key-to-shard mapping
+                for key in shard_data:
+                    self._enrichment_key_to_shard[key] = shard_id
+                
+                self._next_shard_id = max(self._next_shard_id, shard_id + 1)
+                
+            except (ValueError, OSError) as e:
+                LOG.warning(f"⚠️ [Cache] Failed to load shard {shard_file}: {e}")
+        
+        # Migrate legacy entries to shards
+        if legacy_entries:
+            for key, entry in legacy_entries.items():
+                if key not in self._enrichment_key_to_shard:
+                    self._assign_to_shard(key, entry)
+            
+            # Save all shards after migration
+            self._save_all_enrichment_shards()
+            
+            # Rename legacy file to backup
+            backup_file = self._enrichment_file.with_suffix(".json.bak")
+            try:
+                self._enrichment_file.rename(backup_file)
+                LOG.info(f"✅ [Cache] Migration complete. Legacy file backed up to {backup_file.name}")
+            except OSError:
+                pass
+        
+        LOG.info(
+            f"📦 [Cache] Loaded {sum(len(s) for s in self._enrichment_shards.values())} "
+            f"enrichment entries across {len(self._enrichment_shards)} shards"
+        )
+    
+    def _assign_to_shard(self, key: str, entry: EnrichmentEntry) -> int:
+        """Assign an entry to a shard, creating new shard if needed."""
+        # Find a shard with room
+        for shard_id, shard_data in self._enrichment_shards.items():
+            if len(shard_data) < _ENRICHMENT_SHARD_MAX_ENTRIES:
+                shard_data[key] = entry
+                self._enrichment_key_to_shard[key] = shard_id
+                return shard_id
+        
+        # All shards full, create new one
+        new_shard_id = self._next_shard_id
+        self._next_shard_id += 1
+        self._enrichment_shards[new_shard_id] = {key: entry}
+        self._enrichment_key_to_shard[key] = new_shard_id
+        return new_shard_id
+    
+    def _get_shard_file(self, shard_id: int) -> Path:
+        """Get the file path for a shard."""
+        return self._cache_dir / f"{_ENRICHMENT_SHARD_PREFIX}{shard_id}.json"
+    
+    def _save_enrichment_shard(self, shard_id: int) -> None:
+        """Save a single enrichment shard to disk."""
+        if shard_id not in self._enrichment_shards:
+            return
+        shard_data = self._enrichment_shards[shard_id]
+        shard_file = self._get_shard_file(shard_id)
+        self._save_map(shard_file, shard_data)
+    
+    def _save_all_enrichment_shards(self) -> None:
+        """Save all enrichment shards to disk."""
+        for shard_id in self._enrichment_shards:
+            self._save_enrichment_shard(shard_id)
+    
+    @property
+    def _enrichment_cache(self) -> Dict[str, EnrichmentEntry]:
+        """
+        Backward compatibility property - returns unified view of all shards.
+        WARNING: This rebuilds the dict on each access. Use sparingly.
+        """
+        combined = {}
+        for shard_data in self._enrichment_shards.values():
+            combined.update(shard_data)
+        return combined
 
     # ------------------------------------------------------------------
     # Mapping cache
@@ -434,13 +552,23 @@ class CacheManager:
                 self._save_map(self._mapping_file, self._mapping_cache)
 
     # ------------------------------------------------------------------
-    # Enrichment cache
+    # Enrichment cache (Sharded)
     # ------------------------------------------------------------------
     async def get_enrichment(
         self, artist: str, title: str
     ) -> Optional[EnrichmentEntry]:
         key = self._normalize_key(artist, title)
-        entry = self._enrichment_cache.get(key)
+        
+        # Fast lookup via key-to-shard mapping
+        shard_id = self._enrichment_key_to_shard.get(key)
+        if shard_id is None:
+            return None
+        
+        shard_data = self._enrichment_shards.get(shard_id)
+        if shard_data is None:
+            return None
+        
+        entry = shard_data.get(key)
         if not entry:
             return None
         if entry.is_expired(self._enrichment_ttl):
@@ -456,8 +584,17 @@ class CacheManager:
     ) -> None:
         key = self._normalize_key(artist, title)
         async with self._lock:
-            self._enrichment_cache[key] = entry
-            self._save_map(self._enrichment_file, self._enrichment_cache)
+            # Check if key already exists in a shard
+            existing_shard_id = self._enrichment_key_to_shard.get(key)
+            
+            if existing_shard_id is not None:
+                # Update existing entry in its shard
+                self._enrichment_shards[existing_shard_id][key] = entry
+                self._save_enrichment_shard(existing_shard_id)
+            else:
+                # Assign to a shard (creates new if needed)
+                shard_id = self._assign_to_shard(key, entry)
+                self._save_enrichment_shard(shard_id)
 
     async def delete_enrichment_entry(self, artist: str, title: str) -> None:
         key = self._normalize_key(artist, title)
@@ -465,9 +602,13 @@ class CacheManager:
 
     async def _delete_enrichment(self, key: str) -> None:
         async with self._lock:
-            if key in self._enrichment_cache:
-                self._enrichment_cache.pop(key, None)
-                self._save_map(self._enrichment_file, self._enrichment_cache)
+            shard_id = self._enrichment_key_to_shard.get(key)
+            if shard_id is not None:
+                shard_data = self._enrichment_shards.get(shard_id)
+                if shard_data and key in shard_data:
+                    shard_data.pop(key, None)
+                    self._enrichment_key_to_shard.pop(key, None)
+                    self._save_enrichment_shard(shard_id)
 
     # ------------------------------------------------------------------
     # Parsing cache (Gemini) - Phase 0.5: Self-Healing with Adaptive TTL
@@ -608,11 +749,14 @@ class CacheManager:
             for key, entry in self._mapping_cache.items()
             if (now - entry.timestamp) > self._mapping_ttl
         ]
-        stale_enrichment = [
-            key
-            for key, entry in self._enrichment_cache.items()
-            if (now - entry.fetched_at) > self._enrichment_ttl
-        ]
+        
+        # Collect stale enrichment keys from all shards
+        stale_enrichment = []
+        for shard_data in self._enrichment_shards.values():
+            for key, entry in shard_data.items():
+                if (now - entry.fetched_at) > self._enrichment_ttl:
+                    stale_enrichment.append(key)
+        
         stale_parsing = [
             key
             for key, entry in self._parsing_cache.items()
@@ -627,9 +771,24 @@ class CacheManager:
             await self._delete_parsing(key)
 
     def get_cache_stats(self) -> Dict[str, Any]:
+        # Calculate total enrichment entries across all shards
+        total_enrichment = sum(len(s) for s in self._enrichment_shards.values())
+        
+        # Calculate shard sizes in bytes
+        shard_sizes = {}
+        for shard_id in self._enrichment_shards:
+            shard_file = self._get_shard_file(shard_id)
+            if shard_file.exists():
+                shard_sizes[f"shard_{shard_id}"] = {
+                    "entries": len(self._enrichment_shards[shard_id]),
+                    "size_kb": shard_file.stat().st_size / 1024,
+                }
+        
         return {
             "mappings": len(self._mapping_cache),
-            "enrichment": len(self._enrichment_cache),
+            "enrichment": total_enrichment,
+            "enrichment_shards": len(self._enrichment_shards),
+            "enrichment_shard_details": shard_sizes,
             "parsing": len(self._parsing_cache),
             "mapping_ttl_days": self._mapping_ttl / _SECONDS_PER_DAY,
             "enrichment_ttl_days": self._enrichment_ttl / _SECONDS_PER_DAY,
