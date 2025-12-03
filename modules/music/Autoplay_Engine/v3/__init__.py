@@ -175,9 +175,6 @@ class LastFMAutoplayV3:
         self._pool_composition: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         
         # Layer 4: JIT Buffer Architecture (per-guild)
-        # _recommendation_buffer: Holds 5-slot buffer [safe, safe, safe, discovery, safe_harbor]
-        # _filling_task: Async task that fills buffer in background
-        # _buffer_fill_size: Size of buffer per guild (default: 5)
         self._recommendation_buffer: Dict[int, List[PreparedCandidate]] = defaultdict(list)
         self._filling_task: Dict[int, Optional[asyncio.Task]] = {}
         self._buffer_fill_size = 5

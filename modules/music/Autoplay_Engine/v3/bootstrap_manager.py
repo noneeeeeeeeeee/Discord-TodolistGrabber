@@ -428,8 +428,9 @@ class BootstrapManager:
             async with DeezerClient(max_concurrent=10, timeout=5.0) as deezer:
                 for track_info in lastfm_tracks:
                     try:
-                        artist = track_info.get("artist", "")
-                        title = track_info.get("title", "")
+                        # LastFMTrack is a dataclass, use attribute access
+                        artist = track_info.artist
+                        title = track_info.title
                         
                         if not artist or not title:
                             continue
@@ -441,7 +442,7 @@ class BootstrapManager:
                             
                     except Exception as e:
                         self._vlog(2, "⚠️ [Scenario A] Failed to verify %s: %s", 
-                                  track_info.get("title", "?"), str(e)[:30])
+                                  getattr(track_info, 'title', '?'), str(e)[:30])
                         continue
             
             self._vlog(1, "✅ [Scenario A] Verified %d/%d tracks via Deezer", 
@@ -479,8 +480,9 @@ class BootstrapManager:
                                     seed_artist, seed_title, limit=10
                                 )
                                 for track_info in similar:
-                                    artist = track_info.get("artist", "")
-                                    title = track_info.get("title", "")
+                                    # LastFMTrack is a dataclass, use attribute access
+                                    artist = track_info.artist
+                                    title = track_info.title
                                     if artist and title:
                                         results = await deezer.search_track(artist, title)
                                         if results and results[0].preview_url:
@@ -494,8 +496,9 @@ class BootstrapManager:
                             try:
                                 tag_tracks = await lastfm.get_tag_top_tracks(tag, limit=10)
                                 for track_info in tag_tracks:
-                                    artist = track_info.get("artist", "")
-                                    title = track_info.get("title", "")
+                                    # LastFMTrack is a dataclass, use attribute access
+                                    artist = track_info.artist
+                                    title = track_info.title
                                     if artist and title:
                                         results = await deezer.search_track(artist, title)
                                         if results and results[0].preview_url:
