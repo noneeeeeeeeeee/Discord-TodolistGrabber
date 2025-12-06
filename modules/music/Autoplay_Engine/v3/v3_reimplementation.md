@@ -10,12 +10,39 @@ Quality over speed. Users have to wait for a certain amount of time for cold sta
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| BootstrapManager | ✅ Complete | Scenarios A/B/C with Last.fm integration |
-| EnrichmentWorker | ✅ Complete | 4-stage pipeline with priority queue |
+| BootstrapManager | ✅ Complete | Scenarios A/B/C with Last.fm integration, first-run protection |
+| EnrichmentWorker | ✅ Complete | 4-stage pipeline with priority queue, 8s timer with reset |
 | LastFMClient | ✅ Complete | Top tracks, similar, tag-based discovery |
 | DeezerClient | ✅ Complete | Metadata fetch with BPM, gain, genres |
 | Recommender P1 Wait | ✅ Complete | Waits for analysis_verified before scoring |
 | Cache Sharding | ✅ Complete | enrichment_v3_*.json files, 500 entries each |
+| BufferManager | ✅ Complete | Apple Music-style 5-track buffer with nuke on user add |
+| TrackResolver | ✅ Complete | 3-tier waterfall search (Direct → Grounded → Last.fm) |
+| MappingEntry.collaborators | ✅ Complete | Collaboration graph for artist expansion |
+
+### Recent Fixes (December 2025)
+
+1. **Scenario A 5→200 Fix**: First run now queues all 200 tracks (was limited to 5)
+2. **First Run Protection**: `_first_run_triggered` flag prevents duplicate Scenario A runs
+3. **Gemini 8s Timer**: Timer resets on new track, flushes at 50 or timeout, retries failed
+4. **Scenario C Dedup**: Max 3 per artist, fill remaining with Scenario B tracks
+5. **Buffer Nuke**: Clears buffer when user adds track to queue
+6. **Collaborators Field**: Added to MappingEntry for recommendation graph expansion
+7. **Gemini queue_enrichment()**: Added public method returning future (batch queuing without blocking)
+8. **Enriched Count Methods**: `get_enriched_count()` and `get_gemini_enriched_count()` in CacheManager
+9. **Daydream 200 Enriched Loop**: Now loops until 200 ENRICHED (analysis_verified=True), not just queued
+10. **30-min Intervals After Bootstrap**: Uses fast intervals during bootstrap, 30-min after 200 enriched
+11. **Deezer Gain Field**: Added `deezer_gain` to EnrichmentEntry for loudness data from Deezer API
+12. **Deezer BPM/Gain Fix**: Now stores actual value (0 = unknown, None = not fetched)
+13. **Pipeline Order Fix**: Changed from Deezer→Audio→Gemini to Deezer→Gemini→Audio
+14. **Unified Pipeline**: BootstrapManager now uses EnrichmentWorker (was bypassing it)
+15. **Cache Entry Creation**: Deezer stage creates initial cache entries for Gemini to update
+16. **Gemini Batch Await**: Tasks now wait for Gemini batch flush before continuing to audio analysis
+17. **Stale Queue Cleanup**: Queue older than 1 hour is cleared on startup to prevent duplicate skips
+18. **Bootstrap Tracking Fix**: Only successfully queued tracks are marked as bootstrapped
+19. **Deezer Waterfall Search**: 3-tier search (exact → fuzzy → artist top tracks) for better matching
+20. **DeezerClient.search_artist()**: New method for artist search
+21. **DeezerClient.get_artist_top_tracks()**: New method to fetch artist's top tracks
 
 ---
 
@@ -372,6 +399,7 @@ The V3 system is divided into **three independent modules** that operate as a fa
 **Responsibility:** Only manages track discovery and queue filling. Does NOT perform enrichment.
 
 **Key Features:**
+
 - Uses `DaydreamScenario` enum for state management
 - Integrates `LastFMClient` for chart/similar/tag APIs
 - Persists state between restarts
@@ -687,3 +715,55 @@ Buffer fills → User continues listening
 - More tracks pre-enriched by Daydreamer
 - Faster recommendations
 - Eventually near-instant autoplay
+
+use <https://r.jina.ai/{URL}> if the url cannot be accessed
+
+---
+
+## Recent Fixes (Session: Dec 3, 2025)
+
+### Fix 22: Batch Deezer Resolution with Gemini Fallback
+
+**File:** `track_resolver.py`
+**Status:** ✅ Implemented
+
+Added `resolve_batch_to_deezer()` method for batch resolution of Last.fm tracks to Deezer:
+
+```python
+# Phase 1: Waterfall search (3 strategies per track)
+# - Exact search: "{artist} {title}"
+# - Fuzzy search: title only, filter by artist similarity  
+# - Artist top tracks: search artist, get top 50, match title
+
+# Phase 2: Gemini batch fallback (max 50 tracks)
+# - Sends failed tracks to Gemini for refined search queries
+# - Each track gets 3 alternative queries
+# - Retries on Deezer with Gemini suggestions
+```
+
+**New Methods:**
+
+- `resolve_batch_to_deezer()`: Main batch resolver entry point
+- `_waterfall_deezer_search()`: 3-tier search strategy
+- `_find_best_deezer_match()`: Jaccard similarity matching
+- `_gemini_batch_resolve()`: Gemini batch query generation
+- `resolve_youtube_to_deezer_simple()`: Simplified YouTube→Deezer (like !p)
+
+### Fix 23: Bootstrap Manager Phase 2 Integration
+
+**File:** `bootstrap_manager.py`
+**Status:** ✅ Implemented
+
+Both `_scenario_first_run()` and `_scenario_daydreaming()` now use 2-phase resolution:
+
+```python
+# Scenario A: First Run (200 tracks from Last.fm)
+Phase 1: Direct Deezer search for each track
+Phase 2: Batch resolver for failed tracks (with Gemini)
+
+# Scenario B: Daydreaming (exploration)
+Phase 1: Similar tracks + tag discovery → Deezer search
+Phase 2: Batch resolver for failed tracks (with Gemini)
+```
+
+**Result:** More tracks successfully mapped (fewer skips due to failed Deezer search)

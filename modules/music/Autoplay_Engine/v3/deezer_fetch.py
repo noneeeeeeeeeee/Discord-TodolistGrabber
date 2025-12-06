@@ -789,12 +789,17 @@ class DeezerClient:
                         data = await response.json()
                         
                         # Extract acoustic features
-                        bpm = float(data.get("bpm", 0) or 0)
-                        gain = float(data.get("gain", 0) or 0)
+                        # BPM=0 means "fetched but unknown", None means "not fetched"
+                        # Gain can be negative dB (e.g., -12.4)
+                        raw_bpm = data.get("bpm")
+                        raw_gain = data.get("gain")
+                        
+                        bpm = float(raw_bpm) if raw_bpm is not None else None
+                        gain = float(raw_gain) if raw_gain is not None else None
                         
                         LOG.debug(
                             f"✅ Deezer track details for {track_id}: "
-                            f"BPM={bpm}, gain={gain}dB"
+                            f"BPM={bpm if bpm is not None else 'N/A'}, gain={gain if gain is not None else 'N/A'}dB"
                         )
                         
                         return {
@@ -812,4 +817,90 @@ class DeezerClient:
             except Exception as exc:
                 LOG.debug(f"❌ Deezer track details error: {exc}")
                 return None
+
+    async def search_artist(self, query: str, limit: int = 5) -> List[Any]:
+        """
+        Search for artists on Deezer.
+        
+        Args:
+            query: Artist name to search for
+            limit: Maximum number of results
+            
+        Returns:
+            List of artist objects with id, name, picture_url
+        """
+        if not self.session:
+            LOG.error("❌ No aiohttp session available for artist search")
+            return []
+        
+        url = f"{DEEZER_API_BASE}/search/artist"
+        params = {"q": query, "limit": limit}
+        
+        async with self.semaphore:
+            try:
+                timeout = aiohttp.ClientTimeout(total=self.timeout)
+                
+                async with self.session.get(url, params=params, timeout=timeout) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        artists = []
+                        
+                        for item in data.get("data", []):
+                            artists.append(type('Artist', (), {
+                                'id': str(item.get("id", "")),
+                                'name': item.get("name", ""),
+                                'picture_url': item.get("picture_medium"),
+                            })())
+                        
+                        LOG.debug(f"✅ Deezer artist search: '{query}' → {len(artists)} results")
+                        return artists
+                    else:
+                        LOG.debug(f"⚠️ Deezer artist search failed: HTTP {response.status}")
+                        return []
+                        
+            except asyncio.TimeoutError:
+                LOG.debug(f"⏱️ Deezer artist search timeout for '{query}'")
+                return []
+            except Exception as exc:
+                LOG.debug(f"❌ Deezer artist search error: {exc}")
+                return []
+
+    async def get_artist_top_tracks(self, artist_id: str, limit: int = 50) -> List[DeezerTrack]:
+        """
+        Fetch top tracks for an artist.
+        
+        Args:
+            artist_id: Deezer artist ID
+            limit: Maximum number of tracks
+            
+        Returns:
+            List of DeezerTrack objects
+        """
+        if not self.session:
+            LOG.error("❌ No aiohttp session available for artist tracks")
+            return []
+        
+        url = f"{DEEZER_API_BASE}/artist/{artist_id}/top"
+        params = {"limit": limit}
+        
+        async with self.semaphore:
+            try:
+                timeout = aiohttp.ClientTimeout(total=self.timeout)
+                
+                async with self.session.get(url, params=params, timeout=timeout) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        tracks = self._parse_search_results(data)
+                        LOG.debug(f"✅ Deezer artist top tracks: {len(tracks)} tracks for artist {artist_id}")
+                        return tracks
+                    else:
+                        LOG.debug(f"⚠️ Deezer artist top tracks failed: HTTP {response.status}")
+                        return []
+                        
+            except asyncio.TimeoutError:
+                LOG.debug(f"⏱️ Deezer artist top tracks timeout for {artist_id}")
+                return []
+            except Exception as exc:
+                LOG.debug(f"❌ Deezer artist top tracks error: {exc}")
+                return []
 

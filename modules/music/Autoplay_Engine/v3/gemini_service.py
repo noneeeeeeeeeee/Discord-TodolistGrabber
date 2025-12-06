@@ -647,6 +647,32 @@ Return the BEST GUESS metadata for Last.fm scrobbling:
             LOG.error(f"Failed to extract text from Gemini response: {e}")
             return None
 
+    async def queue_enrichment(
+        self,
+        artist: str,
+        title: str,
+        existing_tags: Optional[List[str]] = None,
+        *,
+        allow_grounding: bool = False,
+    ) -> asyncio.Future:
+        """
+        Queue a track for enrichment and return a future immediately.
+        
+        Unlike request_enrichment() which blocks until complete, this returns
+        a future that will be resolved when the batch is flushed.
+        
+        Use with flush_enrichment_queue() for batch processing:
+            futures = [await gemini.queue_enrichment(a, t) for a, t in tracks]
+            await gemini.flush_enrichment_queue()
+            results = [await f for f in futures]
+        """
+        return await self._enqueue_enrichment_future(
+            artist,
+            title,
+            existing_tags or [],
+            allow_grounding,
+        )
+
     async def flush_enrichment_queue(self) -> None:
         """Manually flush the enrichment queue and return batch results."""
         await self._flush_enrichment_batch()

@@ -1429,9 +1429,9 @@ class LastFMAutoplayV3:
         if cached_count < 50:
              return await self._fetch_bootstrapped_pool()
 
-        # Case 3 Preparation: Hybrid (>= 200 tracks)
+        # Case 3 Preparation: Hybrid (>= 500 tracks)
         collaborative_pool = []
-        if cached_count >= 200:
+        if cached_count >= 500:
              seed_track_id = self._track_id(seed_artist, seed_title)
              collaborative_pool = await self._fetch_collaborative_pool(seed_track_id)
 
@@ -2875,6 +2875,16 @@ class LastFMAutoplayV3:
                     )
                 continue
 
+            # Filter out non-music channels/artists (streaming platforms, etc.)
+            if self._is_non_music_artist(artist):
+                if self._engine._verbose:
+                    LOG.debug(
+                        "[AutoplayV2][filter] Rejected non-music artist: '%s' by '%s'",
+                        title,
+                        artist,
+                    )
+                continue
+
             track_id = self._track_id(artist, title)
 
             # Skip if this track was recently played
@@ -3606,12 +3616,78 @@ class LastFMAutoplayV3:
             "teaser",
             "preview",
             "sneak peek",
+            # Promotional/Advertisement content
+            "advertisement",
+            "commercial",
+            "promo",
+            "promotional",
+            "it's on prime",
+            "watch on prime",
+            "watch now",
+            "available now on",
+            "streaming now",
+            "out now on",
+            "subscribe",
+            "sponsored",
         ]
 
         for keyword in non_music_keywords:
             if keyword in title_lower:
                 return True
 
+        return False
+
+    @staticmethod
+    def _is_non_music_artist(artist: str) -> bool:
+        """Check if an artist name indicates non-music content (streaming platforms, etc.)."""
+        artist_lower = artist.lower().strip()
+        
+        # Known non-music channels/platforms that may have been cached
+        non_music_artists = {
+            # Streaming platforms
+            "prime video",
+            "amazon prime video",
+            "amazon.co.uk",
+            "amazon",
+            "netflix",
+            "hulu",
+            "disney+",
+            "disney plus",
+            "hbo max",
+            "paramount+",
+            "peacock",
+            "apple tv+",
+            "crunchyroll",
+            "funimation",
+            # News/Media
+            "bbc",
+            "cnn",
+            "fox news",
+            "msnbc",
+            "sky news",
+            # Other non-music
+            "ted",
+            "ted-ed",
+            "tedx",
+            "ted talks",
+            "national geographic",
+            "discovery channel",
+        }
+        
+        if artist_lower in non_music_artists:
+            return True
+        
+        # Pattern-based detection for generic promotional channels
+        promo_patterns = [
+            "official trailer",
+            "trailers",
+            "movie clips",
+            "tv promos",
+        ]
+        for pattern in promo_patterns:
+            if pattern in artist_lower:
+                return True
+        
         return False
 
     # ------------------------------------------------------------------

@@ -6,9 +6,13 @@ import re
 import time
 import unicodedata
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
-from .cache_manager import CacheManager, MappingEntry
+from .cache_manager import CacheManager, MappingEntry, ParsingEntry
+from .config import PARSING_SCHEMA_VERSION
+
+if TYPE_CHECKING:
+    from .deezer_fetch import DeezerClient
 
 LOG = logging.getLogger(__name__)
 
@@ -29,19 +33,6 @@ GOOD_CHANNEL_HINTS = [
     "records",
     "music",
     "label",
-]
-
-# Official title markers (boost priority)
-GOOD_TITLE_KEYWORDS = [
-    "official audio",
-    "official video",
-    "official mv",
-    "official music video",
-    "official visualizer",
-    "official lyric video",
-    "official",
-    "album version",
-    "single version",
 ]
 
 # Spam keywords that indicate non-music content or low-quality uploads
@@ -334,14 +325,14 @@ class TrackResolver:
 
         # Phase 4: Confidence Check & Branching
         if not search_result:
-            # No heuristic result at all - try Gemini if available
+            # No heuristic result at all - try Gemini-assisted YouTube search
             if self._gemini_service:
                 LOG.warning(
-                    "⚠️ [Hybrid] Heuristic search failed for '%s - %s', falling back to Gemini AI",
+                    "⚠️ [Hybrid] Heuristic search failed for '%s - %s', using Gemini AI",
                     artist,
                     title,
                 )
-                return await self.resolve_track_with_gemini(
+                return await self.resolve_to_youtube_with_gemini(
                     artist, title, expected_duration_ms=expected_duration_ms
                 )
 
@@ -359,18 +350,17 @@ class TrackResolver:
         track_obj, heuristics = search_result
         heuristic_score = float(heuristics.get("score", 0.0) or 0.0)
 
-        # Check confidence threshold
+        # Check confidence threshold - if low, use Gemini for better selection
         if heuristic_score < LOW_CONFIDENCE_THRESHOLD:
-            # Low confidence - fallback to Gemini AI for better accuracy
             if self._gemini_service:
                 LOG.info(
-                    "🔄 [Hybrid] Low confidence score %.2f < %.2f for '%s - %s', using Gemini AI fallback",
+                    "🔄 [Hybrid] Low confidence score %.2f < %.2f for '%s - %s', using Gemini AI",
                     heuristic_score,
                     LOW_CONFIDENCE_THRESHOLD,
                     artist,
                     title,
                 )
-                gemini_track = await self.resolve_track_with_gemini(
+                gemini_track = await self.resolve_to_youtube_with_gemini(
                     artist, title, expected_duration_ms=expected_duration_ms
                 )
                 if gemini_track:
@@ -382,7 +372,7 @@ class TrackResolver:
                 )
             else:
                 LOG.debug(
-                    "[Hybrid] Low confidence score %.2f but Gemini not available, using heuristic result",
+                    "[Hybrid] Low confidence score %.2f but Gemini not available",
                     heuristic_score,
                 )
 
@@ -429,50 +419,6 @@ class TrackResolver:
                 heuristic_version=int(heuristics.get("heuristic_version", 3) or 3),
             )
             await self._cache.set_mapping(artist, title, entry)
-            if LOG.isEnabledFor(logging.DEBUG):
-                LOG.debug(
-                    "Track mapping stored: %s",
-                    {
-                        "artist": artist,
-                        "title": title,
-                        "youtube_id": entry.youtube_id,
-                        "duration_ms": entry.duration_ms,
-                        "channel": entry.channel_name,
-                        "verified": entry.verified,
-                        "source": "search",
-                        "heuristic_score": round(entry.heuristic_score, 3),
-                        "title_similarity": entry.title_similarity,
-                        "artist_similarity": entry.artist_similarity,
-                        "channel_similarity": entry.channel_similarity,
-                        "content_penalty": entry.content_penalty,
-                        "spam_penalty": entry.spam_penalty,
-                        "spam_flags": entry.spam_flags,
-                        "heuristic_version": entry.heuristic_version,
-                        "search_query": heuristics.get("search_query"),
-                    },
-                )
-        if LOG.isEnabledFor(logging.DEBUG):
-            LOG.debug(
-                "Track resolved via Pomice: %s",
-                {
-                    "artist": artist,
-                    "title": title,
-                    "youtube_id": metadata.get("youtube_id"),
-                    "channel": metadata.get("channel_name"),
-                    "verified": metadata.get("verified"),
-                    "duration_ms": metadata.get("duration_ms"),
-                    "heuristic_score": round(
-                        float(heuristics.get("score", 0.0) or 0.0), 3
-                    ),
-                    "title_similarity": heuristics.get("title_similarity"),
-                    "artist_similarity": heuristics.get("artist_similarity"),
-                    "channel_similarity": heuristics.get("channel_similarity"),
-                    "content_penalty": heuristics.get("content_penalty"),
-                    "spam_penalty": heuristics.get("spam_penalty"),
-                    "spam_flags": heuristics.get("spam_flags"),
-                    "search_query": heuristics.get("search_query"),
-                },
-            )
         return track_obj
 
     async def ban_track(
@@ -501,242 +447,6 @@ class TrackResolver:
                 youtube_id,
                 channel_name,
             )
-
-    async def resolve_track_with_gemini(
-        self,
-        artist: str,
-        title: str,
-        *,
-        expected_duration_ms: Optional[int] = None,
-    ) -> Optional[Any]:
-        """
-        Resolve track using Gemini AI to intelligently select the best match.
-        This is more expensive but produces better results for ambiguous cases.
-        Used when user reports low quality on a track.
-        """
-        artist = artist.strip()
-        title = title.strip()
-        if not artist or not title:
-            return None
-
-        if not self._gemini_service:
-            LOG.warning(
-                "[Gemini Resolution] Gemini service not available, falling back to heuristic search"
-            )
-            return await self.resolve_track(
-                artist,
-                title,
-                expected_duration_ms=expected_duration_ms,
-                prefer_cache=False,
-            )
-
-        LOG.info(
-            "🤖 [Gemini Resolution] Using AI-powered search for '%s' by '%s'",
-            title,
-            artist,
-        )
-
-        # Use semaphore to limit concurrent Gemini calls and prevent throttling
-        async with self._gemini_resolution_semaphore:
-            # Get search results from Pomice (up to 15 candidates for Gemini to analyze)
-            node = await self._get_node()
-            if not node:
-                return None
-
-            search_query = f"{artist} {title}"
-            try:
-                search_results = await node.get_tracks(
-                    query=f"ytsearch:{search_query}", ctx=None
-                )
-            except Exception as e:
-                LOG.error(f"Pomice search failed: {e}")
-                return None
-
-            if not search_results:
-                return None
-
-            # Filter out banned tracks
-            ban_key = (artist.lower(), title.lower())
-            banned_ids = set()
-            if ban_key in self._banned_tracks:
-                banned_ids = {entry[0] for entry in self._banned_tracks[ban_key]}
-
-            # Collect candidate info for Gemini
-            candidates = []
-            for idx, track in enumerate(search_results[:15]):  # Analyze top 15
-                metadata = self._extract_track_metadata(track)
-                youtube_id = metadata.get("youtube_id", "")
-
-                # Skip banned tracks
-                if youtube_id in banned_ids:
-                    LOG.debug(
-                        "[Gemini Resolution] Skipping banned track: youtube_id=%s, channel=%s",
-                        youtube_id,
-                        metadata.get("channel_name"),
-                    )
-                    continue
-
-                candidates.append(
-                    {
-                        "index": idx,
-                        "video_title": metadata.get("title", ""),
-                        "channel_name": metadata.get("channel_name", ""),
-                        "duration_ms": metadata.get("duration_ms", 0),
-                        "verified": metadata.get("verified", False),
-                        "view_count": metadata.get("view_count", 0),
-                        "track_obj": track,
-                    }
-                )
-
-            if not candidates:
-                LOG.warning(
-                    "[Gemini Resolution] No valid candidates after filtering banned tracks"
-                )
-                return None
-
-            # Build Gemini prompt
-            prompt = self._build_gemini_selection_prompt(
-                artist=artist,
-                title=title,
-                expected_duration_ms=expected_duration_ms,
-                candidates=candidates,
-            )
-
-            # Query Gemini for best match
-            try:
-                response = await self._gemini_service.query_gemini(prompt)
-                selected_index = self._parse_gemini_selection(response, len(candidates))
-
-                if selected_index is None:
-                    LOG.warning(
-                        "[Gemini Resolution] Failed to parse Gemini response, falling back to heuristic"
-                    )
-                    # Fallback to first non-banned candidate
-                    selected_index = 0
-
-                selected_candidate = candidates[selected_index]
-                track_obj = selected_candidate["track_obj"]
-
-                # Extract metadata and cache the result
-                metadata = self._extract_track_metadata(track_obj)
-
-                LOG.info(
-                    "✅ [Gemini Resolution] Selected: '%s' from '%s' (verified=%s, index=%d/%d)",
-                    selected_candidate["video_title"],
-                    selected_candidate["channel_name"],
-                    selected_candidate["verified"],
-                    selected_index + 1,
-                    len(candidates),
-                )
-
-                # Cache the Gemini-selected mapping (with high confidence score)
-                entry = MappingEntry(
-                    youtube_id=str(metadata.get("youtube_id") or ""),
-                    url=str(metadata.get("url") or ""),
-                    timestamp=time.time(),
-                    track_identifier=getattr(track_obj, "identifier", None),
-                    title=str(metadata.get("title") or ""),
-                    channel_name=metadata.get("channel_name") or None,
-                    duration_ms=self._safe_int(metadata.get("duration_ms")),
-                    verified=bool(metadata.get("verified", False)),
-                    preview_url=(metadata.get("preview_url") or None),
-                    preview_duration_ms=self._safe_int(
-                        metadata.get("preview_duration_ms")
-                    ),
-                    preview_fetched_at=self._safe_float(
-                        metadata.get("preview_fetched_at")
-                    ),
-                    deezer_track_id=(metadata.get("deezer_track_id") or None),
-                    ingest_source=(metadata.get("ingest_source") or None),
-                    heuristic_score=10.0, 
-                    title_similarity=1.0,
-                    artist_similarity=1.0,
-                    channel_similarity=1.0,
-                    engagement_score=None, 
-                    duration_score=None, 
-                    content_penalty=0.0,
-                    spam_penalty=0.0,
-                    spam_flags=[],
-                    search_rank=int(selected_index),
-                    heuristic_version=3,  
-                )
-                await self._cache.set_mapping(artist, title, entry)
-
-                return track_obj
-
-            except Exception as e:
-                LOG.error(
-                    f"[Gemini Resolution] Error during AI selection: {e}", exc_info=True
-                )
-                # Fallback to heuristic
-                return await self.resolve_track(
-                    artist,
-                    title,
-                    expected_duration_ms=expected_duration_ms,
-                    prefer_cache=False,
-                )
-
-    def _build_gemini_selection_prompt(
-        self,
-        artist: str,
-        title: str,
-        expected_duration_ms: Optional[int],
-        candidates: List[Dict[str, Any]],
-    ) -> str:
-        """Build a prompt for Gemini to select the best matching video."""
-        duration_str = ""
-        if expected_duration_ms:
-            duration_sec = expected_duration_ms / 1000
-            duration_str = f"\nExpected duration: {duration_sec:.0f} seconds"
-
-        candidates_str = ""
-        for i, cand in enumerate(candidates):
-            duration_sec = cand["duration_ms"] / 1000 if cand["duration_ms"] else 0
-            verified_marker = "✓" if cand["verified"] else ""
-            candidates_str += f"\n{i}. \"{cand['video_title']}\" by \"{cand['channel_name']}\" {verified_marker}| Duration: {duration_sec:.0f}s | Views: {cand['view_count']:,}"
-
-        prompt = f"""You are a music track matching expert. Select the BEST YouTube video that matches the requested track.
-
-Requested Track:
-Artist: "{artist}"
-Title: "{title}"{duration_str}
-
-Available YouTube Videos:{candidates_str}
-
-Instructions:
-1. Find the video that BEST matches the artist and title (1:1 match preferred)
-2. Prefer verified channels (marked with ✓) and official uploads
-3. Avoid covers, remixes, nightcore, slowed versions, live performances unless specifically requested
-4. Match duration if provided
-5. Prefer channels matching the artist name or official labels (VEVO, Topic, Records)
-
-Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No explanation needed."""
-
-        return prompt
-
-    def _parse_gemini_selection(self, response: str, max_index: int) -> Optional[int]:
-        """Parse Gemini's response to extract the selected index."""
-        if not response:
-            return None
-
-        response = response.strip()
-
-        try:
-            index = int(response)
-            if 0 <= index < max_index:
-                return index
-        except ValueError:
-            pass
-
-        import re
-
-        match = re.search(r"\b(\d+)\b", response)
-        if match:
-            index = int(match.group(1))
-            if 0 <= index < max_index:
-                return index
-
-        return None
 
     async def validate_pomice_path(self) -> bool:
         node = await self._get_node()
@@ -1723,6 +1433,785 @@ Respond with ONLY the index number (0-{len(candidates)-1}) of the best match. No
                 return True
 
         return False
+
+    # =========================================================================
+    # BATCH RESOLUTION SYSTEM (Last.fm > Deezer with Gemini Fallback)
+    # =========================================================================
+    
+    async def resolve_batch_to_deezer(
+        self,
+        tracks: List[Dict[str, str]],
+        *,
+        source: str = "lastfm",
+        max_gemini_batch: int = 50,
+    ) -> Dict[str, Any]:
+        """
+        Resolve a batch of tracks from Last.fm/YouTube to Deezer with multi-phase waterfall.
+        
+        Phase 1: Waterfall search (3 strategies per track)
+        Phase 2: Gemini batch fallback for failures (max 50 tracks)
+        
+        Args:
+            tracks: List of dicts with 'artist' and 'title' keys
+            source: Source of tracks ('lastfm', 'youtube')
+            max_gemini_batch: Maximum tracks to send to Gemini (default: 50)
+            
+        Returns:
+            {
+                'resolved': [{'artist': str, 'title': str, 'deezer_id': int, ...}],
+                'failed': [{'artist': str, 'title': str, 'reason': str}],
+                'stats': {'phase1_resolved': int, 'phase2_resolved': int, 'total_failed': int}
+            }
+        """
+        from .deezer_fetch import DeezerClient
+        
+        resolved: List[Dict[str, Any]] = []
+        phase1_failed: List[Dict[str, str]] = []
+        stats = {
+            "input_count": len(tracks),
+            "phase1_resolved": 0,
+            "phase2_resolved": 0,
+            "total_failed": 0,
+        }
+        
+        LOG.info(
+            "🔄 [Batch Resolver] Starting resolution for %d tracks (source=%s)",
+            len(tracks), source
+        )
+        
+        # Phase 1: Waterfall search with 3 strategies
+        async with DeezerClient(max_concurrent=10, timeout=10.0) as client:
+            for track in tracks:
+                artist = (track.get("artist") or "").strip()
+                title = (track.get("title") or "").strip()
+                
+                if not artist or not title:
+                    phase1_failed.append({
+                        "artist": artist,
+                        "title": title,
+                        "reason": "missing_metadata"
+                    })
+                    continue
+                
+                result = await self._waterfall_deezer_search(client, artist, title)
+                
+                if result:
+                    resolved.append({
+                        "artist": result.artist,
+                        "title": result.title,
+                        "deezer_id": result.id,
+                        "preview_url": result.preview_url,
+                        "duration_ms": result.duration_ms,
+                        "original_artist": artist,
+                        "original_title": title,
+                        "phase": 1,
+                    })
+                    stats["phase1_resolved"] += 1
+                else:
+                    phase1_failed.append({
+                        "artist": artist,
+                        "title": title,
+                        "reason": "waterfall_exhausted"
+                    })
+        
+        LOG.info(
+            "📊 [Batch Resolver] Phase 1 complete: %d resolved, %d failed",
+            stats["phase1_resolved"], len(phase1_failed)
+        )
+        
+        # Phase 2: Gemini batch fallback for remaining failures
+        if phase1_failed and self._gemini_service:
+            # Cap to max_gemini_batch tracks
+            gemini_batch = phase1_failed[:max_gemini_batch]
+            remaining_failed = phase1_failed[max_gemini_batch:]
+            
+            LOG.info(
+                "🤖 [Batch Resolver] Phase 2: Sending %d tracks to Gemini",
+                len(gemini_batch)
+            )
+            
+            gemini_results = await self._gemini_batch_resolve(gemini_batch)
+            
+            async with DeezerClient(max_concurrent=10, timeout=10.0) as client:
+                for item in gemini_results:
+                    if item.get("queries"):
+                        # Try each Gemini-suggested query
+                        found = False
+                        for query in item["queries"][:3]:  # Max 3 queries per track
+                            results = await client.search_track(query, limit=5)
+                            if results:
+                                # Verify result matches
+                                best = self._find_best_deezer_match(
+                                    results,
+                                    item["artist"],
+                                    item["title"]
+                                )
+                                if best:
+                                    resolved.append({
+                                        "artist": best.artist,
+                                        "title": best.title,
+                                        "deezer_id": best.id,
+                                        "preview_url": best.preview_url,
+                                        "duration_ms": best.duration_ms,
+                                        "original_artist": item["artist"],
+                                        "original_title": item["title"],
+                                        "phase": 2,
+                                        "gemini_query": query,
+                                    })
+                                    stats["phase2_resolved"] += 1
+                                    found = True
+                                    break
+                        
+                        if not found:
+                            remaining_failed.append({
+                                "artist": item["artist"],
+                                "title": item["title"],
+                                "reason": "gemini_queries_failed"
+                            })
+                    else:
+                        remaining_failed.append({
+                            "artist": item["artist"],
+                            "title": item["title"],
+                            "reason": item.get("reason", "gemini_no_queries")
+                        })
+            
+            phase1_failed = remaining_failed
+        
+        stats["total_failed"] = len(phase1_failed)
+        
+        LOG.info(
+            "✅ [Batch Resolver] Complete: %d resolved (P1=%d, P2=%d), %d failed",
+            len(resolved), stats["phase1_resolved"], stats["phase2_resolved"],
+            stats["total_failed"]
+        )
+        
+        return {
+            "resolved": resolved,
+            "failed": phase1_failed,
+            "stats": stats,
+        }
+    
+    async def _waterfall_deezer_search(
+        self,
+        client: Any,
+        artist: str,
+        title: str,
+    ) -> Optional[Any]:
+        """
+        3-tier waterfall search for Deezer resolution.
+        
+        Tier 1: Exact search "{artist} {title}"
+        Tier 2: Fuzzy search (title only, filter by artist)
+        Tier 3: Artist top tracks search
+        """
+        # Tier 1: Exact search
+        query = f"{artist} {title}"
+        results = await client.search_track(query, limit=10)
+        if results:
+            best = self._find_best_deezer_match(results, artist, title)
+            if best:
+                return best
+        
+        # Tier 2: Fuzzy search - title only
+        results = await client.search_track(title, limit=10)
+        if results:
+            best = self._find_best_deezer_match(results, artist, title, threshold=0.4)
+            if best:
+                return best
+        
+        # Tier 3: Artist top tracks
+        try:
+            artist_results = await client.search_artist(artist, limit=5)
+            if artist_results:
+                artist_id = artist_results[0].id if hasattr(artist_results[0], 'id') else artist_results[0].get('id')
+                if artist_id:
+                    top_tracks = await client.get_artist_top_tracks(str(artist_id), limit=50)
+                    if top_tracks:
+                        best = self._find_best_deezer_match(top_tracks, artist, title, threshold=0.5)
+                        if best:
+                            return best
+        except Exception as e:
+            LOG.debug("Tier 3 artist search failed: %s", str(e)[:50])
+        
+        return None
+    
+    def _find_best_deezer_match(
+        self,
+        results: List[Any],
+        expected_artist: str,
+        expected_title: str,
+        threshold: float = 0.3,
+    ) -> Optional[Any]:
+        """
+        Find best matching Deezer track using Jaccard similarity.
+        """
+        if not results:
+            return None
+        
+        artist_lower = expected_artist.lower().strip()
+        title_lower = expected_title.lower().strip()
+        artist_words = set(artist_lower.split())
+        title_words = set(title_lower.split())
+        
+        best_match = None
+        best_score = 0.0
+        
+        for result in results:
+            result_artist = getattr(result, 'artist', '').lower().strip()
+            result_title = getattr(result, 'title', '').lower().strip()
+            result_artist_words = set(result_artist.split())
+            result_title_words = set(result_title.split())
+            
+            # Calculate Jaccard similarity for artist
+            artist_intersection = len(artist_words & result_artist_words)
+            artist_union = len(artist_words | result_artist_words)
+            artist_score = artist_intersection / artist_union if artist_union > 0 else 0
+            
+            # Calculate Jaccard similarity for title
+            title_intersection = len(title_words & result_title_words)
+            title_union = len(title_words | result_title_words)
+            title_score = title_intersection / title_union if title_union > 0 else 0
+            
+            # Boost if substring match
+            if artist_lower in result_artist or result_artist in artist_lower:
+                artist_score += 0.3
+            if title_lower in result_title or result_title in title_lower:
+                title_score += 0.3
+            
+            # Combined score (weight title higher for music)
+            combined_score = (artist_score * 0.4) + (title_score * 0.6)
+            
+            if combined_score > best_score and combined_score >= threshold:
+                best_score = combined_score
+                best_match = result
+        
+        return best_match
+    
+    async def _gemini_batch_resolve(
+        self,
+        failed_tracks: List[Dict[str, str]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Use Gemini to generate refined search queries for failed tracks.
+        
+        Sends up to 50 tracks in a single batch request with grounding.
+        Returns list of dicts with 'artist', 'title', and 'queries' keys.
+        """
+        if not self._gemini_service or not self._gemini_service.is_available:
+            return [{"artist": t["artist"], "title": t["title"], "reason": "gemini_unavailable"} 
+                    for t in failed_tracks]
+        
+        # Format tracks for prompt
+        tracks_text = "\n".join([
+            f"{i+1}. {t['artist']} - {t['title']}"
+            for i, t in enumerate(failed_tracks[:50])
+        ])
+        
+        prompt = f"""These tracks failed to match on Deezer. Generate refined search queries for each.
+
+FAILED TRACKS:
+{tracks_text}
+
+For EACH track, provide 3 alternative Deezer search queries using:
+1. Canonical artist name (fix typos, expand abbreviations)
+2. Clean title (remove suffixes like "Official Audio", "Lyric Video")
+3. Album-based search if known
+
+Common fixes:
+- "ft." or "feat." → remove or use primary artist only
+- Covers → use original artist
+- OST → include franchise/game/anime name
+- Remasters → search without "remastered"
+
+Return JSON array:
+[
+  {{"index": 1, "artist": "original", "title": "original", "queries": ["query1", "query2", "query3"]}},
+  ...
+]
+
+Only include tracks you can help with. If unsure, return empty queries array."""
+
+        try:
+            response = await self._gemini_service.query_gemini(
+                prompt,
+                allow_grounding=True,
+                model="gemini-2.5-flash"
+            )
+            
+            if not response:
+                return [{"artist": t["artist"], "title": t["title"], "reason": "gemini_no_response"} 
+                        for t in failed_tracks]
+            
+            # Parse JSON response
+            text = response.strip()
+            if "```" in text:
+                text = re.sub(r"```(?:json)?", "", text).strip()
+            
+            try:
+                results = json.loads(text)
+                if isinstance(results, list):
+                    # Map back to original tracks
+                    result_map = {r.get("index", i+1): r for i, r in enumerate(results)}
+                    
+                    output = []
+                    for i, track in enumerate(failed_tracks[:50]):
+                        idx = i + 1
+                        if idx in result_map:
+                            item = result_map[idx]
+                            output.append({
+                                "artist": track["artist"],
+                                "title": track["title"],
+                                "queries": item.get("queries", []),
+                            })
+                        else:
+                            output.append({
+                                "artist": track["artist"],
+                                "title": track["title"],
+                                "queries": [],
+                                "reason": "not_in_response"
+                            })
+                    return output
+            except json.JSONDecodeError:
+                LOG.warning("⚠️ [Batch Resolver] Failed to parse Gemini response as JSON")
+            
+        except Exception as e:
+            LOG.error("❌ [Batch Resolver] Gemini batch request failed: %s", str(e)[:100])
+        
+        return [{"artist": t["artist"], "title": t["title"], "reason": "gemini_error"} 
+                for t in failed_tracks]
+    
+    # =========================================================================
+    # YOUTUBE > DEEZER WATERFALL PARSING (V3 Architecture)
+    # =========================================================================
+    # Per v3_reimplementation.md: If Deezer can't find it, it's probably not a song.
+    # Deezer has ~129 million songs - if we can't find it, the track is likely
+    # =========================================================================
+
+    async def parse_youtube_to_deezer(
+        self,
+        youtube_title: str,
+        youtube_id: str,
+        channel_name: Optional[str] = None,
+        *,
+        verbose: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Multi-stage resilient parsing: YouTube → Deezer with Gemini assistance.
+        
+        Per v3_reimplementation.md: If all stages fail, returns None (likely not a song).
+        This signals to the caller that autoplay should be disabled for this content.
+        
+        Stage 0: Cache check with self-healing TTL
+        Stage 1: Flash-Lite → 9 Deezer queries (85% confidence threshold)
+        Stage 2: Flash + Grounding → 3 refined queries (75% threshold)
+        Stage 3: Direct extraction + strict Deezer verification (70% threshold)
+        
+        Args:
+            youtube_title: Raw YouTube video title
+            youtube_id: YouTube video ID for cache key
+            channel_name: YouTube channel name (optional artist fallback)
+            verbose: Logging verbosity (0=off, 1=summary, 2=detailed)
+            
+        Returns:
+            Dict with artist, title, confidence, track_type, is_canonical, deezer_id
+            OR None if track cannot be verified (likely not commercial music)
+        """
+        from .deezer_fetch import DeezerClient
+        
+        if DeezerClient is None:
+            LOG.warning("[Waterfall] Deezer client unavailable")
+            return None
+        
+        def _log(level: int, msg: str, *args: Any) -> None:
+            if verbose >= level:
+                LOG.info(msg, *args)
+        
+        # Stage 0: Cache check with self-healing TTL
+        cached = await self._cache.get_parsing(youtube_title, youtube_id)
+        if cached:
+            schema_version = getattr(cached, "schema_version", 1)
+            if schema_version < PARSING_SCHEMA_VERSION:
+                _log(2, "🔄 [Stage 0] Schema upgrade needed for '%s...'", youtube_title[:50])
+                await self._cache.delete_parsing(youtube_title, youtube_id)
+            else:
+                cache_type = "CANONICAL" if getattr(cached, "is_canonical", False) else \
+                            "BEST_GUESS" if getattr(cached, "is_best_guess", False) else "FALLBACK"
+                
+                should_refresh = False
+                if cache_type == "CANONICAL":
+                    should_refresh = False  # Never expires
+                elif cache_type == "BEST_GUESS":
+                    should_refresh = cached.is_expired(7 * 24 * 3600)  # 7 days
+                else:
+                    retry_days = getattr(cached, "retry_after_days", 1) or 1
+                    should_refresh = cached.is_expired(retry_days * 24 * 3600)
+                
+                if not should_refresh:
+                    _log(2, "📁 [Cache Hit] %s: %s - %s", cache_type, cached.artist, cached.title)
+                    return {
+                        "artist": cached.artist,
+                        "title": cached.title,
+                        "confidence": cached.confidence,
+                        "track_type": getattr(cached, "track_type", "music"),
+                        "primary_entity": getattr(cached, "primary_entity", None),
+                        "is_canonical": getattr(cached, "is_canonical", False),
+                        "is_best_guess": getattr(cached, "is_best_guess", False),
+                        "deezer_id": getattr(cached, "deezer_id", None),
+                    }
+                else:
+                    _log(2, "🔄 [Cache Expired] %s entry for '%s...'", cache_type, youtube_title[:50])
+        
+        _log(2, "🔍 [Stage 0] Starting waterfall for '%s...'", youtube_title[:60])
+        
+        if not self._gemini_service or not self._gemini_service.is_available:
+            LOG.warning("[Waterfall] Gemini unavailable, cannot parse YouTube title")
+            return None
+        
+        queries_response: Optional[Dict[str, Any]] = None
+        grounded_response: Optional[Dict[str, Any]] = None
+        
+        async with DeezerClient() as deezer_client:
+            # Stage 1: Flash-Lite → 9 Deezer queries (85% threshold)
+            _log(2, "⚡ [Stage 1] Generating 9 Deezer queries...")
+            
+            try:
+                queries_response = await self._gemini_service.generate_deezer_queries_lite(youtube_title)
+                if queries_response and "queries" in queries_response:
+                    queries = queries_response["queries"][:9]
+                    _log(2, "⚡ [Stage 1] Queries: %s", queries)
+                    
+                    for idx, query in enumerate(queries, 1):
+                        search_results = await deezer_client.search_track(query)
+                        match = deezer_client.get_best_match(
+                            search_results,
+                            threshold=0.85,
+                            expected_title=youtube_title,
+                        )
+                        if match:
+                            _log(1, "✅ [Stage 1] Match: %s - %s (conf=%.2f)", 
+                                 match.track.artist, match.track.title, match.confidence)
+                            
+                            entry = ParsingEntry(
+                                artist=match.track.artist,
+                                title=match.track.title,
+                                confidence=match.confidence,
+                                parsed_at=time.time(),
+                                track_type="music",
+                                is_canonical=True,
+                                deezer_id=match.track.id,
+                                schema_version=PARSING_SCHEMA_VERSION,
+                            )
+                            await self._cache.set_parsing(youtube_title, youtube_id, entry)
+                            
+                            return {
+                                "artist": match.track.artist,
+                                "title": match.track.title,
+                                "confidence": match.confidence,
+                                "track_type": "music",
+                                "is_canonical": True,
+                                "deezer_id": match.track.id,
+                            }
+                    
+                    _log(2, "⚠️ [Stage 1] All 9 queries failed 85%% threshold")
+            except Exception as exc:
+                LOG.warning("⚠️ [Stage 1] Error: %s", exc)
+            
+            # Stage 2: Flash + Grounding → 3 refined queries (75% threshold)
+            if self._gemini_service.can_use_grounding():
+                _log(2, "🧠 [Stage 2] Generating 3 grounded queries...")
+                
+                try:
+                    context = queries_response.get("queries", []) if queries_response else []
+                    grounded_response = await self._gemini_service.generate_deezer_queries_grounded(
+                        youtube_title, failed_queries=context[:3]
+                    )
+                    
+                    if grounded_response and "queries" in grounded_response:
+                        queries = grounded_response["queries"][:3]
+                        _log(2, "🧠 [Stage 2] Queries: %s", queries)
+                        
+                        for idx, query in enumerate(queries, 1):
+                            search_results = await deezer_client.search_track(query)
+                            match = deezer_client.get_best_match(
+                                search_results,
+                                threshold=0.75,
+                                expected_title=youtube_title,
+                            )
+                            if match:
+                                _log(1, "✅ [Stage 2] Match: %s - %s (conf=%.2f)",
+                                     match.track.artist, match.track.title, match.confidence)
+                                
+                                entry = ParsingEntry(
+                                    artist=match.track.artist,
+                                    title=match.track.title,
+                                    confidence=match.confidence,
+                                    parsed_at=time.time(),
+                                    track_type="music",
+                                    is_canonical=True,
+                                    deezer_id=match.track.id,
+                                    schema_version=PARSING_SCHEMA_VERSION,
+                                )
+                                await self._cache.set_parsing(youtube_title, youtube_id, entry)
+                                
+                                return {
+                                    "artist": match.track.artist,
+                                    "title": match.track.title,
+                                    "confidence": match.confidence,
+                                    "track_type": "music",
+                                    "is_canonical": True,
+                                    "deezer_id": match.track.id,
+                                }
+                        
+                        _log(2, "⚠️ [Stage 2] All 3 queries failed 75%% threshold")
+                except Exception as exc:
+                    LOG.warning("⚠️ [Stage 2] Error: %s", exc)
+            else:
+                _log(2, "⏭️ [Stage 2] Skipped (grounding unavailable)")
+            
+            # Stage 3: Direct extraction + strict Deezer verification (70% threshold)
+            if self._gemini_service.can_use_grounding():
+                _log(2, "🎯 [Stage 3] Extracting metadata...")
+                
+                try:
+                    failed_context = []
+                    if queries_response and "queries" in queries_response:
+                        failed_context.extend(queries_response["queries"][:9])
+                    if grounded_response and "queries" in grounded_response:
+                        failed_context.extend(grounded_response["queries"][:3])
+                    
+                    fallback_response = await self._gemini_service.generate_fallback_metadata(
+                        youtube_title, failed_queries=failed_context[:5]
+                    )
+                    
+                    if fallback_response:
+                        artist = fallback_response.get("artist", "").strip()
+                        title = fallback_response.get("title", "").strip()
+                        track_type = fallback_response.get("track_type", "music")
+                        primary_entity = fallback_response.get("primary_entity")
+                        
+                        if artist and title:
+                            _log(2, "🎯 [Stage 3] Extracted: %s - %s, verifying...", artist, title)
+                            
+                            query = f'artist:"{artist}" track:"{title}"'
+                            search_results = await deezer_client.search_track(query)
+                            match = deezer_client.get_best_match(
+                                search_results,
+                                threshold=0.70,
+                                expected_title=youtube_title,
+                            )
+                            
+                            if match:
+                                _log(1, "✅ [Stage 3] Verified: %s - %s (conf=%.2f)",
+                                     match.track.artist, match.track.title, match.confidence)
+                                
+                                entry = ParsingEntry(
+                                    artist=match.track.artist,
+                                    title=match.track.title,
+                                    confidence=match.confidence,
+                                    parsed_at=time.time(),
+                                    track_type=track_type,
+                                    primary_entity=primary_entity,
+                                    is_canonical=True,
+                                    deezer_id=match.track.id,
+                                    schema_version=PARSING_SCHEMA_VERSION,
+                                )
+                                await self._cache.set_parsing(youtube_title, youtube_id, entry)
+                                
+                                return {
+                                    "artist": match.track.artist,
+                                    "title": match.track.title,
+                                    "confidence": match.confidence,
+                                    "track_type": track_type,
+                                    "primary_entity": primary_entity,
+                                    "is_canonical": True,
+                                    "deezer_id": match.track.id,
+                                }
+                            else:
+                                _log(2, "❌ [Stage 3] Extracted '%s - %s' failed Deezer verification", artist, title)
+                except Exception as exc:
+                    LOG.warning("⚠️ [Stage 3] Error: %s", exc)
+            else:
+                _log(2, "⏭️ [Stage 3] Skipped (grounding unavailable)")
+        
+        # Total failure - per v3_reimplementation.md, this is likely NOT a song
+        LOG.warning("❌ [Waterfall] Could not verify '%s...' on Deezer - likely not commercial music", youtube_title[:60])
+        return None
+
+    # =========================================================================
+    # ARTIST/TITLE > YOUTUBE RESOLUTION (For Low Quality Deezer/Last.fm Matches)
+    # =========================================================================
+    # When we have artist + title from Deezer/Last.fm but need a YouTube video,
+    # use Gemini to intelligently select the best match from YouTube search.
+    # =========================================================================
+
+    async def resolve_to_youtube_with_gemini(
+        self,
+        artist: str,
+        title: str,
+        *,
+        expected_duration_ms: Optional[int] = None,
+    ) -> Optional[Any]:
+        """
+        Resolve a Deezer/Last.fm track to YouTube using Gemini-assisted selection.
+        
+        This is used when standard heuristics produce low confidence results.
+        Gemini analyzes YouTube search results and selects the best match.
+        
+        Args:
+            artist: Track artist
+            title: Track title
+            expected_duration_ms: Expected track duration for validation
+            
+        Returns:
+            Pomice track object or None
+        """
+        artist = artist.strip()
+        title = title.strip()
+        if not artist or not title:
+            return None
+        
+        if not self._gemini_service:
+            LOG.debug("[Gemini Resolution] Gemini unavailable, using heuristics")
+            return await self.resolve_track(artist, title, expected_duration_ms=expected_duration_ms, prefer_cache=False)
+        
+        LOG.info("🤖 [Gemini Resolution] AI-assisted search for '%s' by '%s'", title, artist)
+        
+        async with self._gemini_resolution_semaphore:
+            node = await self._get_node()
+            if not node:
+                return None
+            
+            search_query = f"{artist} {title}"
+            try:
+                search_results = await node.get_tracks(query=f"ytsearch:{search_query}", ctx=None)
+            except Exception as e:
+                LOG.error("Pomice search failed: %s", e)
+                return None
+            
+            if not search_results:
+                return None
+            
+            # Filter banned tracks
+            ban_key = (artist.lower(), title.lower())
+            banned_ids = {entry[0] for entry in self._banned_tracks.get(ban_key, [])} if ban_key in self._banned_tracks else set()
+            
+            # Build candidates for Gemini (top 10)
+            candidates = []
+            for idx, track in enumerate(search_results[:10]):
+                metadata = self._extract_track_metadata(track)
+                youtube_id = metadata.get("youtube_id", "")
+                
+                if youtube_id in banned_ids:
+                    continue
+                
+                candidates.append({
+                    "index": idx,
+                    "video_title": metadata.get("title", ""),
+                    "channel_name": metadata.get("channel_name", ""),
+                    "duration_ms": metadata.get("duration_ms", 0),
+                    "verified": metadata.get("verified", False),
+                    "track_obj": track,
+                })
+            
+            if not candidates:
+                LOG.warning("[Gemini Resolution] No valid candidates after filtering")
+                return None
+            
+            # Single Gemini call to select best match
+            prompt = self._build_youtube_selection_prompt(artist, title, expected_duration_ms, candidates)
+            
+            try:
+                response = await self._gemini_service.query_gemini(prompt)
+                selected_index = self._parse_selection_response(response, len(candidates))
+                
+                if selected_index is None:
+                    LOG.warning("[Gemini Resolution] Failed to parse response, using first candidate")
+                    selected_index = 0
+                
+                selected = candidates[selected_index]
+                track_obj = selected["track_obj"]
+                metadata = self._extract_track_metadata(track_obj)
+                
+                LOG.info("✅ [Gemini Resolution] Selected: '%s' by '%s' (verified=%s)",
+                         selected["video_title"][:60], selected["channel_name"], selected["verified"])
+                
+                # Cache the result with high confidence
+                entry = MappingEntry(
+                    youtube_id=str(metadata.get("youtube_id") or ""),
+                    url=str(metadata.get("url") or ""),
+                    timestamp=time.time(),
+                    track_identifier=getattr(track_obj, "identifier", None),
+                    title=str(metadata.get("title") or ""),
+                    channel_name=metadata.get("channel_name"),
+                    duration_ms=self._safe_int(metadata.get("duration_ms")),
+                    verified=bool(metadata.get("verified", False)),
+                    heuristic_score=0.95,  # High score for Gemini-selected
+                    title_similarity=1.0,
+                    artist_similarity=1.0,
+                    search_rank=selected_index,
+                    heuristic_version=3,
+                )
+                await self._cache.set_mapping(artist, title, entry)
+                
+                return track_obj
+                
+            except Exception as e:
+                LOG.error("[Gemini Resolution] Error: %s", e, exc_info=True)
+                # Fallback to heuristic
+                return await self.resolve_track(artist, title, expected_duration_ms=expected_duration_ms, prefer_cache=False)
+    
+    def _build_youtube_selection_prompt(
+        self,
+        artist: str,
+        title: str,
+        expected_duration_ms: Optional[int],
+        candidates: List[Dict[str, Any]],
+    ) -> str:
+        """Build prompt for Gemini to select best YouTube match."""
+        duration_str = f"\nExpected duration: {expected_duration_ms / 1000:.0f}s" if expected_duration_ms else ""
+        
+        candidates_str = ""
+        for cand in candidates:
+            dur_sec = cand["duration_ms"] / 1000 if cand["duration_ms"] else 0
+            verified = "✓" if cand["verified"] else ""
+            candidates_str += f"\n{cand['index']}. \"{cand['video_title']}\" by \"{cand['channel_name']}\" {verified}| {dur_sec:.0f}s"
+        
+        return f"""Select the BEST YouTube video matching this track:
+
+Artist: "{artist}"
+Title: "{title}"{duration_str}
+
+Videos:{candidates_str}
+
+Rules:
+1. Prefer exact artist + title match
+2. Prefer verified channels (✓) and official uploads
+3. Avoid covers, remixes, nightcore, slowed versions, live performances
+4. Match duration if provided
+
+Reply with ONLY the index number (0-{len(candidates)-1})."""
+    
+    def _parse_selection_response(self, response: str, max_index: int) -> Optional[int]:
+        """Parse Gemini's index selection."""
+        if not response:
+            return None
+        response = response.strip()
+        
+        try:
+            idx = int(response)
+            if 0 <= idx < max_index:
+                return idx
+        except ValueError:
+            pass
+        
+        # Try to extract first number
+        match = re.search(r"\b(\d+)\b", response)
+        if match:
+            idx = int(match.group(1))
+            if 0 <= idx < max_index:
+                return idx
+        
+        return None
 
 
 __all__ = ["TrackResolver"]

@@ -65,6 +65,10 @@ class BootstrapManager:
         self._last_new_release_check = 0.0
         self._new_release_continuation = False
         
+        # Scenario A: First run protection (only runs ONCE per boot)
+        self._first_run_triggered = False  # Set True after Scenario A runs
+        self._first_run_queued_count = 0   # How many tracks were queued in first run
+        
         # Persistence
         self._state_file = Path("cache/music/bootstrap_state.json")
         self._load_state()
@@ -93,7 +97,11 @@ class BootstrapManager:
                     self._current_tag_index = data.get("current_tag_index", 0)
                     self._last_new_release_check = data.get("last_new_release_check", 0.0)
                     self._new_release_continuation = data.get("new_release_continuation", False)
-                    self._vlog(1, "🌱 [Bootstrap] Resuming: %d tracks already cached", len(self._bootstrapped_tracks))
+                    # First run tracking (reset on new boot if not enough tracks)
+                    self._first_run_triggered = data.get("first_run_triggered", False)
+                    self._first_run_queued_count = data.get("first_run_queued_count", 0)
+                    self._vlog(1, "🌱 [Bootstrap] Resuming: %d tracks cached, first_run_triggered=%s", 
+                              len(self._bootstrapped_tracks), self._first_run_triggered)
             except Exception as e:
                 LOG.warning(f"⚠️ [Bootstrap] Failed to load state: {e}")
 
@@ -108,6 +116,8 @@ class BootstrapManager:
                     "current_tag_index": self._current_tag_index,
                     "last_new_release_check": self._last_new_release_check,
                     "new_release_continuation": self._new_release_continuation,
+                    "first_run_triggered": self._first_run_triggered,
+                    "first_run_queued_count": self._first_run_queued_count,
                     "saved_at": time.time(),
                 }, f)
         except Exception as e:
@@ -146,9 +156,30 @@ class BootstrapManager:
         Returns:
             DaydreamScenario enum value
         """
-        # Scenario A: First run if we have fewer than half the target tracks
-        if len(self._bootstrapped_tracks) < self._bootstrap_limit // 2:
-            return DaydreamScenario.FIRST_RUN
+        # Scenario A: First run - only runs ONCE per boot, and only if needed
+        # Uses ENRICHED count (analysis_verified=True) not just queued count
+        if not self._first_run_triggered:
+            # Check how many tracks have been FULLY enriched (Gemini + audio analysis)
+            enriched_count = 0
+            if hasattr(self.engine, '_cache') and hasattr(self.engine._cache, 'get_enriched_count'):
+                enriched_count = self.engine._cache.get_enriched_count()
+            
+            # Also count tracks with Gemini enrichment (tags populated)
+            gemini_count = 0
+            if hasattr(self.engine, '_cache') and hasattr(self.engine._cache, 'get_gemini_enriched_count'):
+                gemini_count = self.engine._cache.get_gemini_enriched_count()
+            
+            # Use the higher of the two counts
+            actual_enriched = max(enriched_count, gemini_count)
+            
+            if actual_enriched < self._bootstrap_limit:
+                self._vlog(1, "📊 [Scenario Check] First run needed: enriched=%d (audio=%d, gemini=%d), target=%d",
+                          actual_enriched, enriched_count, gemini_count, self._bootstrap_limit)
+                return DaydreamScenario.FIRST_RUN
+            else:
+                # Already have enough ENRICHED tracks, mark first run as complete
+                self._first_run_triggered = True
+                self._vlog(1, "✅ [Scenario Check] First run skipped: already have %d enriched tracks", actual_enriched)
         
         # Scenario C: New releases if enough time has passed (or continuation)
         if self._new_release_continuation:
@@ -232,59 +263,45 @@ class BootstrapManager:
 
     async def _queue_track_for_analysis(self, artist: str, title: str, track) -> bool:
         """
-        Queue a track for analysis with all necessary metadata.
+        Queue a track for enrichment using the EnrichmentWorker.
         
-        This bypasses the normal queue_analysis flow to directly build a job
-        with the Deezer preview URL, since bootstrapped tracks don't come from
-        YouTube and don't have YouTube mappings.
+        The EnrichmentWorker handles the full pipeline:
+        1. Deezer Resolution (search + track details for BPM/gain)
+        2. Gemini Cultural Enrichment (tags, mood, activity)
+        3. Audio Analysis (Librosa + EfficientAT for embeddings)
+        
+        This ensures consistent processing and proper Gemini batching.
         
         Args:
             artist: Track artist
             title: Track title  
-            track: DeezerTrack object
+            track: DeezerTrack object (may have preview_url already)
             
         Returns:
             True if queued successfully
         """
-        if not track.preview_url:
-            self._vlog(2, "🚫 [Daydream] No preview URL for %s - %s, skipping", artist, title)
+        if not hasattr(self.engine, '_enrichment_worker') or not self.engine._enrichment_worker:
+            LOG.warning("🚫 [Daydream] EnrichmentWorker unavailable, cannot queue")
             return False
         
-        if not self.engine._preview_fetcher:
-            LOG.warning("🚫 [Daydream] Preview fetcher unavailable, cannot queue")
-            return False
-            
         track_key = self.engine._make_track_key(artist, title)
         
-        # Check if already in queue
-        if self.engine._is_job_tracked(track_key):
-            self._vlog(2, "⏭️ [Daydream] %s already in queue, skipping", track_key)
-            return False
-        
-        # Build job directly with preview URL (bypass normal queue_analysis)
-        job: Dict[str, Any] = {
-            "track_id": track_key,
-            "youtube_url": f"bootstrap:{track.id}",  # Marker URL, not used for download
-            "preview_url": track.preview_url,
-            "preview_duration_ms": track.duration_ms,
-            "deezer_track_id": track.id,
-            "priority": PRIORITY_DAYDREAM,  # P3: Daydreaming (lowest priority)
-            "attempts": 0,
-            "enqueued_at": time.time(),
-            "last_error": None,
-        }
-        
-        # Add to queue
-        self.engine._analysis_queue.append(job)
-        self.engine._analysis_stats["queued"] += 1
-        self.engine._analysis_stats["queue_depth"] = len(self.engine._analysis_queue)
-        self.engine._persist_analysis_queue_state()
-        
-        self._vlog(
-            2, "✅ [Daydream] Queued %s - %s for analysis (preview_url=%s)",
-            artist, title, track.preview_url[:50] + "..." if len(track.preview_url) > 50 else track.preview_url
+        # Use EnrichmentWorker to handle full pipeline
+        # Priority is DAYDREAM (P3) for background processing
+        from .enrichment_worker import Priority
+        success = await self.engine._enrichment_worker.add_task(
+            artist=artist,
+            title=title,
+            priority=Priority.DAYDREAM,
+            source="bootstrap",
         )
-        return True
+        
+        if success:
+            self._vlog(2, "✅ [Daydream] Queued %s - %s via EnrichmentWorker", artist, title)
+        else:
+            self._vlog(2, "⏭️ [Daydream] %s already queued or enriched", track_key)
+        
+        return success
 
     async def _queue_gemini_enrichment_batch(self, tracks) -> int:
         """
@@ -403,6 +420,10 @@ class BootstrapManager:
         Scenario A: First run - cache is empty or very small.
         Fetch 200 tracks from Last.fm global charts to seed the pool.
         
+        Uses 2-phase resolution:
+        - Phase 1: Direct Deezer search for each Last.fm track
+        - Phase 2: Batch Gemini resolver for failed tracks (max 50)
+        
         Returns:
             List of DeezerTrack objects (verified via Deezer for preview URLs)
         """
@@ -410,6 +431,7 @@ class BootstrapManager:
                    FIRST_RUN_FETCH_COUNT)
         
         verified_tracks = []
+        failed_tracks: List[Dict[str, str]] = []
         
         try:
             # Fetch from Last.fm chart.getTopTracks
@@ -421,14 +443,13 @@ class BootstrapManager:
                 async with DeezerClient(max_concurrent=10, timeout=5.0) as deezer:
                     return await deezer.get_charts(limit=FIRST_RUN_FETCH_COUNT)
             
-            self._vlog(1, "📊 [Scenario A] Got %d tracks from Last.fm, verifying via Deezer...", 
+            self._vlog(1, "📊 [Scenario A] Got %d tracks from Last.fm, Phase 1: Direct Deezer search...", 
                       len(lastfm_tracks))
             
-            # Verify each track via Deezer to get preview URLs
+            # Phase 1: Direct Deezer search for each track
             async with DeezerClient(max_concurrent=10, timeout=5.0) as deezer:
                 for track_info in lastfm_tracks:
                     try:
-                        # LastFMTrack is a dataclass, use attribute access
                         artist = track_info.artist
                         title = track_info.title
                         
@@ -436,16 +457,62 @@ class BootstrapManager:
                             continue
                         
                         # Search Deezer for this track
-                        results = await deezer.search_track(artist, title)
+                        results = await deezer.search_track(f"{artist} {title}")
                         if results and results[0].preview_url:
                             verified_tracks.append(results[0])
+                        else:
+                            # Track to failed list for Phase 2
+                            failed_tracks.append({"artist": artist, "title": title})
                             
                     except Exception as e:
-                        self._vlog(2, "⚠️ [Scenario A] Failed to verify %s: %s", 
-                                  getattr(track_info, 'title', '?'), str(e)[:30])
-                        continue
+                        failed_tracks.append({"artist": getattr(track_info, 'artist', ''), 
+                                            "title": getattr(track_info, 'title', '')})
             
-            self._vlog(1, "✅ [Scenario A] Verified %d/%d tracks via Deezer", 
+            self._vlog(1, "📊 [Scenario A] Phase 1 complete: %d verified, %d failed", 
+                      len(verified_tracks), len(failed_tracks))
+            
+            # Phase 2: Use batch resolver for failed tracks (with Gemini fallback)
+            if failed_tracks and hasattr(self.engine, '_track_resolver') and self.engine._track_resolver:
+                self._vlog(1, "🔄 [Scenario A] Phase 2: Batch resolving %d failed tracks...", 
+                          len(failed_tracks))
+                
+                batch_result = await self.engine._track_resolver.resolve_batch_to_deezer(
+                    failed_tracks,
+                    source="lastfm",
+                    max_gemini_batch=50,
+                )
+                
+                # Convert resolved tracks to DeezerTrack-like objects
+                if batch_result.get("resolved"):
+                    from dataclasses import dataclass
+                    
+                    @dataclass
+                    class DeezerTrackProxy:
+                        id: int
+                        artist: str
+                        title: str
+                        preview_url: str
+                        duration_ms: int
+                        
+                    for item in batch_result["resolved"]:
+                        if item.get("preview_url"):
+                            proxy = DeezerTrackProxy(
+                                id=item.get("deezer_id", 0),
+                                artist=item["artist"],
+                                title=item["title"],
+                                preview_url=item["preview_url"],
+                                duration_ms=item.get("duration_ms", 0),
+                            )
+                            verified_tracks.append(proxy)
+                
+                stats = batch_result.get("stats", {})
+                self._vlog(1, "✅ [Scenario A] Phase 2 complete: +%d tracks (P1=%d, P2=%d, failed=%d)", 
+                          stats.get("phase1_resolved", 0) + stats.get("phase2_resolved", 0),
+                          stats.get("phase1_resolved", 0),
+                          stats.get("phase2_resolved", 0),
+                          stats.get("total_failed", 0))
+            
+            self._vlog(1, "✅ [Scenario A] Total verified: %d/%d tracks via Deezer", 
                       len(verified_tracks), len(lastfm_tracks))
             
         except Exception as e:
@@ -464,6 +531,7 @@ class BootstrapManager:
         self._vlog(1, "🌱 [Scenario B] Daydreaming - exploration mode")
         
         verified_tracks = []
+        failed_tracks: List[Dict[str, str]] = []
         
         try:
             # Get seed tracks from recently played or cached pool
@@ -480,13 +548,14 @@ class BootstrapManager:
                                     seed_artist, seed_title, limit=10
                                 )
                                 for track_info in similar:
-                                    # LastFMTrack is a dataclass, use attribute access
                                     artist = track_info.artist
                                     title = track_info.title
                                     if artist and title:
-                                        results = await deezer.search_track(artist, title)
+                                        results = await deezer.search_track(f"{artist} {title}")
                                         if results and results[0].preview_url:
                                             verified_tracks.append(results[0])
+                                        else:
+                                            failed_tracks.append({"artist": artist, "title": title})
                             except Exception as e:
                                 self._vlog(2, "⚠️ [Scenario B] Similar tracks error: %s", str(e)[:30])
                     
@@ -496,15 +565,55 @@ class BootstrapManager:
                             try:
                                 tag_tracks = await lastfm.get_tag_top_tracks(tag, limit=10)
                                 for track_info in tag_tracks:
-                                    # LastFMTrack is a dataclass, use attribute access
                                     artist = track_info.artist
                                     title = track_info.title
                                     if artist and title:
-                                        results = await deezer.search_track(artist, title)
+                                        results = await deezer.search_track(f"{artist} {title}")
                                         if results and results[0].preview_url:
                                             verified_tracks.append(results[0])
+                                        else:
+                                            failed_tracks.append({"artist": artist, "title": title})
                             except Exception as e:
                                 self._vlog(2, "⚠️ [Scenario B] Tag discovery error: %s", str(e)[:30])
+            
+            self._vlog(1, "📊 [Scenario B] Phase 1: %d verified, %d failed", 
+                      len(verified_tracks), len(failed_tracks))
+            
+            # Phase 2: Batch resolve failed tracks
+            if failed_tracks and hasattr(self.engine, '_track_resolver') and self.engine._track_resolver:
+                batch_result = await self.engine._track_resolver.resolve_batch_to_deezer(
+                    failed_tracks[:50],  # Limit to 50 for Gemini batch
+                    source="lastfm",
+                    max_gemini_batch=50,
+                )
+                
+                if batch_result.get("resolved"):
+                    from dataclasses import dataclass
+                    
+                    @dataclass
+                    class DeezerTrackProxy:
+                        id: int
+                        artist: str
+                        title: str
+                        preview_url: str
+                        duration_ms: int
+                        
+                    for item in batch_result["resolved"]:
+                        if item.get("preview_url"):
+                            proxy = DeezerTrackProxy(
+                                id=item.get("deezer_id", 0),
+                                artist=item["artist"],
+                                title=item["title"],
+                                preview_url=item["preview_url"],
+                                duration_ms=item.get("duration_ms", 0),
+                            )
+                            verified_tracks.append(proxy)
+                
+                stats = batch_result.get("stats", {})
+                self._vlog(1, "✅ [Scenario B] Phase 2: +%d recovered (P1=%d, P2=%d)", 
+                          stats.get("phase1_resolved", 0) + stats.get("phase2_resolved", 0),
+                          stats.get("phase1_resolved", 0),
+                          stats.get("phase2_resolved", 0))
             
             # Fallback: Deezer charts if no exploration results
             if not verified_tracks:
@@ -524,35 +633,159 @@ class BootstrapManager:
         Scenario C: Monthly new releases check.
         Fetch latest releases from Deezer to keep recommendations fresh.
         
+        V3 Improvements:
+        - Fetch max releases per artist (avoid artist flooding)
+        - Deduplicate across all artists
+        - Fill remaining slots with Scenario B tracks
+        
         Returns:
             List of DeezerTrack objects
         """
         self._vlog(1, "🆕 [Scenario C] Checking new releases from Deezer")
         
         verified_tracks = []
+        seen_keys: set = set()  # For deduplication
+        max_per_artist = 3  # Max tracks per artist to avoid flooding
+        artist_counts: dict = {}  # Track count per artist
         
         try:
             async with DeezerClient(max_concurrent=10, timeout=5.0) as deezer:
-                new_releases = await deezer.get_new_releases(limit=50)
+                new_releases = await deezer.get_new_releases(limit=100)  # Fetch more for filtering
                 
-                # Filter to tracks with preview URLs
+                # Filter and deduplicate
                 for track in new_releases:
-                    if track.preview_url:
-                        verified_tracks.append(track)
+                    if not track.preview_url:
+                        continue
+                    
+                    # Deduplication key
+                    track_key = f"{track.artist.lower().strip()}::{track.title.lower().strip()}"
+                    if track_key in seen_keys:
+                        continue
+                    if track_key in self._bootstrapped_tracks:
+                        continue
+                    
+                    # Artist limit check
+                    artist_lower = track.artist.lower().strip()
+                    artist_count = artist_counts.get(artist_lower, 0)
+                    if artist_count >= max_per_artist:
+                        self._vlog(2, "⏭️ [Scenario C] Artist limit reached: %s", track.artist)
+                        continue
+                    
+                    # Add track
+                    verified_tracks.append(track)
+                    seen_keys.add(track_key)
+                    artist_counts[artist_lower] = artist_count + 1
+                    
+                    # Stop if we have enough
+                    if len(verified_tracks) >= DAYDREAM_BATCH_SIZE:
+                        break
+            
+            self._vlog(1, "🆕 [Scenario C] Found %d unique new releases (from %d artists)", 
+                      len(verified_tracks), len(artist_counts))
+            
+            # Fill remaining with Scenario B (daydream) tracks
+            if len(verified_tracks) < DAYDREAM_BATCH_SIZE:
+                remaining = DAYDREAM_BATCH_SIZE - len(verified_tracks)
+                self._vlog(1, "🔄 [Scenario C] Filling %d remaining slots with exploration tracks", remaining)
+                
+                # Get exploration tracks from Scenario B logic
+                exploration_tracks = await self._get_exploration_tracks_for_fill(remaining, seen_keys)
+                verified_tracks.extend(exploration_tracks)
+                
+                self._vlog(1, "✅ [Scenario C] Total after fill: %d tracks", len(verified_tracks))
             
             if verified_tracks:
                 self._last_new_release_check = time.time()
-                self._new_release_continuation = len(verified_tracks) >= 40  # Continue if many new
+                self._new_release_continuation = len(verified_tracks) >= 40
                 self._save_state()
-                
-                self._vlog(1, "✅ [Scenario C] Found %d new releases with previews", 
-                          len(verified_tracks))
             else:
-                self._vlog(1, "⚠️ [Scenario C] No new releases with previews")
+                self._vlog(1, "⚠️ [Scenario C] No new releases found")
                 self._new_release_continuation = False
                 
         except Exception as e:
             LOG.error(f"❌ [Scenario C] Error: {e}", exc_info=True)
+        
+        return verified_tracks
+    
+    async def _get_exploration_tracks_for_fill(self, count: int, exclude_keys: set) -> List:
+        """
+        Get exploration tracks to fill remaining slots (used by Scenario C).
+        
+        Args:
+            count: Number of tracks to fetch
+            exclude_keys: Track keys to exclude (already in batch)
+            
+        Returns:
+            List of DeezerTrack objects
+        """
+        verified_tracks = []
+        
+        try:
+            seed_tracks = await self._get_seed_tracks_for_exploration()
+            
+            async with LastFMClient(max_concurrent=5, timeout=10.0) as lastfm:
+                async with DeezerClient(max_concurrent=10, timeout=5.0) as deezer:
+                    
+                    # Similar tracks to seeds
+                    if seed_tracks:
+                        for seed_artist, seed_title in seed_tracks[:2]:
+                            if len(verified_tracks) >= count:
+                                break
+                            try:
+                                similar = await lastfm.get_similar_tracks(
+                                    seed_artist, seed_title, limit=10
+                                )
+                                for track_info in similar:
+                                    artist = track_info.artist
+                                    title = track_info.title
+                                    track_key = f"{artist.lower().strip()}::{title.lower().strip()}"
+                                    
+                                    if track_key in exclude_keys:
+                                        continue
+                                    if track_key in self._bootstrapped_tracks:
+                                        continue
+                                    
+                                    if artist and title:
+                                        results = await deezer.search_track(artist, title)
+                                        if results and results[0].preview_url:
+                                            verified_tracks.append(results[0])
+                                            exclude_keys.add(track_key)
+                                            
+                                            if len(verified_tracks) >= count:
+                                                break
+                            except Exception:
+                                continue
+                    
+                    # Tag-based fallback
+                    if len(verified_tracks) < count:
+                        for tag in self._exploration_tags[:2]:
+                            if len(verified_tracks) >= count:
+                                break
+                            try:
+                                tag_tracks = await lastfm.get_tag_top_tracks(tag, limit=10)
+                                for track_info in tag_tracks:
+                                    artist = track_info.artist
+                                    title = track_info.title
+                                    track_key = f"{artist.lower().strip()}::{title.lower().strip()}"
+                                    
+                                    if track_key in exclude_keys:
+                                        continue
+                                    if track_key in self._bootstrapped_tracks:
+                                        continue
+                                    
+                                    if artist and title:
+                                        results = await deezer.search_track(artist, title)
+                                        if results and results[0].preview_url:
+                                            verified_tracks.append(results[0])
+                                            exclude_keys.add(track_key)
+                                            
+                                            if len(verified_tracks) >= count:
+                                                break
+                            except Exception:
+                                continue
+                                
+        except Exception as e:
+            self._vlog(2, "⚠️ [Scenario C] Fill error: %s", str(e)[:50])
         
         return verified_tracks
     
@@ -680,15 +913,11 @@ class BootstrapManager:
                           len(tracks), scenario.value)
                 
                 # ========================================
-                # STEP 1.5: Queue Gemini cultural enrichment for all tracks
+                # STEP 2: Process tracks for enrichment
                 # ========================================
-                # Gemini only needs artist/title - queue early for batching
-                # This runs in parallel with audio analysis queueing
-                await self._queue_gemini_enrichment_batch(tracks)
-                
-                # ========================================
-                # STEP 2: Process tracks for analysis
-                # ========================================
+                # NOTE: Gemini enrichment is handled by EnrichmentWorker
+                # The worker pipeline is: Deezer → Gemini → Audio Analysis
+                # We just need to queue tracks for the worker
                 queued_count = 0
                 skipped_count = 0
                 
@@ -728,28 +957,37 @@ class BootstrapManager:
                     # ========================================
                     # STEP 3: Queue using direct method (bypasses cache lookup)
                     # ========================================
-                    # This creates cache entries AND queues in one step
-                    await self._ensure_cache_entries(track.artist, track.title, track)
+                    # Queue via EnrichmentWorker (handles Deezer → Gemini → Audio)
                     success = await self._queue_track_for_analysis(track.artist, track.title, track)
-                    
-                    # Always track it for recommendation pool
-                    self._bootstrapped_tracks.add(track_key)
                     
                     if success:
                         queued_count += 1
+                        # Only track successfully queued tracks
+                        self._bootstrapped_tracks.add(track_key)
                         self._vlog(2, "🌱 [Daydream] Queued: %s - %s", track.artist, track.title)
                     else:
+                        # Don't add to bootstrapped_tracks - allow retry next time
+                        skipped_count += 1
                         self._vlog(2, "⚠️ [Daydream] Failed to queue: %s - %s", track.artist, track.title)
                     
-                    # Rate limit: max 5 per batch to not overwhelm workers
-                    if queued_count >= 5:
-                        break
+                    # Rate limit based on scenario
+                    # FIRST_RUN (Scenario A): No limit - queue all 200 tracks to bootstrap cache
+                    if scenario != DaydreamScenario.FIRST_RUN:
+                        if queued_count >= DAYDREAM_BATCH_SIZE:
+                            self._vlog(1, "🌱 [Daydream] Batch limit reached (%d tracks)", queued_count)
+                            break
                 
                 # ========================================
                 # STEP 4: Summary and save
                 # ========================================
+                # Mark first run as complete (only runs once per boot)
+                if scenario == DaydreamScenario.FIRST_RUN and queued_count > 0:
+                    self._first_run_triggered = True
+                    self._vlog(1, "🚀 [Daydream] FIRST RUN COMPLETE: Queued %d tracks for bootstrap", queued_count)
+                
                 self._vlog(
-                    1, "🌱 [Daydream] Batch complete: queued=%d, skipped=%d, total=%d/%d",
+                    1, "🌱 [Daydream] Batch complete: scenario=%s, queued=%d, skipped=%d, total=%d/%d",
+                    scenario.value,
                     queued_count,
                     skipped_count,
                     len(self._bootstrapped_tracks),
@@ -758,11 +996,29 @@ class BootstrapManager:
                 
                 self._save_state()
                 
-                # Sleep between batches
-                if queued_count == 0:
-                    await asyncio.sleep(300)  # 5 min if nothing new
+                # Sleep between batches - timing depends on enrichment progress
+                # Get actual enriched count (not just queued)
+                enriched_count = 0
+                if hasattr(self.engine, '_cache') and hasattr(self.engine._cache, 'get_enriched_count'):
+                    enriched_count = self.engine._cache.get_enriched_count()
+                    
+                if enriched_count < self._bootstrap_limit:
+                    # Still bootstrapping - use fast intervals
+                    if scenario == DaydreamScenario.FIRST_RUN:
+                        self._vlog(2, "🚀 [Daydream] Bootstrap in progress (%d/%d enriched), quick pause...", 
+                                  enriched_count, self._bootstrap_limit)
+                        await asyncio.sleep(5)  # Quick 5s pause between first-run batches
+                    elif queued_count == 0:
+                        self._vlog(2, "💤 [Daydream] Nothing new, waiting...")
+                        await asyncio.sleep(60)  # 1 min if nothing new (faster during bootstrap)
+                    else:
+                        self._vlog(2, "🌱 [Daydream] Batch processing...")
+                        await asyncio.sleep(30)  # 30s between active batches during bootstrap
                 else:
-                    await asyncio.sleep(60)  # 1 min between active batches
+                    # Bootstrap complete - use normal 30-min intervals
+                    self._vlog(1, "✅ [Daydream] Bootstrap complete (%d enriched), using 30-min intervals", 
+                              enriched_count)
+                    await asyncio.sleep(DAYDREAM_INTERVAL_SECONDS)  # 30 minutes
 
             except asyncio.CancelledError:
                 raise

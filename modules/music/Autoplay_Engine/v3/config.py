@@ -20,6 +20,7 @@ MAX_QUEUE_BACKLOG = 200             # Renamed from DAYDREAM_QUEUE_BACKLOG_LIMIT
 DAYDREAM_QUEUE_BACKLOG_LIMIT = 200  # Pause daydreaming if queue > 200
 DAYDREAM_BATCH_SIZE = 50            # Songs per daydream batch
 BUFFER_TARGET_SIZE = 5              # Apple Music-style 5-song buffer
+BUFFER_FAMILIAR_RATIO = 0.7         # 70% familiar, 30% discovery
 P1_CANDIDATE_LIMIT = 25             # Max candidates for P1 (user waiting)
 P1_TIMEOUT_SECONDS = 10             # Notify user if P1 takes longer
 

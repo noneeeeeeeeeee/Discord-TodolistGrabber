@@ -124,6 +124,14 @@ async def test_scenario_first_run_uses_dataclass_attributes():
     mock_engine._cache.get_enrichment.return_value = {}
     mock_engine.verbose_level = 1
     
+    # Mock track resolver for batch fallback (Phase 2)
+    mock_engine._track_resolver = MagicMock()
+    mock_engine._track_resolver.resolve_batch_to_deezer = AsyncMock(return_value={
+        "resolved": [],
+        "failed": [],
+        "stats": {"phase1_resolved": 0, "phase2_resolved": 0, "total_failed": 0}
+    })
+    
     # Create bootstrap manager
     bootstrap = BootstrapManager(mock_engine)
     
@@ -155,9 +163,9 @@ async def test_scenario_first_run_uses_dataclass_attributes():
             mock_deezer_instance.__aenter__ = AsyncMock(return_value=mock_deezer_instance)
             mock_deezer_instance.__aexit__ = AsyncMock(return_value=None)
             
-            # Return different results for each search
+            # Return different results for each search (now takes single query string)
             search_call_count = 0
-            async def mock_search(artist, title):
+            async def mock_search(query):
                 nonlocal search_call_count
                 if search_call_count < len(mock_deezer_results):
                     result = mock_deezer_results[search_call_count]
@@ -250,6 +258,14 @@ async def test_scenario_daydreaming_uses_dataclass_attributes():
     mock_engine._cache.get_enrichment.return_value = {}
     mock_engine.verbose_level = 1
     
+    # Mock track resolver for batch fallback (Phase 2)
+    mock_engine._track_resolver = MagicMock()
+    mock_engine._track_resolver.resolve_batch_to_deezer = AsyncMock(return_value={
+        "resolved": [],
+        "failed": [],
+        "stats": {"phase1_resolved": 0, "phase2_resolved": 0, "total_failed": 0}
+    })
+    
     bootstrap = BootstrapManager(mock_engine)
     
     # Seed tracks for exploration
@@ -290,7 +306,7 @@ async def test_scenario_daydreaming_uses_dataclass_attributes():
             mock_deezer.__aexit__ = AsyncMock(return_value=None)
             
             result_index = 0
-            async def mock_search(artist, title):
+            async def mock_search(query):
                 nonlocal result_index
                 if result_index < len(mock_deezer_results):
                     track = mock_deezer_results[result_index]

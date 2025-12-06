@@ -1,12 +1,16 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
+
+LOG = logging.getLogger(__name__)
 
 __all__ = [
     "MappingEntry",
@@ -50,6 +54,8 @@ class MappingEntry:
     spam_flags: List[str] = field(default_factory=list)
     search_rank: Optional[int] = None
     heuristic_version: int = 2
+    # V3: Collaborator tracking for recommendation graph expansion
+    collaborators: List[str] = field(default_factory=list)  # Featured/collab artists
 
     def is_expired(self, ttl_seconds: float) -> bool:
         return (time.time() - self.timestamp) > ttl_seconds
@@ -80,6 +86,13 @@ class MappingEntry:
             spam_flags = [str(flag) for flag in spam_flags_raw if str(flag).strip()]
         else:
             spam_flags = []
+
+        # V3: Parse collaborators list
+        collaborators_raw = payload.get("collaborators")
+        if isinstance(collaborators_raw, list):
+            collaborators = [str(c).strip() for c in collaborators_raw if str(c).strip()]
+        else:
+            collaborators = []
 
         return cls(
             youtube_id=str(payload.get("youtube_id", "")),
@@ -124,6 +137,7 @@ class MappingEntry:
             spam_flags=spam_flags,
             search_rank=_safe_int(payload.get("search_rank")),
             heuristic_version=int(payload.get("heuristic_version", 1) or 1),
+            collaborators=collaborators,
         )
 
 
@@ -142,7 +156,8 @@ class EnrichmentEntry:
     fetched_at: float
     
     # Extended metadata for V3 
-    bpm: Optional[int] = None  
+    bpm: Optional[int] = None  # Deezer BPM (fallback if Librosa unavailable)
+    deezer_gain: Optional[float] = None  # Deezer loudness in dB (e.g., -7.2)
     key: Optional[str] = None  
     genres: List[str] = field(default_factory=list)  
     
@@ -224,6 +239,11 @@ class EnrichmentEntry:
             mood=(str(payload["mood"]).strip() if payload.get("mood") else None),
             fetched_at=float(payload.get("fetched_at", 0.0)),
             bpm=(int(payload["bpm"]) if payload.get("bpm") else None),
+            deezer_gain=(
+                float(payload["deezer_gain"])
+                if payload.get("deezer_gain") is not None
+                else None
+            ),
             key=(str(payload["key"]).strip() if payload.get("key") else None),
             genres=genres,
             activity_affinity=(
@@ -413,6 +433,19 @@ class CacheManager:
 
         self._lock = asyncio.Lock()
         self._ingest_lock = threading.Lock()
+        
+        # Per-file locks to prevent concurrent writes on Windows
+        self._file_locks: Dict[str, threading.Lock] = {}
+        self._file_locks_lock = threading.Lock()  # Lock for accessing _file_locks
+        
+        # Async file I/O: debounced background saving
+        self._pending_shard_saves: Set[int] = set()
+        self._pending_mapping_save: bool = False  # Flag for debounced mapping saves
+        self._save_task: Optional[asyncio.Task] = None
+        self._save_debounce_seconds: float = 2.0  # Batch saves within this window
+        
+        # Enrichment completion events: notify waiters when analysis_verified=True
+        self._enrichment_events: Dict[str, asyncio.Event] = {}
     
     # ------------------------------------------------------------------
     # Enrichment cache sharding helpers
@@ -499,12 +532,105 @@ class CacheManager:
         return self._cache_dir / f"{_ENRICHMENT_SHARD_PREFIX}{shard_id}.json"
     
     def _save_enrichment_shard(self, shard_id: int) -> None:
-        """Save a single enrichment shard to disk."""
+        """Schedule a shard save (debounced, non-blocking)."""
+        if shard_id not in self._enrichment_shards:
+            return
+        self._pending_shard_saves.add(shard_id)
+        self._schedule_background_save()
+    
+    def _save_enrichment_shard_sync(self, shard_id: int) -> None:
+        """Synchronously save a single enrichment shard to disk."""
         if shard_id not in self._enrichment_shards:
             return
         shard_data = self._enrichment_shards[shard_id]
         shard_file = self._get_shard_file(shard_id)
         self._save_map(shard_file, shard_data)
+
+    def _schedule_debounced_save(self) -> None:
+        """Alias to schedule the background save task (used by mapping writes)."""
+        self._schedule_background_save()
+    
+    def _schedule_background_save(self) -> None:
+        """Schedule background save task if not already running."""
+        if self._save_task is None or self._save_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+                self._save_task = loop.create_task(self._background_save_loop())
+            except RuntimeError:
+                # No running loop - fall back to sync save
+                self._flush_pending_saves_sync()
+    
+    async def _background_save_loop(self) -> None:
+        """Background task that batches and saves pending shards."""
+        await asyncio.sleep(self._save_debounce_seconds)
+        await self._flush_pending_saves()
+    
+    async def _flush_pending_saves(self) -> None:
+        """Flush all pending saves to disk (non-blocking)."""
+        # Save mapping cache if pending
+        if self._pending_mapping_save:
+            self._pending_mapping_save = False
+            serialized = {key: entry.to_dict() for key, entry in self._mapping_cache.items()}
+            await asyncio.to_thread(self._save_json_sync, self._mapping_file, serialized)
+        
+        # Save enrichment shards
+        if not self._pending_shard_saves:
+            return
+        
+        shards_to_save = list(self._pending_shard_saves)
+        self._pending_shard_saves.clear()
+        
+        # Save shards sequentially to avoid file lock contention
+        for shard_id in shards_to_save:
+            if shard_id in self._enrichment_shards:
+                shard_data = self._enrichment_shards[shard_id]
+                shard_file = self._get_shard_file(shard_id)
+                serialized = {key: entry.to_dict() for key, entry in shard_data.items()}
+                await asyncio.to_thread(self._save_json_sync, shard_file, serialized)
+    
+    def _flush_pending_saves_sync(self) -> None:
+        """Synchronously flush pending saves (fallback when no event loop)."""
+        # Save mapping cache if pending
+        if self._pending_mapping_save:
+            self._pending_mapping_save = False
+            serialized = {key: entry.to_dict() for key, entry in self._mapping_cache.items()}
+            self._save_json_sync(self._mapping_file, serialized)
+        
+        if not self._pending_shard_saves:
+            return
+        shards_to_save = list(self._pending_shard_saves)
+        self._pending_shard_saves.clear()
+        for shard_id in shards_to_save:
+            self._save_enrichment_shard_sync(shard_id)
+    
+    def _get_file_lock(self, file_path: Path) -> threading.Lock:
+        """Get or create a lock for a specific file path."""
+        path_key = str(file_path.resolve())
+        with self._file_locks_lock:
+            if path_key not in self._file_locks:
+                self._file_locks[path_key] = threading.Lock()
+            return self._file_locks[path_key]
+    
+    def _save_json_sync(self, file_path: Path, payload: Dict[str, Any]) -> None:
+        """Synchronous JSON save with per-file locking (for use with asyncio.to_thread)."""
+        file_lock = self._get_file_lock(file_path)
+        # Use unique temp file to avoid collisions between concurrent saves
+        tmp_path = file_path.parent / f"{file_path.stem}_{uuid.uuid4().hex[:8]}.tmp"
+        
+        with file_lock:
+            try:
+                with tmp_path.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle)
+                tmp_path.replace(file_path)
+            except OSError:
+                pass  # File save failed, will retry on next save
+            finally:
+                # Clean up temp file if it still exists
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
     
     def _save_all_enrichment_shards(self) -> None:
         """Save all enrichment shards to disk."""
@@ -522,6 +648,36 @@ class CacheManager:
             combined.update(shard_data)
         return combined
 
+    def get_enriched_count(self) -> int:
+        """
+        Count tracks that have analysis_verified=True (fully enriched).
+        
+        This is used by bootstrap_manager to determine if the 200-track
+        minimum for FIRST_RUN has been met. Unlike counting queued tracks,
+        this counts tracks that have actually been processed by the enrichment
+        pipeline (Gemini tags, audio analysis, etc.).
+        """
+        count = 0
+        for shard_data in self._enrichment_shards.values():
+            for entry in shard_data.values():
+                if entry.analysis_verified:
+                    count += 1
+        return count
+
+    def get_gemini_enriched_count(self) -> int:
+        """
+        Count tracks that have Gemini cultural enrichment (tags populated).
+        
+        This counts tracks where Gemini has provided tags, mood, or activity
+        data - independent of audio analysis status.
+        """
+        count = 0
+        for shard_data in self._enrichment_shards.values():
+            for entry in shard_data.values():
+                if entry.tags and len(entry.tags) > 0:
+                    count += 1
+        return count
+
     # ------------------------------------------------------------------
     # Mapping cache
     # ------------------------------------------------------------------
@@ -536,10 +692,33 @@ class CacheManager:
         return entry
 
     async def set_mapping(self, artist: str, title: str, entry: MappingEntry) -> None:
+        # Validate entry to prevent cache poisoning with None/None values
+        # A valid mapping must have EITHER:
+        # 1. Deezer data (deezer_track_id or preview_url) - for bootstrap/Daydreamer
+        # 2. OR YouTube data (valid youtube_id != placeholder AND title/channel) - for resolved tracks
+        has_deezer_data = bool(entry.deezer_track_id or entry.preview_url)
+        has_youtube_data = (
+            entry.youtube_id 
+            and entry.youtube_id not in ("deezer_preview", "pending", "") 
+            and entry.title
+        )
+        
+        if not has_deezer_data and not has_youtube_data:
+            LOG.warning(
+                "⚠️ [Cache] Rejecting mapping with no valid identifiers: artist='%s', title='%s', "
+                "deezer_id='%s', preview='%s', yt_id='%s', yt_title='%s'",
+                artist, title, entry.deezer_track_id, 
+                entry.preview_url[:30] if entry.preview_url else None,
+                entry.youtube_id, entry.title
+            )
+            return  # Don't cache invalid entries
+        
         key = self._normalize_key(artist, title)
         async with self._lock:
             self._mapping_cache[key] = entry
-            self._save_map(self._mapping_file, self._mapping_cache)
+            # Mark mapping as needing save (debounced with shard saves)
+            self._pending_mapping_save = True
+            self._schedule_debounced_save()
 
     async def delete_mapping(self, artist: str, title: str) -> None:
         key = self._normalize_key(artist, title)
@@ -595,6 +774,89 @@ class CacheManager:
                 # Assign to a shard (creates new if needed)
                 shard_id = self._assign_to_shard(key, entry)
                 self._save_enrichment_shard(shard_id)
+            
+            # Signal completion if analysis is verified
+            if entry.analysis_verified:
+                event = self._enrichment_events.get(key)
+                if event:
+                    event.set()
+
+    async def wait_for_enrichment(
+        self,
+        artist: str,
+        title: str,
+        timeout: float = 30.0,
+    ) -> bool:
+        """
+        Wait for a track's enrichment to complete (analysis_verified=True).
+        
+        This allows the recommender to wait for audio analysis completion
+        instead of polling. Returns True if enrichment completed, False on timeout.
+        
+        Args:
+            artist: Artist name
+            title: Track title
+            timeout: Maximum wait time in seconds
+            
+        Returns:
+            True if enrichment completed, False if timed out
+        """
+        key = self._normalize_key(artist, title)
+        
+        # Check if already verified
+        existing = await self.get_enrichment(artist, title)
+        if existing and existing.analysis_verified:
+            return True
+        
+        # Create/get event for this key
+        async with self._lock:
+            if key not in self._enrichment_events:
+                self._enrichment_events[key] = asyncio.Event()
+            event = self._enrichment_events[key]
+        
+        # Wait for event with timeout
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            # Clean up event
+            async with self._lock:
+                self._enrichment_events.pop(key, None)
+
+    async def wait_for_enrichments(
+        self,
+        tracks: List[tuple],
+        timeout: float = 30.0,
+    ) -> int:
+        """
+        Wait for multiple tracks' enrichments to complete.
+        
+        Args:
+            tracks: List of (artist, title) tuples
+            timeout: Maximum wait time in seconds
+            
+        Returns:
+            Number of tracks that completed enrichment
+        """
+        if not tracks:
+            return 0
+        
+        # Create wait tasks for each track
+        async def wait_one(artist: str, title: str) -> bool:
+            return await self.wait_for_enrichment(artist, title, timeout)
+        
+        results = await asyncio.gather(
+            *[wait_one(a, t) for a, t in tracks],
+            return_exceptions=True
+        )
+        
+        return sum(1 for r in results if r is True)
+
+    async def flush_saves(self) -> None:
+        """Flush all pending saves to disk. Call before shutdown."""
+        await self._flush_pending_saves()
 
     async def delete_enrichment_entry(self, artist: str, title: str) -> None:
         key = self._normalize_key(artist, title)
@@ -895,8 +1157,9 @@ class CacheManager:
         return result
 
     def _save_map(self, file_path: Path, entries: Dict[str, Any]) -> None:
+        """Synchronous map save (used for non-mapping caches like parsing)."""
         serialized = {key: entry.to_dict() for key, entry in entries.items()}
-        self._save_json(file_path, serialized)
+        self._save_json_sync(file_path, serialized)
 
     def _load_collaborative(self) -> Optional[CollaborativeSnapshot]:
         if not self._collab_file.exists():

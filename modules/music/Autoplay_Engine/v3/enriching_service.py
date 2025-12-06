@@ -1,7 +1,10 @@
 """Librosa + EfficientAT MobileNet audio analysis service."""
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -9,6 +12,38 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from .dependency_manager import ensure_model_file
+
+
+@contextlib.contextmanager
+def suppress_c_stderr():
+    """
+    Suppress stderr at the C library level using file descriptor redirection.
+    
+    Python's contextlib.redirect_stderr() only redirects Python-level stderr
+    (sys.stderr). C libraries like mpg123 (used by librosa for MP3 decoding)
+    write directly to file descriptor 2, bypassing Python's sys.stderr.
+    
+    This context manager uses os.dup2() to redirect the actual file descriptor
+    to /dev/null, suppressing all stderr output including from C libraries.
+    """
+    # Save the original stderr file descriptor
+    stderr_fd = sys.stderr.fileno()
+    saved_stderr_fd = os.dup(stderr_fd)
+    
+    try:
+        # Flush Python's stderr before redirecting
+        sys.stderr.flush()
+        
+        # Open /dev/null (or NUL on Windows) and redirect stderr to it
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, stderr_fd)
+        os.close(devnull)
+        
+        yield
+    finally:
+        # Restore the original stderr file descriptor
+        os.dup2(saved_stderr_fd, stderr_fd)
+        os.close(saved_stderr_fd)
 
 try:  # Optional heavy imports
     import torch
@@ -198,49 +233,52 @@ class EnrichingService:
             return AnalysisResult(success=False, error=f"Audio file not found: {audio_path}")
 
         try:
-            librosa = self._import_librosa()
-            audio, sr = librosa.load(str(audio_path), sr=_SAMPLE_RATE, mono=True)
-            
-            # Enhanced Librosa Analysis (Musical Syntax)
-            tempo, loudness, key, mode, chroma, mfcc, centroid, zcr = self._analyze_flow_librosa(audio, sr)
-            
-            simple_vibe = self._compute_simple_vibe(
-                audio, sr, tempo, loudness, key, mode, 
-                centroid=centroid, zcr=zcr
-            )
+            # Suppress mpg123 ID3v2 warnings during audio processing
+            # Uses C-level stderr redirection since mpg123 writes directly to fd 2
+            with suppress_c_stderr():
+                librosa = self._import_librosa()
+                audio, sr = librosa.load(str(audio_path), sr=_SAMPLE_RATE, mono=True)
+                
+                # Enhanced Librosa Analysis (Musical Syntax)
+                tempo, loudness, key, mode, chroma, mfcc, centroid, zcr = self._analyze_flow_librosa(audio, sr)
+                
+                simple_vibe = self._compute_simple_vibe(
+                    audio, sr, tempo, loudness, key, mode, 
+                    centroid=centroid, zcr=zcr
+                )
 
-            if self._analysis_mode == "ml":
-                embedding, model_name, embedding_dim = self._extract_mobile_embedding(audio, sr)
-                result = AnalysisResult(
-                    tempo=tempo,
-                    loudness=loudness,
-                    key=key,
-                    mode=mode,
-                    simple_vibe=simple_vibe,
-                    embedding=embedding,
-                    embedding_model=model_name,
-                    embedding_dim=embedding_dim,
-                    chroma_mean=chroma,
-                    mfcc_mean=mfcc,
-                    spectral_centroid_mean=centroid,
-                    zero_crossing_rate_mean=zcr,
-                    analysis_mode="ml",
-                    success=True,
-                )
-            else:
-                result = AnalysisResult(
-                    tempo=tempo,
-                    loudness=loudness,
-                    key=key,
-                    mode=mode,
-                    simple_vibe=simple_vibe,
-                    chroma_mean=chroma,
-                    mfcc_mean=mfcc,
-                    spectral_centroid_mean=centroid,
-                    zero_crossing_rate_mean=zcr,
-                    analysis_mode="non-ml",
-                    success=True,
-                )
+                if self._analysis_mode == "ml":
+                    embedding, model_name, embedding_dim = self._extract_mobile_embedding(audio, sr)
+                    result = AnalysisResult(
+                        tempo=tempo,
+                        loudness=loudness,
+                        key=key,
+                        mode=mode,
+                        simple_vibe=simple_vibe,
+                        embedding=embedding,
+                        embedding_model=model_name,
+                        embedding_dim=embedding_dim,
+                        chroma_mean=chroma,
+                        mfcc_mean=mfcc,
+                        spectral_centroid_mean=centroid,
+                        zero_crossing_rate_mean=zcr,
+                        analysis_mode="ml",
+                        success=True,
+                    )
+                else:
+                    result = AnalysisResult(
+                        tempo=tempo,
+                        loudness=loudness,
+                        key=key,
+                        mode=mode,
+                        simple_vibe=simple_vibe,
+                        chroma_mean=chroma,
+                        mfcc_mean=mfcc,
+                        spectral_centroid_mean=centroid,
+                        zero_crossing_rate_mean=zcr,
+                        analysis_mode="non-ml",
+                        success=True,
+                    )
 
             if self._verbose:
                 LOG.info(
