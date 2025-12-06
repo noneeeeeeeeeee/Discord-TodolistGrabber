@@ -21,7 +21,6 @@ from .track_resolver import TrackResolver
 from .session_manager import AutoplaySessionManager
 from .bootstrap_manager import BootstrapManager
 
-# V3 Factory Worker Pattern modules
 from .enrichment_worker import EnrichmentWorker, Priority
 
 try:
@@ -92,11 +91,9 @@ class AutoplayEngineV3:
         analysis_workers: int = 3,  # Number of concurrent analysis workers
     ) -> None:
         cache_path = Path(cache_dir)
-        # instance verbosity (0 = off, 1 = debug, 2 = very verbose)
         self._verbose = DEFAULT_VERBOSITY
         if self._verbose:
-            # Configure logging for autoplay V3 modules only (not root logger)
-            # Verbosity 0: WARN+ only, Verbosity 1: INFO+, Verbosity 2: DEBUG+
+            # Configure logging for autoplay V3 modules only 
             autoplay_loggers = [
                 "modules.music.Autoplay_Engine.v3",
                 "modules.music.Autoplay_Engine.v3.autoplayengine_v3",
@@ -183,26 +180,6 @@ class AutoplayEngineV3:
             LOG.warning(f"⚠️ Invalid ANALYSIS_MODE '{analysis_mode}', defaulting to 'ml'")
             analysis_mode = "ml"
         
-        # Validate embedding_model (map legacy identifiers to EfficientAT)
-        legacy_model_aliases = {
-            "panns_mobilenetv2": "mn10_as",
-            "panns_cnn14": "mn10_as",
-            "openl3": "mn10_as",
-        }
-        normalized_model = legacy_model_aliases.get(embedding_model, embedding_model)
-        if normalized_model != embedding_model:
-            LOG.info(
-                "ℹ️ Mapping legacy embedding model '%s' to '%s'",
-                embedding_model,
-                normalized_model,
-            )
-        if normalized_model != "mn10_as":
-            LOG.warning(
-                "⚠️ Unsupported EMBEDDING_MODEL '%s', defaulting to 'mn10_as'",
-                normalized_model,
-            )
-            normalized_model = "mn10_as"
-        embedding_model = normalized_model
         
         # Dependency + ingest helpers
         self._dependency_manager = DependencyManager(model_key=embedding_model)
@@ -279,7 +256,7 @@ class AutoplayEngineV3:
             "avg_duration": 0.0,
             "in_progress": 0,
         }
-        self._last_summary_time = 0.0  # For level 1 periodic summary logs
+        self._last_summary_time = 0.0 
 
         self._restore_persistent_queue()
         
@@ -287,7 +264,7 @@ class AutoplayEngineV3:
             mode_str = f"Non-ML mode (lightweight)" if analysis_mode == "non-ml" else f"ML mode ({embedding_model})"
             LOG.info(f"✅ Audio analysis enabled: {mode_str} with {analysis_workers} workers")
         else:
-            LOG.info("ℹ️ Audio analysis disabled (using Gemini estimates)")
+            LOG.info("ℹ️ Audio analysis disabled using librosa only.")
 
         if not self._lastfm_key:
             LOG.warning(
