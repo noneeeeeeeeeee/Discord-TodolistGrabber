@@ -10,7 +10,7 @@ from typing import Literal, Optional
 
 LOG = logging.getLogger(__name__)
 
-AutoplayVersion = Literal["v1", "v3"]
+AutoplayVersion = Literal["v1", "v3", "v4"]
 
 # ============================================================================
 # CONFIGURATION: Set your autoplay engine version here
