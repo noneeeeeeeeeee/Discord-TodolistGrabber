@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.music.Autoplay_Engine.v3.mappings import MappingManager
+from modules.music.Autoplay_Engine.v3.mappings import MappingsManager
 from modules.music.Autoplay_Engine.v3.constants import V3Config, CacheType
 
 
@@ -47,20 +47,20 @@ class MockCacheManager:
         return f"{cache_type.value}:{key}" in self._cache
 
 
-class TestMappingManagerInitialization:
-    """Tests for MappingManager initialization."""
+class TestMappingsManagerInitialization:
+    """Tests for MappingsManager initialization."""
     
     def test_mapping_manager_creation(self):
         """Verify mapping manager can be created."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         assert manager is not None
     
     @pytest.mark.asyncio
     async def test_initialize(self):
         """Mapping manager should initialize successfully."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         manager._cache_manager = MockCacheManager()
         
         await manager.initialize()
@@ -74,7 +74,7 @@ class TestDeezerToYouTubeMapping:
     def mapping_manager(self):
         """Create mapping manager with mocks."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         manager._cache_manager = MockCacheManager()
         manager._lavalink = MockLavalinkClient()
         return manager
@@ -156,7 +156,7 @@ class TestYouTubeToDeezerMapping:
     def mapping_manager(self):
         """Create mapping manager with mocks."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         manager._cache_manager = MockCacheManager()
         return manager
     
@@ -187,7 +187,7 @@ class TestDeezerToLastFMMapping:
     def mapping_manager(self):
         """Create mapping manager with mocks."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         manager._cache_manager = MockCacheManager()
         return manager
     
@@ -215,7 +215,7 @@ class TestLastFMToDeezerMapping:
     def mapping_manager(self):
         """Create mapping manager with mocks."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         manager._cache_manager = MockCacheManager()
         return manager
     
@@ -249,7 +249,7 @@ class TestFuzzyMatching:
     def mapping_manager(self):
         """Create mapping manager for fuzzy tests."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         return manager
     
     def test_normalize_title(self, mapping_manager):
@@ -292,7 +292,7 @@ class TestBulkMapping:
     def mapping_manager(self):
         """Create mapping manager for bulk tests."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         manager._cache_manager = MockCacheManager()
         manager._lavalink = MockLavalinkClient()
         return manager
@@ -337,7 +337,7 @@ class TestCacheIntegration:
     def mapping_manager(self):
         """Create mapping manager with cache."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         manager._cache_manager = MockCacheManager()
         manager._lavalink = MockLavalinkClient()
         return manager
@@ -400,7 +400,7 @@ class TestErrorHandling:
     def mapping_manager(self):
         """Create mapping manager for error tests."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         manager._cache_manager = MockCacheManager()
         return manager
     
@@ -462,7 +462,7 @@ class TestRateLimiting:
     def mapping_manager(self):
         """Create mapping manager for rate limit tests."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         manager._cache_manager = MockCacheManager()
         manager._lavalink = MockLavalinkClient()
         return manager
@@ -496,7 +496,7 @@ class TestMappingPersistence:
     def mapping_manager(self):
         """Create mapping manager for persistence tests."""
         config = V3Config()
-        manager = MappingManager(config)
+        manager = MappingsManager(config)
         manager._cache_manager = MockCacheManager()
         manager._lavalink = MockLavalinkClient()
         return manager

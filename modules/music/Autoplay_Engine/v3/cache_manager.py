@@ -31,9 +31,9 @@ from .constants import (
     EventType,
     V3Config,
     SongMetadata,
-    AudioFeatures,
-    SemanticFeatures,
-    LibrarianInfo,
+    PhysicsLayer,
+    SemanticsLayer,
+    LibrarianLayer,
 )
 from .event_bus import EventBus, EventPayload
 
@@ -79,8 +79,8 @@ class CacheManager:
         self.config = config or CacheConfig()
         self.event_bus = event_bus or EventBus()
         
-        # Set up paths
-        self.base_path = Path(self.config.cache_directory)
+        # Set up paths - use base_path directly from CacheConfig
+        self.base_path = Path(self.config.base_path)
         self.mappings_path = self.base_path / "mappings"
         self.metadata_path = self.base_path / "metadata"
         self.recovery_path = self.base_path / "recovery"
@@ -723,15 +723,15 @@ class CacheManager:
         """Convert stored dictionary back to SongMetadata dataclass."""
         audio_features = None
         if data.get("audio_features"):
-            audio_features = AudioFeatures(**data["audio_features"])
+            audio_features = PhysicsLayer(**data["audio_features"])
         
         semantic_features = None
         if data.get("semantic_features"):
-            semantic_features = SemanticFeatures(**data["semantic_features"])
+            semantic_features = SemanticsLayer(**data["semantic_features"])
         
         librarian_info = None
         if data.get("librarian_info"):
-            librarian_info = LibrarianInfo(**data["librarian_info"])
+            librarian_info = LibrarianLayer(**data["librarian_info"])
         
         return SongMetadata(
             song_id=data["song_id"],

@@ -93,7 +93,7 @@ class TestEventTypeEnum:
     def test_analysis_events_exist(self):
         """Verify analysis-related events are defined."""
         assert hasattr(EventType, 'ANALYSIS_REQUESTED')
-        assert hasattr(EventType, 'ANALYSIS_COMPLETED')
+        assert hasattr(EventType, 'SONG_ANALYZED')
 
 
 class TestAnalysisModeEnum:

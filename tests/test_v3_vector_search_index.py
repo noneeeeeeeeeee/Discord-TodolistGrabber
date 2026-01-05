@@ -450,7 +450,7 @@ class TestVectorSearcherIntegration:
     
     @pytest.mark.asyncio
     async def test_event_subscription(self):
-        """Should subscribe to ANALYSIS_COMPLETE events."""
+        """Should subscribe to SONG_ANALYZED events."""
         searcher = VectorSearcher()
         
         mock_cache = MagicMock()
@@ -464,5 +464,5 @@ class TestVectorSearcherIntegration:
         
         await searcher.initialize()
         
-        # Should have subscribed to ANALYSIS_COMPLETE
+        # Should have subscribed to SONG_ANALYZED
         mock_bus.subscribe.assert_called()

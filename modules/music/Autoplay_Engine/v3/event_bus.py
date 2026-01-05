@@ -13,13 +13,13 @@ from datetime import datetime
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 from weakref import WeakSet
 
-from .constants import EventType
+from .constants import EventType, AnalysisPriority
 
 LOG = logging.getLogger(__name__)
 
 
 @dataclass
-class Event:
+class EventPayload:
     """Represents an event in the system."""
     event_type: EventType
     data: Dict[str, Any] = field(default_factory=dict)
@@ -33,8 +33,8 @@ class Event:
             self.priority = 0
 
 
-# EventPayload is the preferred way to create events
-EventPayload = Event
+# Event is an alias for EventPayload for any code using the old name
+Event = EventPayload
 
 # Type alias for event handlers
 EventHandler = Callable[[Event], Coroutine[Any, Any, None]]

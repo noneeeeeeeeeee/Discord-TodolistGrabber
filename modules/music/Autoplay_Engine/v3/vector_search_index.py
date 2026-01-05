@@ -203,8 +203,8 @@ class VectorSearcher:
         
         # Subscribe to analysis events (subscribe is synchronous)
         self.event_bus.subscribe(
-            EventType.ANALYSIS_COMPLETE,
-            self._on_analysis_complete
+            EventType.SONG_ANALYZED,
+            self._on_song_analyzed
         )
         
         # Build initial index from cache
@@ -219,8 +219,8 @@ class VectorSearcher:
     async def shutdown(self) -> None:
         """Clean up."""
         self.event_bus.unsubscribe(
-            EventType.ANALYSIS_COMPLETE,
-            self._on_analysis_complete
+            EventType.SONG_ANALYZED,
+            self._on_song_analyzed
         )
         self._initialized = False
     
@@ -242,7 +242,7 @@ class VectorSearcher:
         self._song_count = count
         self._active = True
     
-    async def _on_analysis_complete(self, payload: EventPayload) -> None:
+    async def _on_song_analyzed(self, payload: EventPayload) -> None:
         """Handle song analysis completion."""
         song_id = payload.data.get("song_id")
         if not song_id:
@@ -574,3 +574,7 @@ def get_vector_searcher() -> VectorSearcher:
         _vector_searcher = VectorSearcher()
     return _vector_searcher
 
+
+# Backwards compatibility aliases (deprecated)
+CollaborativeFilterer = VectorSearcher
+get_collaborative_filterer = get_vector_searcher

@@ -28,12 +28,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
-from .constants import EventType, SessionState, V3Config
+from .constants import AnalysisPriority, EventType, SessionState, V3Config
 from .event_bus import EventBus, EventPayload
 from .mappings import SongIdentifier
 from .recommender import Recommendation, Recommender, get_recommender
 from .session_manager import SessionManager, get_session_manager
-from .song_analyzer import AnalysisPriority, SongAnalyzer, get_song_analyzer
+from .song_analyzer import SongAnalyzer, get_song_analyzer
 
 logger = logging.getLogger(__name__)
 

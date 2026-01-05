@@ -59,7 +59,7 @@ class TestEventPayload:
     def test_payload_without_session_id(self):
         """Payload should work without session ID."""
         payload = EventPayload(
-            event_type=EventType.ANALYSIS_COMPLETED,
+            event_type=EventType.SONG_ANALYZED,
             data={},
             source='test'
         )
@@ -93,7 +93,7 @@ class TestEventBusSubscription:
     def event_bus(self):
         """Create a fresh event bus for each test."""
         bus = EventBus()
-        bus._subscribers = {}  # Reset subscribers
+        bus.reset()  # Reset subscribers
         return bus
     
     def test_subscribe_to_event(self, event_bus):
@@ -101,8 +101,8 @@ class TestEventBusSubscription:
         callback = AsyncMock()
         event_bus.subscribe(EventType.SONG_STARTED, callback)
         
-        assert EventType.SONG_STARTED in event_bus._subscribers
-        assert callback in event_bus._subscribers[EventType.SONG_STARTED]
+        assert EventType.SONG_STARTED in event_bus._handlers
+        assert callback in event_bus._handlers[EventType.SONG_STARTED]
     
     def test_subscribe_multiple_callbacks(self, event_bus):
         """Multiple callbacks can subscribe to the same event."""
@@ -112,7 +112,7 @@ class TestEventBusSubscription:
         event_bus.subscribe(EventType.SONG_SKIPPED, callback1)
         event_bus.subscribe(EventType.SONG_SKIPPED, callback2)
         
-        assert len(event_bus._subscribers[EventType.SONG_SKIPPED]) == 2
+        assert len(event_bus._handlers[EventType.SONG_SKIPPED]) == 2
     
     def test_unsubscribe_from_event(self, event_bus):
         """Should be able to unsubscribe a callback."""
@@ -120,7 +120,7 @@ class TestEventBusSubscription:
         event_bus.subscribe(EventType.BUFFER_LOW, callback)
         event_bus.unsubscribe(EventType.BUFFER_LOW, callback)
         
-        assert callback not in event_bus._subscribers.get(EventType.BUFFER_LOW, [])
+        assert callback not in event_bus._handlers.get(EventType.BUFFER_LOW, [])
     
     def test_unsubscribe_nonexistent_callback(self, event_bus):
         """Unsubscribing non-existent callback should not raise."""
@@ -136,7 +136,7 @@ class TestEventBusPublish:
     def event_bus(self):
         """Create a fresh event bus for each test."""
         bus = EventBus()
-        bus._subscribers = {}
+        bus.reset()
         return bus
     
     @pytest.mark.asyncio
@@ -178,7 +178,7 @@ class TestEventBusPublish:
         assert received_payload.data['completed'] is True
     
     @pytest.mark.asyncio
-    async def test_publish_calls_all_subscribers(self, event_bus):
+    async def test_publish_calls_all_handlers(self, event_bus):
         """Publishing should call all subscribed callbacks."""
         call_count = 0
         
@@ -248,8 +248,8 @@ class TestEventBusTopics:
     def event_bus(self):
         """Create a fresh event bus for each test."""
         bus = EventBus()
-        bus._subscribers = {}
-        bus._topic_subscribers = {}
+        bus.reset()
+        bus._topic_handlers = {}
         return bus
     
     def test_subscribe_to_topic(self, event_bus):
@@ -258,7 +258,7 @@ class TestEventBusTopics:
         
         if hasattr(event_bus, 'subscribe_topic'):
             event_bus.subscribe_topic('session.123', callback)
-            assert 'session.123' in event_bus._topic_subscribers
+            assert 'session.123' in event_bus._topic_handlers
     
     @pytest.mark.asyncio
     async def test_publish_to_topic(self, event_bus):
@@ -290,7 +290,7 @@ class TestEventBusAsync:
     def event_bus(self):
         """Create a fresh event bus for each test."""
         bus = EventBus()
-        bus._subscribers = {}
+        bus.reset()
         return bus
     
     @pytest.mark.asyncio
@@ -336,10 +336,10 @@ class TestEventBusCleanup:
     def event_bus(self):
         """Create a fresh event bus for each test."""
         bus = EventBus()
-        bus._subscribers = {}
+        bus.reset()
         return bus
     
-    def test_clear_all_subscribers(self, event_bus):
+    def test_clear_all_handlers(self, event_bus):
         """Should be able to clear all subscribers."""
         callback = AsyncMock()
         event_bus.subscribe(EventType.SONG_STARTED, callback)
@@ -347,7 +347,7 @@ class TestEventBusCleanup:
         
         if hasattr(event_bus, 'clear'):
             event_bus.clear()
-            assert len(event_bus._subscribers) == 0
+            assert len(event_bus._handlers) == 0
     
     def test_clear_specific_event(self, event_bus):
         """Should be able to clear subscribers for specific event."""
@@ -357,8 +357,8 @@ class TestEventBusCleanup:
         
         if hasattr(event_bus, 'clear_event'):
             event_bus.clear_event(EventType.SONG_STARTED)
-            assert EventType.SONG_STARTED not in event_bus._subscribers
-            assert EventType.SONG_ENDED in event_bus._subscribers
+            assert EventType.SONG_STARTED not in event_bus._handlers
+            assert EventType.SONG_ENDED in event_bus._handlers
     
     def test_subscriber_count(self, event_bus):
         """Should be able to get subscriber count."""

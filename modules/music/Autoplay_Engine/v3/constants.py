@@ -100,8 +100,16 @@ class CacheType(Enum):
             return SessionState.HOT
 
 
-# AnalysisPriority is defined in song_analyzer.py
-# Use: from .song_analyzer import AnalysisPriority
+class AnalysisPriority(Enum):
+    """Priority levels for song analysis queue.
+    
+    Lower values = higher priority. Used for priority queue ordering.
+    """
+    IMMEDIATE = 0  # Currently playing or about to play
+    HIGH = 1       # In buffer (next 5 songs)
+    MEDIUM = 2     # In extended queue
+    LOW = 3        # Background/daydreamer exploration
+    BATCH = 4      # Bulk analysis during idle
 
 
 class AnalysisMode(Enum):
@@ -176,6 +184,7 @@ class EventType(Enum):
     
     # System events
     RATE_LIMIT_HIT = auto()
+    CACHE_LOADED = auto()
     CACHE_UPDATED = auto()
     
     # User feedback events
@@ -465,6 +474,9 @@ class LibrarianLayer:
     cultural_vibe: List[str]
     micro_genre: List[str]
     explicit_content: bool
+
+
+# Primary type names for the three analysis layers
 
 
 @dataclass

@@ -99,8 +99,8 @@ class SessionManager:
         self._sessions: dict[str, SessionData] = {}
         self._guild_to_session: dict[str, str] = {}
         
-        # Persistence
-        self._sessions_dir = Path(self.config.cache_directory) / "sessions"
+        # Persistence - use cache.base_path from config
+        self._sessions_dir = Path(self.config.cache.base_path) / "sessions"
         
         # Lock for concurrent access
         self._lock = asyncio.Lock()

@@ -526,7 +526,7 @@ For canonical_title, provide the official/standardized title if different from t
         
         # Publish batch completion event
         await self.event_bus.publish(EventPayload(
-            event_type=EventType.ANALYSIS_COMPLETE,
+            event_type=EventType.SONG_ANALYZED,
             data={
                 "batch_size": len(songs),
                 "successes": sum(1 for r in results if r.success),

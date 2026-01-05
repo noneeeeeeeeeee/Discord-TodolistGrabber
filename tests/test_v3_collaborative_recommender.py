@@ -458,22 +458,24 @@ class TestTransitionMatrixRecording:
             play_through_rate=0.9
         )
         
-        # Should have recorded the transition
-        score = matrix.get_transition_score("song_a", "song_b")
-        assert score is not None
+        # Should have recorded the transition - access internal _transitions
+        assert "song_a" in matrix._transitions
+        assert "song_b" in matrix._transitions["song_a"]
+        record = matrix._transitions["song_a"]["song_b"]
+        assert record.transition_score > 0
     
     def test_multiple_transitions_accumulate(self, matrix):
         """Multiple transitions should accumulate."""
+        # Use unique song IDs to avoid interference from other tests
         for _ in range(5):
             matrix.record_transition(
-                from_song_id="song_a",
-                to_song_id="song_b",
+                from_song_id="accum_x",
+                to_song_id="accum_y",
                 play_through_rate=0.9
             )
         
-        record = matrix.get_transition("song_a", "song_b")
-        if record:
-            assert record.count == 5
+        record = matrix._transitions["accum_x"]["accum_y"]
+        assert record.count == 5
     
     def test_like_recorded(self, matrix):
         """Should record explicit likes on transitions."""
@@ -481,12 +483,11 @@ class TestTransitionMatrixRecording:
             from_song_id="song_a",
             to_song_id="song_b",
             play_through_rate=0.8,
-            explicit_like=True
+            was_liked=True
         )
         
-        record = matrix.get_transition("song_a", "song_b")
-        if record:
-            assert record.explicit_likes >= 1
+        record = matrix._transitions["song_a"]["song_b"]
+        assert record.explicit_likes >= 1
     
     def test_skip_recorded(self, matrix):
         """Should record skips on transitions."""
@@ -497,9 +498,8 @@ class TestTransitionMatrixRecording:
             was_skipped=True
         )
         
-        record = matrix.get_transition("song_a", "song_b")
-        if record:
-            assert record.skip_count >= 1
+        record = matrix._transitions["song_a"]["song_b"]
+        assert record.skip_count >= 1
 
 
 class TestTransitionMatrixLookup:
@@ -520,7 +520,7 @@ class TestTransitionMatrixLookup:
         
         # A -> D (liked transition)
         for _ in range(3):
-            matrix.record_transition("a", "d", 0.9, explicit_like=True)
+            matrix.record_transition("a", "d", 0.9, was_liked=True)
         
         return matrix
     
@@ -532,11 +532,12 @@ class TestTransitionMatrixLookup:
     
     def test_good_transitions_scored_higher(self, populated_matrix):
         """Good transitions should have higher scores."""
-        score_b = populated_matrix.get_transition_score("a", "b") or 0
-        score_c = populated_matrix.get_transition_score("a", "c") or 0
+        # Access scores via internal _transitions dict
+        record_b = populated_matrix._transitions["a"]["b"]
+        record_c = populated_matrix._transitions["a"]["c"]
         
         # B should score higher (good play-through, no skips)
-        assert score_b > score_c
+        assert record_b.transition_score > record_c.transition_score
 
 
 # ============================================================================
@@ -577,28 +578,31 @@ class TestCollaborativeRecommenderBehavioralBoost:
         """Create initialized recommender."""
         return CollaborativeRecommender()
     
-    def test_boost_from_transition_matrix(self, recommender):
-        """Should boost based on transition history."""
-        # Setup: Record good transition
-        recommender._matrix.record_transition("song_a", "song_b", 0.95)
-        recommender._matrix.record_transition("song_a", "song_b", 0.95)
-        recommender._matrix.record_transition("song_a", "song_b", 0.95)
+    @pytest.mark.asyncio
+    async def test_boost_from_transition_matrix(self, recommender):
+        """Should boost based on transition history and user profiles."""
+        # Setup: Add a user profile with liked song
+        profile = recommender.get_or_create_profile(12345)
+        profile.liked_songs.add("song_b")
         
         if hasattr(recommender, 'get_behavioral_boost'):
-            boost = recommender.get_behavioral_boost(
-                current_song="song_a",
-                candidate_song="song_b"
+            boost = await recommender.get_behavioral_boost(
+                song_id="song_b",
+                user_ids=[12345]
             )
-            assert boost > 0
+            # Liked song gets boost (1.0 + 0.3 = 1.3)
+            assert boost > 1.0
     
-    def test_no_boost_for_unknown_transition(self, recommender):
-        """Unknown transitions should have no boost."""
+    @pytest.mark.asyncio
+    async def test_no_boost_for_unknown_transition(self, recommender):
+        """Unknown users/songs should have neutral boost."""
         if hasattr(recommender, 'get_behavioral_boost'):
-            boost = recommender.get_behavioral_boost(
-                current_song="unknown_a",
-                candidate_song="unknown_b"
+            boost = await recommender.get_behavioral_boost(
+                song_id="unknown_song",
+                user_ids=[99999]  # Unknown user
             )
-            assert boost == 0 or boost is None
+            # Neutral boost is 1.0
+            assert boost == 1.0
 
 
 class TestCollaborativeRecommenderGroupSession:
@@ -638,7 +642,7 @@ class TestCollaborativeRecommenderRecommendations:
         
         # Simulate training data
         for i in range(20):
-            recommender._matrix.record_transition(f"song_{i}", f"song_{i+1}", 0.9)
+            recommender.transition_matrix.record_transition(f"song_{i}", f"song_{i+1}", 0.9)
         
         return recommender
     
@@ -718,16 +722,15 @@ class TestCollaborativeRecommenderIntegration:
         await recommender.initialize()
         
         # Simulate user behavior
-        recommender._matrix.record_transition("song_1", "song_2", 0.95)
-        recommender._matrix.record_transition("song_2", "song_3", 0.85)
-        recommender._matrix.record_transition("song_2", "song_4", 0.20, was_skipped=True)
+        recommender.transition_matrix.record_transition("song_1", "song_2", 0.95)
+        recommender.transition_matrix.record_transition("song_2", "song_3", 0.85)
+        recommender.transition_matrix.record_transition("song_2", "song_4", 0.20, was_skipped=True)
         
-        # Verify transition scores
-        good_score = recommender._matrix.get_transition_score("song_1", "song_2")
-        bad_score = recommender._matrix.get_transition_score("song_2", "song_4")
+        # Verify transition scores via internal _transitions dict
+        record_good = recommender.transition_matrix._transitions["song_2"]["song_3"]
+        record_bad = recommender.transition_matrix._transitions["song_2"]["song_4"]
         
-        if good_score is not None and bad_score is not None:
-            assert good_score > bad_score
+        assert record_good.transition_score > record_bad.transition_score
         
         # Cleanup
         if hasattr(recommender, 'shutdown'):
@@ -765,8 +768,9 @@ class TestEdgeCases:
     def test_empty_transition_matrix_lookup(self):
         """Lookup on empty matrix should not crash."""
         matrix = TransitionMatrix()
-        score = matrix.get_transition_score("any", "song")
-        # Should return None or 0, not crash
+        # get_best_transitions returns empty list for unknown song
+        result = matrix.get_best_transitions("any", k=5)
+        assert result == []  # Should return empty list, not crash
     
     def test_empty_consensus_aggregation(self):
         """Aggregation on empty consensus should not crash."""

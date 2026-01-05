@@ -21,10 +21,10 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from .cache_manager import CacheManager, get_cache_manager
-from .constants import AnalysisMode, EventType, SongMetadata, V3Config
+from .constants import AnalysisMode, AnalysisPriority, EventType, SongMetadata, V3Config
 from .event_bus import EventBus, EventPayload
 from .mappings import MappingsManager, SongIdentifier, get_mappings_manager
-from .song_analyzer import AnalysisPriority, SongAnalyzer, get_song_analyzer
+from .song_analyzer import SongAnalyzer, get_song_analyzer
 
 logger = logging.getLogger(__name__)
 

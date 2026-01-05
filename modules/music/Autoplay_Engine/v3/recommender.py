@@ -21,13 +21,13 @@ from typing import Any, Optional
 from .cache_manager import CacheManager, get_cache_manager
 from .vector_search_index import VectorSearcher, get_vector_searcher
 from .collaborative_recommender import CollaborativeRecommender, get_collaborative_recommender
-from .constants import EventType, SessionState, SongMetadata, V3Config
+from .constants import AnalysisPriority, EventType, SessionState, SongMetadata, V3Config
 from .context_analyzer import ContextAnalyzer, get_context_analyzer
 from .event_bus import EventBus, EventPayload
 from .gemini_manager import GeminiManager, get_gemini_manager
 from .mappings import MappingsManager, SongIdentifier, get_mappings_manager
 from .novelty_controller import NoveltyController, NoveltyNudge, get_novelty_controller
-from .song_analyzer import AnalysisPriority, SongAnalyzer, get_song_analyzer
+from .song_analyzer import SongAnalyzer, get_song_analyzer
 
 logger = logging.getLogger(__name__)
 

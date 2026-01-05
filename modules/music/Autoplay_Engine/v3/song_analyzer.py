@@ -32,9 +32,10 @@ from .cache_manager import CacheManager, get_cache_manager
 from .constants import (
     ANALYZER_CONFIG,
     AnalysisMode,
+    AnalysisPriority,
+    PhysicsLayer,
     EventType,
     LibrarianLayer,
-    PhysicsLayer,
     SemanticsLayer,
     SongMetadata,
     V3Config,
@@ -44,15 +45,6 @@ from .gemini_manager import GeminiManager, get_gemini_manager
 from .mappings import MappingsManager, SongIdentifier, get_mappings_manager
 
 logger = logging.getLogger(__name__)
-
-
-class AnalysisPriority(Enum):
-    """Priority levels for analysis queue."""
-    IMMEDIATE = 0  # Currently playing or about to play
-    HIGH = 1       # In buffer (next 5 songs)
-    MEDIUM = 2     # In extended queue
-    LOW = 3        # Background/daydreamer exploration
-    BATCH = 4      # Bulk analysis during idle
 
 
 @dataclass
@@ -149,7 +141,7 @@ class SongAnalyzer:
         self._efficientat_labels = None
         
         # Gemini bulk processing queue
-        self._gemini_batch: list[tuple[AnalysisTask, AudioFeatures, Optional[SemanticFeatures]]] = []
+        self._gemini_batch: list[tuple[AnalysisTask, PhysicsLayer, Optional[SemanticsLayer]]] = []
         self._gemini_batch_lock = asyncio.Lock()
         self._gemini_batch_event = asyncio.Event()
         self._gemini_worker_task: Optional[asyncio.Task] = None
@@ -433,7 +425,7 @@ class SongAnalyzer:
             
             # Publish completion event
             await self.event_bus.publish(EventPayload(
-                event_type=EventType.ANALYSIS_COMPLETE,
+                event_type=EventType.SONG_ANALYZED,
                 data={
                     "song_id": task.song_id,
                     "title": task.identifier.title,
@@ -513,7 +505,7 @@ class SongAnalyzer:
             logger.error(f"Preview download failed: {e}")
             return None
     
-    async def _analyze_physics(self, audio_path: Path) -> AudioFeatures:
+    async def _analyze_physics(self, audio_path: Path) -> PhysicsLayer:
         """
         Run Librosa analysis for physics layer via worker pool.
         
@@ -524,7 +516,7 @@ class SongAnalyzer:
             import librosa
         except ImportError:
             logger.warning("Librosa not installed, using placeholder values")
-            return AudioFeatures(
+            return PhysicsLayer(
                 bpm=120.0,
                 key="C",
                 mode="major",
@@ -542,7 +534,7 @@ class SongAnalyzer:
             audio_path
         )
     
-    def _librosa_analysis(self, audio_path: Path) -> AudioFeatures:
+    def _librosa_analysis(self, audio_path: Path) -> PhysicsLayer:
         """Synchronous Librosa analysis (runs in thread pool)."""
         import librosa
         
@@ -582,7 +574,7 @@ class SongAnalyzer:
         # Zero crossing rate (percussiveness indicator)
         zcr = librosa.feature.zero_crossing_rate(y)[0]
         
-        return AudioFeatures(
+        return PhysicsLayer(
             bpm=bpm,
             key=key,
             mode=mode,
@@ -594,7 +586,7 @@ class SongAnalyzer:
             zero_crossing_rate=float(np.mean(zcr))
         )
     
-    async def _analyze_semantics(self, audio_path: Path) -> SemanticFeatures:
+    async def _analyze_semantics(self, audio_path: Path) -> SemanticsLayer:
         """
         Run EfficientAT analysis for semantics layer via worker pool.
         
@@ -605,7 +597,7 @@ class SongAnalyzer:
         
         if model is None:
             logger.warning("EfficientAT not available, using placeholder")
-            return SemanticFeatures(
+            return SemanticsLayer(
                 embedding=[0.0] * 128,
                 instrument_tags=["unknown"],
                 sound_tags=["music"],
@@ -654,7 +646,7 @@ class SongAnalyzer:
         self,
         audio_path: Path,
         model
-    ) -> SemanticFeatures:
+    ) -> SemanticsLayer:
         """Run EfficientAT inference (synchronous, runs in thread pool)."""
         # This is a placeholder implementation
         # Actual implementation would:
@@ -662,7 +654,7 @@ class SongAnalyzer:
         # 2. Run inference to get embeddings and tags
         # 3. Post-process outputs
         
-        return SemanticFeatures(
+        return SemanticsLayer(
             embedding=[0.0] * 128,
             instrument_tags=["placeholder"],
             sound_tags=["music"],
@@ -672,9 +664,9 @@ class SongAnalyzer:
     async def _analyze_librarian(
         self,
         identifier: SongIdentifier,
-        audio_features: AudioFeatures,
-        semantic_features: Optional[SemanticFeatures]
-    ) -> Optional[LibrarianInfo]:
+        audio_features: PhysicsLayer,
+        semantic_features: Optional[SemanticsLayer]
+    ) -> Optional[LibrarianLayer]:
         """
         Run Gemini analysis for librarian layer.
         
@@ -712,7 +704,7 @@ class SongAnalyzer:
         
         data = response.data
         
-        return LibrarianInfo(
+        return LibrarianLayer(
             genres=data.get("genres", []),
             moods=data.get("moods", []),
             themes=data.get("themes", []),
@@ -728,8 +720,8 @@ class SongAnalyzer:
     async def _queue_for_gemini_batch(
         self,
         task: AnalysisTask,
-        audio_features: AudioFeatures,
-        semantic_features: Optional[SemanticFeatures]
+        audio_features: PhysicsLayer,
+        semantic_features: Optional[SemanticsLayer]
     ) -> None:
         """
         Queue a song for bulk Gemini processing.
@@ -789,7 +781,7 @@ class SongAnalyzer:
     
     async def _process_gemini_batch(
         self,
-        batch: list[tuple[AnalysisTask, AudioFeatures, Optional[SemanticFeatures]]]
+        batch: list[tuple[AnalysisTask, PhysicsLayer, Optional[SemanticsLayer]]]
     ) -> None:
         """
         Process a batch of songs through Gemini in a single bulk request.

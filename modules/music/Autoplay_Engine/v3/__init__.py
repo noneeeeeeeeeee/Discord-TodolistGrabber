@@ -94,6 +94,7 @@ from .vector_search_index import VectorSearcher, get_vector_searcher
 from .collaborative_recommender import CollaborativeRecommender, get_collaborative_recommender
 from .constants import (
     AnalysisMode,
+    AnalysisPriority,
     CacheConfig,
     CacheType,
     EventType,
@@ -109,7 +110,7 @@ from .mappings import MappingsManager, SongIdentifier, get_mappings_manager
 from .novelty_controller import NoveltyController, get_novelty_controller
 from .recommender import Recommendation, Recommender, get_recommender
 from .session_manager import SessionData, SessionManager, get_session_manager
-from .song_analyzer import AnalysisPriority, SongAnalyzer, get_song_analyzer
+from .song_analyzer import SongAnalyzer, get_song_analyzer
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,7 @@ __version__ = "3.0.0"
 __all__ = [
     # Main engine
     "V3Engine",
+    "AutoplayV3",  
     "get_v3_engine",
     
     # Configuration
@@ -515,3 +517,6 @@ def get_v3_engine() -> V3Engine:
     if _v3_engine is None:
         _v3_engine = V3Engine()
     return _v3_engine
+
+
+AutoplayV3 = V3Engine

@@ -173,12 +173,12 @@ class ContextAnalyzer:
         
         # Subscribe to playback events (subscribe is synchronous)
         self.event_bus.subscribe(
-            EventType.TRACK_PLAYED,
-            self._on_track_played
+            EventType.SONG_PLAYED,
+            self._on_SONG_PLAYED
         )
         self.event_bus.subscribe(
-            EventType.TRACK_SKIPPED,
-            self._on_track_skipped
+            EventType.SONG_SKIPPED,
+            self._on_SONG_SKIPPED
         )
         
         self._initialized = True
@@ -187,12 +187,12 @@ class ContextAnalyzer:
     async def shutdown(self) -> None:
         """Clean up subscriptions."""
         self.event_bus.unsubscribe(
-            EventType.TRACK_PLAYED,
-            self._on_track_played
+            EventType.SONG_PLAYED,
+            self._on_SONG_PLAYED
         )
         self.event_bus.unsubscribe(
-            EventType.TRACK_SKIPPED,
-            self._on_track_skipped
+            EventType.SONG_SKIPPED,
+            self._on_SONG_SKIPPED
         )
         
         self._initialized = False
@@ -293,7 +293,7 @@ class ContextAnalyzer:
         await self._update_preferences(session, song_id, was_skipped, event)
         
         # Publish event
-        event_type = EventType.TRACK_SKIPPED if was_skipped else EventType.TRACK_PLAYED
+        event_type = EventType.SONG_SKIPPED if was_skipped else EventType.SONG_PLAYED
         await self.event_bus.publish(EventPayload(
             event_type=event_type,
             data={
@@ -437,12 +437,12 @@ class ContextAnalyzer:
         else:
             pref.play_count += 1
     
-    async def _on_track_played(self, payload: EventPayload) -> None:
+    async def _on_SONG_PLAYED(self, payload: EventPayload) -> None:
         """Handle track played event."""
         # Events handled in record_playback, this is for external events
         pass
     
-    async def _on_track_skipped(self, payload: EventPayload) -> None:
+    async def _on_SONG_SKIPPED(self, payload: EventPayload) -> None:
         """Handle track skipped event."""
         # Events handled in record_playback, this is for external events
         pass

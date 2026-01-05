@@ -121,8 +121,8 @@ class NoveltyController:
         
         # Subscribe to track events (subscribe is synchronous)
         self.event_bus.subscribe(
-            EventType.TRACK_PLAYED,
-            self._on_track_played
+            EventType.SONG_PLAYED,
+            self._on_SONG_PLAYED
         )
         
         self._initialized = True
@@ -131,8 +131,8 @@ class NoveltyController:
     async def shutdown(self) -> None:
         """Clean up."""
         self.event_bus.unsubscribe(
-            EventType.TRACK_PLAYED,
-            self._on_track_played
+            EventType.SONG_PLAYED,
+            self._on_SONG_PLAYED
         )
         self._initialized = False
     
@@ -218,7 +218,7 @@ class NoveltyController:
                 metrics.same_genre_streak = 1
             metrics.last_genre = primary_genre
     
-    async def _on_track_played(self, payload: EventPayload) -> None:
+    async def _on_SONG_PLAYED(self, payload: EventPayload) -> None:
         """Handle track played event from event bus."""
         # This is handled externally via record_played
         pass
