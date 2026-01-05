@@ -464,18 +464,22 @@ class TestTransitionMatrixRecording:
         record = matrix._transitions["song_a"]["song_b"]
         assert record.transition_score > 0
     
-    def test_multiple_transitions_accumulate(self, matrix):
+    def test_multiple_transitions_accumulate(self):
         """Multiple transitions should accumulate."""
-        # Use unique song IDs to avoid interference from other tests
-        for _ in range(5):
-            matrix.record_transition(
-                from_song_id="accum_x",
-                to_song_id="accum_y",
-                play_through_rate=0.9
-            )
-        
-        record = matrix._transitions["accum_x"]["accum_y"]
-        assert record.count == 5
+        import tempfile
+        from pathlib import Path
+        # Create fresh matrix with isolated storage to ensure no interference
+        with tempfile.TemporaryDirectory() as tmpdir:
+            matrix = TransitionMatrix(storage_path=Path(tmpdir) / "test_matrix.json")
+            for _ in range(5):
+                matrix.record_transition(
+                    from_song_id="accum_x",
+                    to_song_id="accum_y",
+                    play_through_rate=0.9
+                )
+            
+            record = matrix._transitions["accum_x"]["accum_y"]
+            assert record.count == 5
     
     def test_like_recorded(self, matrix):
         """Should record explicit likes on transitions."""

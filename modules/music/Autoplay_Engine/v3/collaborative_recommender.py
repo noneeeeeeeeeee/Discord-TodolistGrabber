@@ -53,7 +53,7 @@ class TransitionRecord:
     """Records a transition between two songs."""
     from_song_id: str
     to_song_id: str
-    count: int = 1
+    count: int = 0  # Starts at 0, incremented on each call to record_transition
     total_play_through: float = 0.0  # Sum of play-through rates
     explicit_likes: int = 0          # "More Like This" clicks on transition
     skip_count: int = 0              # Times to_song was skipped after from_song
