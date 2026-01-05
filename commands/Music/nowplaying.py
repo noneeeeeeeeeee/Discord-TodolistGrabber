@@ -545,9 +545,10 @@ class PlayerControlView(View):
         self._active_track_key: Optional[str] = self._current_track_key()
 
         # Add feedback buttons if V2+ autoplay is enabled
+        # Note: V3 removes "Less Like This" button - dislikes are tracked via skip behavior
         if player.supports_feedback_buttons():
             self.add_item(self.more_like_this_button_item())
-            self.add_item(self.less_like_this_button_item())
+            # Less Like This removed in V3 - consecutive skips handle negative feedback
             # Add "Low Quality" button for autoplay tracks only
             self.add_item(self.low_quality_button_item())
 
@@ -808,7 +809,16 @@ class PlayerControlView(View):
         return button
 
     def less_like_this_button_item(self):
-        """Factory method for Less Like This button (V2+)"""
+        """
+        Factory method for Less Like This button (V2 only - DEPRECATED in V3).
+        
+        V3 handles negative feedback through consecutive skip detection instead
+        of explicit "Less Like This" button presses. This provides more natural
+        feedback without requiring user interaction.
+        
+        This method is kept for backwards compatibility with V2 but is no longer
+        used in V3's button initialization.
+        """
         button = Button(
             emoji="👎",
             style=discord.ButtonStyle.danger,
