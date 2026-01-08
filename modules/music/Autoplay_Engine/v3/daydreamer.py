@@ -10,15 +10,23 @@ the recommendation pool. Runs during idle time to:
 
 Named "daydreamer" because it explores possibilities when
 the system isn't busy with active recommendations.
+
+API Sources:
+- Deezer: chart/0/tracks, chart/{genre_id}/tracks, search, genre
+- Last.fm: artist.getSimilar, tag.getTopTracks
 """
 
 import asyncio
 import logging
+import os
 import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
+from urllib.parse import quote_plus
+
+import aiohttp
 
 from .cache_manager import CacheManager, get_cache_manager
 from .constants import AnalysisMode, AnalysisPriority, EventType, SongMetadata, V3Config
@@ -47,6 +55,7 @@ class Daydreamer:
     2. Artist Expansion: Explore similar artists to popular ones
     3. Random Discovery: Periodic random exploration
     4. Trend Following: Explore based on session patterns
+    5. Chart Exploration: Discover popular tracks from charts
     
     Runs as a background task, pausing when system is busy
     with active recommendations. Prioritizes analysis at
@@ -56,6 +65,10 @@ class Daydreamer:
     - Exploration interval: 30 seconds when idle
     - Max concurrent explorations: 3
     - Target genre balance: 20% max per genre
+    
+    API Sources:
+    - Deezer API: chart, genre, search
+    - Last.fm API: artist.getSimilar, tag.getTopTracks
     """
     
     # Configuration
@@ -68,6 +81,34 @@ class Daydreamer:
     GENRE_BALANCE_QUOTA = 2
     ARTIST_EXPANSION_QUOTA = 1
     RANDOM_DISCOVERY_QUOTA = 1
+    CHART_EXPLORATION_QUOTA = 2
+    
+    # API endpoints
+    DEEZER_API = "https://api.deezer.com"
+    LASTFM_API = "https://ws.audioscrobbler.com/2.0/"
+    
+    # Deezer genre IDs (common ones)
+    GENRE_IDS = {
+        "pop": 132,
+        "rock": 152,
+        "hip-hop": 116,
+        "rap": 116,
+        "r&b": 165,
+        "electronic": 106,
+        "dance": 113,
+        "jazz": 129,
+        "classical": 98,
+        "metal": 464,
+        "reggae": 144,
+        "blues": 153,
+        "country": 84,
+        "folk": 466,
+        "latin": 197,
+        "soul": 169,
+        "funk": 85,
+        "indie": 467,
+        "alternative": 85,
+    }
     
     def __init__(
         self,
@@ -103,10 +144,18 @@ class Daydreamer:
         self._running = False
         self._paused = False
         
+        # HTTP session for API calls
+        self._session: Optional[aiohttp.ClientSession] = None
+        
+        # API keys
+        self._lastfm_key: Optional[str] = None
+        
         # Statistics
         self._stats = {
             "rounds": 0,
             "songs_discovered": 0,
+            "api_calls": 0,
+            "api_errors": 0,
             "by_strategy": defaultdict(int)
         }
         
@@ -116,6 +165,16 @@ class Daydreamer:
         """Initialize and start background exploration."""
         if self._initialized:
             return
+        
+        # Initialize HTTP session
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
+        
+        # Load Last.fm API key
+        self._lastfm_key = os.environ.get("LASTFM_API_KEY")
+        if not self._lastfm_key:
+            logger.warning("LASTFM_API_KEY not set - artist similarity disabled")
         
         await self.cache.initialize()
         await self.mappings.initialize()
@@ -129,7 +188,7 @@ class Daydreamer:
         self._exploration_task = asyncio.create_task(self._exploration_loop())
         
         self._initialized = True
-        logger.info("Daydreamer initialized")
+        logger.info("Daydreamer initialized with real API access")
     
     async def shutdown(self) -> None:
         """Stop background exploration."""
@@ -141,6 +200,10 @@ class Daydreamer:
                 await self._exploration_task
             except asyncio.CancelledError:
                 pass
+        
+        if self._session:
+            await self._session.close()
+            self._session = None
         
         self._initialized = False
         logger.info("Daydreamer shutdown")
@@ -210,7 +273,12 @@ class Daydreamer:
         discovered.extend(artist_songs)
         self._stats["by_strategy"]["artist_expansion"] += len(artist_songs)
         
-        # Strategy 3: Random discovery
+        # Strategy 3: Chart exploration (new)
+        chart_songs = await self._explore_charts()
+        discovered.extend(chart_songs)
+        self._stats["by_strategy"]["chart"] += len(chart_songs)
+        
+        # Strategy 4: Random discovery
         random_songs = await self._random_exploration()
         discovered.extend(random_songs)
         self._stats["by_strategy"]["random"] += len(random_songs)
@@ -268,28 +336,285 @@ class Daydreamer:
         return suggestions
     
     async def _search_genre(self, genre: str) -> Optional[SongIdentifier]:
-        """Search for a random song in a genre using Deezer."""
-        # This would use Deezer's genre/chart APIs
-        # Simplified placeholder implementation
+        """Search for a random song in a genre using Deezer chart API."""
+        if not self._session:
+            return None
+        
+        try:
+            # Map genre name to Deezer genre ID
+            genre_lower = genre.lower().replace(" ", "-")
+            genre_id = self.GENRE_IDS.get(genre_lower)
+            
+            if not genre_id:
+                # Try searching for the genre instead
+                return await self._search_deezer_by_query(f"genre:{genre}")
+            
+            # Fetch chart for this genre
+            url = f"{self.DEEZER_API}/chart/{genre_id}/tracks"
+            
+            async with self._session.get(url) as response:
+                self._stats["api_calls"] += 1
+                
+                if response.status == 200:
+                    data = await response.json()
+                    tracks = data.get("data", [])
+                    
+                    if tracks:
+                        # Pick a random track from the chart
+                        track = random.choice(tracks)
+                        return SongIdentifier(
+                            deezer_id=str(track.get("id")),
+                            title=track.get("title"),
+                            artist=track.get("artist", {}).get("name"),
+                            album=track.get("album", {}).get("title"),
+                            preview_url=track.get("preview"),
+                            duration_ms=track.get("duration", 0) * 1000
+                        )
+                else:
+                    self._stats["api_errors"] += 1
+                    logger.warning(f"Deezer genre chart error: {response.status}")
+                    
+        except Exception as e:
+            self._stats["api_errors"] += 1
+            logger.warning(f"Genre search error for '{genre}': {e}")
+        
+        return None
+    
+    async def _search_deezer_by_query(self, query: str) -> Optional[SongIdentifier]:
+        """Search Deezer with a custom query."""
+        if not self._session:
+            return None
+        
+        try:
+            encoded_query = quote_plus(query)
+            url = f"{self.DEEZER_API}/search?q={encoded_query}&limit=20"
+            
+            async with self._session.get(url) as response:
+                self._stats["api_calls"] += 1
+                
+                if response.status == 200:
+                    data = await response.json()
+                    tracks = data.get("data", [])
+                    
+                    if tracks:
+                        track = random.choice(tracks)
+                        return SongIdentifier(
+                            deezer_id=str(track.get("id")),
+                            title=track.get("title"),
+                            artist=track.get("artist", {}).get("name"),
+                            album=track.get("album", {}).get("title"),
+                            preview_url=track.get("preview"),
+                            duration_ms=track.get("duration", 0) * 1000
+                        )
+                        
+        except Exception as e:
+            self._stats["api_errors"] += 1
+            logger.warning(f"Deezer search error: {e}")
+        
         return None
     
     async def _explore_similar_artists(self) -> list[ExplorationSuggestion]:
-        """Explore songs from artists similar to popular ones."""
+        """Explore songs from artists similar to popular ones using Last.fm."""
         suggestions = []
         
-        # Would need to:
-        # 1. Identify popular artists in cache
-        # 2. Use Last.fm artist.getSimilar
-        # 3. Get songs from similar artists
+        if not self._lastfm_key or not self._session:
+            return suggestions
+        
+        # Get artists from explored list or pick from cache
+        artists_to_explore = list(self._explored_artists)[:5]
+        
+        if not artists_to_explore:
+            # No artists tracked yet, skip this round
+            return suggestions
+        
+        try:
+            # Pick a random artist to explore
+            artist_name = random.choice(artists_to_explore)
+            
+            # Get similar artists from Last.fm
+            similar_artists = await self._get_similar_artists_lastfm(artist_name)
+            
+            if similar_artists:
+                # Pick up to 2 similar artists
+                for similar_artist in similar_artists[:self.ARTIST_EXPANSION_QUOTA]:
+                    # Search for a popular song by this artist
+                    song = await self._get_artist_top_track(similar_artist)
+                    if song:
+                        suggestions.append(ExplorationSuggestion(
+                            identifier=song,
+                            metadata=None,
+                            exploration_reason=f"Similar to {artist_name}: {similar_artist}",
+                            discovery_time=time.time()
+                        ))
+                        
+        except Exception as e:
+            self._stats["api_errors"] += 1
+            logger.warning(f"Artist expansion error: {e}")
         
         return suggestions
     
+    async def _get_similar_artists_lastfm(self, artist_name: str) -> list[str]:
+        """Get similar artists from Last.fm."""
+        if not self._lastfm_key or not self._session:
+            return []
+        
+        try:
+            params = {
+                "method": "artist.getSimilar",
+                "api_key": self._lastfm_key,
+                "artist": artist_name,
+                "limit": 10,
+                "format": "json"
+            }
+            
+            async with self._session.get(self.LASTFM_API, params=params) as response:
+                self._stats["api_calls"] += 1
+                
+                if response.status == 200:
+                    data = await response.json()
+                    similar = data.get("similarartists", {}).get("artist", [])
+                    
+                    # Extract artist names
+                    return [a.get("name") for a in similar if a.get("name")]
+                else:
+                    self._stats["api_errors"] += 1
+                    
+        except Exception as e:
+            self._stats["api_errors"] += 1
+            logger.warning(f"Last.fm artist.getSimilar error: {e}")
+        
+        return []
+    
+    async def _get_artist_top_track(self, artist_name: str) -> Optional[SongIdentifier]:
+        """Get a top track for an artist from Deezer."""
+        if not self._session:
+            return None
+        
+        try:
+            # Search Deezer for artist
+            encoded = quote_plus(f'artist:"{artist_name}"')
+            url = f"{self.DEEZER_API}/search?q={encoded}&limit=10"
+            
+            async with self._session.get(url) as response:
+                self._stats["api_calls"] += 1
+                
+                if response.status == 200:
+                    data = await response.json()
+                    tracks = data.get("data", [])
+                    
+                    if tracks:
+                        # Pick a random track from top results
+                        track = random.choice(tracks)
+                        return SongIdentifier(
+                            deezer_id=str(track.get("id")),
+                            title=track.get("title"),
+                            artist=track.get("artist", {}).get("name"),
+                            album=track.get("album", {}).get("title"),
+                            preview_url=track.get("preview"),
+                            duration_ms=track.get("duration", 0) * 1000
+                        )
+                        
+        except Exception as e:
+            self._stats["api_errors"] += 1
+            logger.warning(f"Deezer artist search error: {e}")
+        
+        return None
+    
     async def _random_exploration(self) -> list[ExplorationSuggestion]:
-        """Completely random song discovery."""
+        """Completely random song discovery using Deezer charts."""
         suggestions = []
         
-        # Deezer has chart endpoints that could be used for discovery
-        # This is a placeholder implementation
+        if not self._session:
+            return suggestions
+        
+        try:
+            # Fetch global chart
+            url = f"{self.DEEZER_API}/chart/0/tracks"
+            
+            async with self._session.get(url) as response:
+                self._stats["api_calls"] += 1
+                
+                if response.status == 200:
+                    data = await response.json()
+                    tracks = data.get("data", [])
+                    
+                    if tracks:
+                        # Pick random tracks from the chart
+                        sample_size = min(self.RANDOM_DISCOVERY_QUOTA, len(tracks))
+                        sampled = random.sample(tracks, sample_size)
+                        
+                        for track in sampled:
+                            identifier = SongIdentifier(
+                                deezer_id=str(track.get("id")),
+                                title=track.get("title"),
+                                artist=track.get("artist", {}).get("name"),
+                                album=track.get("album", {}).get("title"),
+                                preview_url=track.get("preview"),
+                                duration_ms=track.get("duration", 0) * 1000
+                            )
+                            suggestions.append(ExplorationSuggestion(
+                                identifier=identifier,
+                                metadata=None,
+                                exploration_reason="Chart discovery",
+                                discovery_time=time.time()
+                            ))
+                else:
+                    self._stats["api_errors"] += 1
+                    
+        except Exception as e:
+            self._stats["api_errors"] += 1
+            logger.warning(f"Random exploration error: {e}")
+        
+        return suggestions
+    
+    async def _explore_charts(self) -> list[ExplorationSuggestion]:
+        """Explore genre-specific charts for variety."""
+        suggestions = []
+        
+        if not self._session:
+            return suggestions
+        
+        try:
+            # Pick random genres to explore
+            genres = list(self.GENRE_IDS.keys())
+            selected_genres = random.sample(genres, min(self.CHART_EXPLORATION_QUOTA, len(genres)))
+            
+            for genre in selected_genres:
+                genre_id = self.GENRE_IDS[genre]
+                url = f"{self.DEEZER_API}/chart/{genre_id}/tracks"
+                
+                try:
+                    async with self._session.get(url) as response:
+                        self._stats["api_calls"] += 1
+                        
+                        if response.status == 200:
+                            data = await response.json()
+                            tracks = data.get("data", [])
+                            
+                            if tracks:
+                                # Pick a random track
+                                track = random.choice(tracks)
+                                identifier = SongIdentifier(
+                                    deezer_id=str(track.get("id")),
+                                    title=track.get("title"),
+                                    artist=track.get("artist", {}).get("name"),
+                                    album=track.get("album", {}).get("title"),
+                                    preview_url=track.get("preview"),
+                                    duration_ms=track.get("duration", 0) * 1000
+                                )
+                                suggestions.append(ExplorationSuggestion(
+                                    identifier=identifier,
+                                    metadata=None,
+                                    exploration_reason=f"Chart: {genre}",
+                                    discovery_time=time.time()
+                                ))
+                except Exception as e:
+                    self._stats["api_errors"] += 1
+                    logger.debug(f"Genre chart error for {genre}: {e}")
+                    
+        except Exception as e:
+            self._stats["api_errors"] += 1
+            logger.warning(f"Chart exploration error: {e}")
         
         return suggestions
     
@@ -392,16 +717,142 @@ class Daydreamer:
         self,
         artist_name: str
     ) -> list[ExplorationSuggestion]:
-        """Get songs from artists similar to given artist."""
-        # Would use Last.fm artist.getSimilar
-        return []
+        """Get songs from artists similar to given artist using Last.fm + Deezer."""
+        suggestions = []
+        
+        if not self._lastfm_key or not self._session:
+            return suggestions
+        
+        try:
+            # Get similar artists from Last.fm
+            similar_artists = await self._get_similar_artists_lastfm(artist_name)
+            
+            for similar_artist in similar_artists[:3]:
+                # Get a top track from each similar artist
+                song = await self._get_artist_top_track(similar_artist)
+                if song:
+                    suggestions.append(ExplorationSuggestion(
+                        identifier=song,
+                        metadata=None,
+                        exploration_reason=f"Similar to {artist_name}",
+                        discovery_time=time.time()
+                    ))
+                    
+        except Exception as e:
+            self._stats["api_errors"] += 1
+            logger.warning(f"Similar artist songs error: {e}")
+        
+        return suggestions
     
     async def _get_genre_songs(
         self,
         genre: str
     ) -> list[ExplorationSuggestion]:
-        """Get songs from a genre."""
-        # Would use Deezer genre endpoints
+        """Get songs from a genre using Deezer."""
+        suggestions = []
+        
+        if not self._session:
+            return suggestions
+        
+        try:
+            # Try genre chart first
+            genre_lower = genre.lower().replace(" ", "-")
+            genre_id = self.GENRE_IDS.get(genre_lower)
+            
+            if genre_id:
+                url = f"{self.DEEZER_API}/chart/{genre_id}/tracks"
+                
+                async with self._session.get(url) as response:
+                    self._stats["api_calls"] += 1
+                    
+                    if response.status == 200:
+                        data = await response.json()
+                        tracks = data.get("data", [])
+                        
+                        # Get a few random tracks
+                        sample_size = min(3, len(tracks))
+                        if tracks:
+                            for track in random.sample(tracks, sample_size):
+                                identifier = SongIdentifier(
+                                    deezer_id=str(track.get("id")),
+                                    title=track.get("title"),
+                                    artist=track.get("artist", {}).get("name"),
+                                    album=track.get("album", {}).get("title"),
+                                    preview_url=track.get("preview"),
+                                    duration_ms=track.get("duration", 0) * 1000
+                                )
+                                suggestions.append(ExplorationSuggestion(
+                                    identifier=identifier,
+                                    metadata=None,
+                                    exploration_reason=f"Genre: {genre}",
+                                    discovery_time=time.time()
+                                ))
+            else:
+                # Fall back to search
+                song = await self._search_deezer_by_query(f"genre:{genre}")
+                if song:
+                    suggestions.append(ExplorationSuggestion(
+                        identifier=song,
+                        metadata=None,
+                        exploration_reason=f"Genre search: {genre}",
+                        discovery_time=time.time()
+                    ))
+                    
+        except Exception as e:
+            self._stats["api_errors"] += 1
+            logger.warning(f"Genre songs error: {e}")
+        
+        return suggestions
+    
+    async def get_tag_top_tracks(
+        self,
+        tag: str,
+        limit: int = 10
+    ) -> list[SongIdentifier]:
+        """
+        Get top tracks for a tag/genre using Last.fm.
+        
+        Args:
+            tag: Tag name (genre, mood, etc.)
+            limit: Maximum tracks to return
+            
+        Returns:
+            List of SongIdentifier for top tracks
+        """
+        if not self._lastfm_key or not self._session:
+            return []
+        
+        try:
+            params = {
+                "method": "tag.getTopTracks",
+                "api_key": self._lastfm_key,
+                "tag": tag,
+                "limit": limit,
+                "format": "json"
+            }
+            
+            async with self._session.get(self.LASTFM_API, params=params) as response:
+                self._stats["api_calls"] += 1
+                
+                if response.status == 200:
+                    data = await response.json()
+                    tracks = data.get("tracks", {}).get("track", [])
+                    
+                    results = []
+                    for track in tracks:
+                        identifier = SongIdentifier(
+                            lastfm_mbid=track.get("mbid"),
+                            title=track.get("name"),
+                            artist=track.get("artist", {}).get("name")
+                        )
+                        results.append(identifier)
+                    
+                    return results
+                    
+        except Exception as e:
+            self._stats["api_errors"] += 1
+            logger.warning(f"Last.fm tag.getTopTracks error: {e}")
+        
         return []
     
     def get_stats(self) -> dict[str, Any]:
@@ -409,12 +860,16 @@ class Daydreamer:
         return {
             "rounds": self._stats["rounds"],
             "songs_discovered": self._stats["songs_discovered"],
+            "api_calls": self._stats["api_calls"],
+            "api_errors": self._stats["api_errors"],
             "by_strategy": dict(self._stats["by_strategy"]),
             "pending_suggestions": len(self._pending_suggestions),
             "explored_artists": len(self._explored_artists),
             "genre_distribution": dict(self._genre_distribution),
             "running": self._running,
-            "paused": self._paused
+            "paused": self._paused,
+            "has_lastfm_key": self._lastfm_key is not None,
+            "has_session": self._session is not None
         }
 
 

@@ -1,5 +1,15 @@
 # Core Idea
 
+## Core Philosophy
+
+**Quality over speed.** The bot waits for a sufficient database before making recommendations during cold start while showing real-time progress updates.
+
+### User Experience
+
+- High-level progress updates display what the bot is analyzing (e.g., "Analyzing Context," "Analyzing Candidates (50/1000)," "Finalizing Pick")
+- Updates appear on Discord every 10 seconds after the initial 30-second threshold
+- Based on Apple Music's approach: "The algorithm analyzes listening habits, preferred genres, artists, play frequency, and user activity patterns"
+
 > Quality over speed. Users have to wait until it finishes building up a database for a cold start while the bot initializes
 > It will show high level progress updates on what its doing if its taking a while. For example: Analyzing Context, Analyzing  candidates (50/1000), Finalizing pick.
 This high level progress update is shown on discord and updated per 10s after it takes longer than 30s.

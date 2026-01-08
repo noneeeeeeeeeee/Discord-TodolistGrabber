@@ -113,11 +113,24 @@ class GeminiManager:
         self._initialized = False
     
     def _load_api_keys(self) -> None:
-        """Load API keys from environment variable."""
+        """Load API keys from environment variable (supports JSON array or comma-separated)."""
+        import json
+        
         keys_str = os.environ.get("GeminiApiKeys", "")
         
         if keys_str:
-            self._api_keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+            # Try JSON array format first: ["key1", "key2"]
+            if keys_str.startswith("["):
+                try:
+                    self._api_keys = json.loads(keys_str)
+                    if not isinstance(self._api_keys, list):
+                        self._api_keys = []
+                except json.JSONDecodeError:
+                    # Fallback to comma-separated
+                    self._api_keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+            else:
+                # Comma-separated format
+                self._api_keys = [k.strip() for k in keys_str.split(",") if k.strip()]
         
         if not self._api_keys:
             # Try single key format

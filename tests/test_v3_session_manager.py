@@ -200,7 +200,7 @@ class TestSessionStateTransitions:
                 total_duration_ms=200000
             )
         
-        updated_session = await session_manager.get_session(session.session_id)
+        updated_session = await session_manager.get_session(session_id=session.session_id)
         # After 12 plays, should be WARM
         assert updated_session.play_count == 12
         assert updated_session.state == SessionState.WARM.value
@@ -208,6 +208,7 @@ class TestSessionStateTransitions:
     @pytest.mark.asyncio
     async def test_warm_to_hot_transition(self, session_manager):
         """Session should transition from WARM to HOT after more songs."""
+        await session_manager.initialize()
         session = await session_manager.create_session(guild_id='123', voice_channel_id='456')
         
         # Simulate playing songs
@@ -220,7 +221,7 @@ class TestSessionStateTransitions:
                 total_duration_ms=200000
             )
         
-        updated_session = await session_manager.get_session(session.session_id)
+        updated_session = await session_manager.get_session(session_id=session.session_id)
         assert updated_session.play_count == 30
         # Should be HOT or EXTENDED
         assert updated_session.state in [SessionState.HOT.value, SessionState.EXTENDED.value, SessionState.WARM.value]

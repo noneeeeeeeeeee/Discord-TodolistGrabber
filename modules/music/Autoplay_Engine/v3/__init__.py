@@ -118,8 +118,10 @@ __version__ = "3.0.0"
 __all__ = [
     # Main engine
     "V3Engine",
-    "AutoplayV3",  
+    "AutoplayV3",
+    "LastFMAutoplayV3",
     "get_v3_engine",
+    "get_lastfm_autoplay_v3",
     
     # Configuration
     "V3Config",
@@ -191,29 +193,47 @@ class V3Engine:
         self.daydreamer = get_daydreamer()
         
         self._initialized = False
+        self._gemini_available = False
     
     async def initialize(self) -> None:
         """
         Initialize all engine components.
         
         Must be called before using the engine.
-
+        Components that fail to initialize (e.g., Gemini without keys)
+        will be marked unavailable but won't prevent other components from working.
         """
         if self._initialized:
             return
         
         logger.info("Initializing V3 Autoplay Engine...")
         
-
         await self.event_bus.start()
         logger.debug("Event bus started")
         
-
+        # Core components - must succeed
         await self.cache.initialize()
         await self.mappings.initialize()
-        await self.analyzer.initialize()
         await self.session_mgr.initialize()
         await self.buffer_mgr.initialize()
+        
+        # Optional components - can fail gracefully
+        try:
+            await self.analyzer.initialize()
+        except Exception as e:
+            logger.warning(f"Song analyzer initialization failed (ML models may be unavailable): {e}")
+        
+        # Gemini is optional - V3 can work with Deezer/Last.fm only
+        try:
+            from .gemini_manager import get_gemini_manager
+            gemini = get_gemini_manager()
+            await gemini.initialize()
+            self._gemini_available = True
+            logger.info("Gemini manager initialized")
+        except Exception as e:
+            logger.warning(f"Gemini initialization skipped: {e}")
+            self._gemini_available = False
+        
         await self.recommender.initialize()
         await self.daydreamer.initialize()
         
@@ -520,3 +540,303 @@ def get_v3_engine() -> V3Engine:
 
 
 AutoplayV3 = V3Engine
+
+
+class LastFMAutoplayV3:
+    """
+    V3 wrapper that provides V1-compatible interface for music_player.py.
+    
+    Maps V1's interface to V3Engine:
+    - is_available() -> True if prerequisites configured (env vars)
+    - can_recommend() -> True if prerequisites configured  
+    - clear_history(guild_id) -> end_session
+    - record_playback_feedback(...) -> record_playback with feedback_type
+    - get_recommendations_for_track(track_info, limit) -> get_next_song with resolution
+    """
+    
+    def __init__(self, bot=None):
+        """Initialize V3 wrapper with synchronous prerequisite checks."""
+        import os
+        
+        self.bot = bot
+        self._engine = get_v3_engine()
+        self._guild_sessions: dict[int, str] = {}  # guild_id -> session_id
+        self._engine_initialized = False
+        self._init_lock = asyncio.Lock()
+        
+        # Check prerequisites synchronously (like V1 does)
+        # This allows is_available() to return True immediately
+        self._lastfm_api_key = os.getenv("LASTFM_API_KEY")
+        self._prerequisites_available = bool(self._lastfm_api_key)
+        
+        if self._prerequisites_available:
+            logger.info("✅ V3 Autoplay prerequisites configured (Last.fm API key found)")
+        else:
+            logger.warning(
+                "⚠️ LASTFM_API_KEY not found in .env. "
+                "Get a free API key from https://www.last.fm/api/account/create"
+            )
+        
+    async def _ensure_initialized(self) -> bool:
+        """Ensure engine is initialized (async)."""
+        if self._engine_initialized:
+            return True
+        
+        async with self._init_lock:
+            if self._engine_initialized:
+                return True
+            try:
+                await self._engine.initialize()
+                self._engine_initialized = True
+                logger.info("✅ V3 Autoplay Engine fully initialized")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to initialize V3 engine: {e}")
+                return False
+    
+    def is_available(self) -> bool:
+        """
+        Check if autoplay is available (V1 interface).
+        
+        Returns True if prerequisites (env vars) are configured.
+        The async engine initialization happens lazily on first use.
+        """
+        return self._prerequisites_available
+    
+    def can_recommend(self) -> bool:
+        """Check if recommendations are available (V1 interface)."""
+        return self._prerequisites_available
+    
+    def clear_history(self, guild_id: Optional[int] = None) -> None:
+        """Clear recommendation history (V1 interface)."""
+        if guild_id is not None:
+            session_id = self._guild_sessions.get(guild_id)
+            if session_id:
+                # Run async in background since V1 signature is sync
+                asyncio.create_task(self._engine.end_session(
+                    guild_id=str(guild_id),
+                    session_id=session_id
+                ))
+                del self._guild_sessions[guild_id]
+                logger.info(f"Cleared V3 session for guild {guild_id}")
+        else:
+            # Clear all
+            for gid, sid in list(self._guild_sessions.items()):
+                asyncio.create_task(self._engine.end_session(
+                    guild_id=str(gid),
+                    session_id=sid
+                ))
+            self._guild_sessions.clear()
+            logger.info("Cleared all V3 sessions")
+    
+    async def clear_guild_session(self, guild_id: int) -> None:
+        """Clear session for a specific guild (async version for music_player)."""
+        session_id = self._guild_sessions.get(guild_id)
+        if session_id:
+            await self._engine.end_session(
+                guild_id=str(guild_id),
+                session_id=session_id
+            )
+            del self._guild_sessions[guild_id]
+            logger.info(f"Cleared V3 session for guild {guild_id}")
+    
+    async def record_playback_feedback(
+        self,
+        guild_id: int,
+        artist: str,
+        title: str = "",  # V3 uses 'title', V1 uses 'track'
+        progress_ratio: float = 1.0,
+        *,
+        track: str = "",  # V1 parameter name
+        feedback_type: Optional[str] = None,  # "more_like_this" or "less_like_this"
+        user_id: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+        primary_listener_bias: bool = True,
+    ) -> None:
+        """
+        Record playback feedback (V1 interface + V3 extensions).
+        
+        Supports both V1's parameter names and V3's extensions:
+        - V1: guild_id, artist, track, progress_ratio, duration_ms
+        - V3: adds feedback_type, user_id for button interactions
+        """
+        if not await self._ensure_initialized():
+            return
+        
+        # Handle V1's 'track' vs V3's 'title'
+        track_title = title or track
+        if not guild_id or not artist or not track_title:
+            return
+        
+        session_id = self._guild_sessions.get(guild_id)
+        if not session_id:
+            logger.debug(f"No session for guild {guild_id}, skipping feedback")
+            return
+        
+        # Determine skip status based on progress and feedback type
+        was_skipped = progress_ratio < 0.9
+        if feedback_type == "less_like_this":
+            was_skipped = True  # Treat as skip for recommendation weighting
+        elif feedback_type == "more_like_this":
+            was_skipped = False  # Treat as full listen
+        
+        # Calculate duration if not provided
+        total_duration_ms = duration_ms or 180000  # Default 3 min
+        duration_played_ms = int(total_duration_ms * progress_ratio)
+        
+        try:
+            # Resolve song to get song_id
+            song = await self._engine.resolve_song(
+                title=track_title,
+                artist=artist
+            )
+            
+            if song and song.primary_id:
+                await self._engine.record_playback(
+                    session_id=session_id,
+                    song_id=song.primary_id,
+                    duration_played_ms=duration_played_ms,
+                    total_duration_ms=total_duration_ms,
+                    was_skipped=was_skipped
+                )
+                
+                if feedback_type:
+                    logger.debug(
+                        f"Recorded {feedback_type} feedback: {artist} - {track_title} "
+                        f"(user={user_id})"
+                    )
+            else:
+                logger.debug(f"Could not resolve song for feedback: {artist} - {track_title}")
+                
+        except Exception as e:
+            logger.error(f"Failed to record V3 feedback: {e}")
+    
+    async def get_recommendations_for_track(
+        self,
+        track_info: dict[str, Any],
+        limit: int = 10
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """
+        Get recommendations based on current track (V1 interface).
+        
+        Args:
+            track_info: Dict with 'title', 'author', 'length', 'guild_id'
+            limit: Number of recommendations
+            
+        Returns:
+            List of (url, track_dict) tuples - V1 format for music_player
+        """
+        if not await self._ensure_initialized():
+            return []
+        
+        raw_title = track_info.get("title", "").strip()
+        artist = track_info.get("author", "").strip()
+        guild_id = int(track_info.get("guild_id", 0) or 0)
+        
+        if not raw_title:
+            logger.warning("Missing track title for V3 autoplay")
+            return []
+        
+        try:
+            # Ensure session exists
+            session_id = self._guild_sessions.get(guild_id)
+            if not session_id:
+                # Create new session
+                session = await self._engine.start_session(
+                    guild_id=str(guild_id),
+                    voice_channel_id="0"  # Not used in V3
+                )
+                if session:
+                    session_id = session.session_id
+                    self._guild_sessions[guild_id] = session_id
+                else:
+                    logger.error(f"Failed to create session for guild {guild_id}")
+                    return []
+            
+            # Resolve seed song
+            seed = await self._engine.resolve_song(
+                title=raw_title,
+                artist=artist
+            )
+            
+            if not seed:
+                logger.warning(f"Could not resolve seed: {artist} - {raw_title}")
+                return []
+            
+            # Fill buffer with seed if needed
+            await self._engine.buffer_mgr.fill_initial_buffer(
+                session_id=session_id,
+                guild_id=str(guild_id),
+                seed_songs=[seed]
+            )
+            
+            # Get recommendations
+            recommendations = []
+            for _ in range(limit):
+                song = await self._engine.get_next_song(session_id)
+                if not song:
+                    break
+                
+                # Build V1-compatible result
+                # The URL should be the youtube URL for playback
+                url = None
+                if song.identifier.youtube_id:
+                    url = f"https://www.youtube.com/watch?v={song.identifier.youtube_id}"
+                elif song.identifier.deezer_id:
+                    # Will need resolution by music_player
+                    url = f"deezer:{song.identifier.deezer_id}"
+                
+                if url:
+                    track_dict = {
+                        "artist": song.identifier.artist or artist,
+                        "title": song.identifier.title or "Unknown",
+                        "url": url,
+                        "deezer_id": song.identifier.deezer_id,
+                        "youtube_id": song.identifier.youtube_id,
+                        "source": getattr(song, 'source', 'v3'),
+                        "confidence": getattr(song, 'confidence', 0.8)
+                    }
+                    recommendations.append((url, track_dict))
+                    
+                    logger.info(
+                        f"[V3] Recommendation: {track_dict['artist']} - {track_dict['title']}"
+                    )
+            
+            return recommendations
+            
+        except Exception as e:
+            logger.error(f"V3 get_recommendations failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    async def get_stats(self) -> dict[str, Any]:
+        """Get V3 engine statistics."""
+        return await self._engine.get_stats()
+    
+    async def health_check(self) -> dict[str, bool]:
+        """Check health of V3 engine."""
+        return await self._engine.health_check()
+
+
+# Singleton wrapper instance
+_lastfm_autoplay_v3: Optional[LastFMAutoplayV3] = None
+
+
+def get_lastfm_autoplay_v3(bot=None) -> LastFMAutoplayV3:
+    """
+    Get or create global V3 autoplay wrapper instance.
+    
+    This is the entry point used by config.py to get the V3 engine
+    with a V1-compatible interface.
+    
+    Args:
+        bot: Discord bot instance (optional, for compatibility)
+        
+    Returns:
+        LastFMAutoplayV3 wrapper instance
+    """
+    global _lastfm_autoplay_v3
+    if _lastfm_autoplay_v3 is None:
+        _lastfm_autoplay_v3 = LastFMAutoplayV3(bot)
+    return _lastfm_autoplay_v3

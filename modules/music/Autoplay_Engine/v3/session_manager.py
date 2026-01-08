@@ -6,6 +6,11 @@ Manages concurrent autoplay sessions across Discord guilds:
 - Disk persistence for crash recovery
 - Session lifecycle (create, update, close)
 - Guild-to-session mapping
+
+Integrates with SessionMixer for:
+- Adaptive confidence tracking
+- Recovery state management
+- Skip classification
 """
 
 import asyncio
@@ -21,6 +26,7 @@ from .constants import EventType, SessionState, V3Config
 from .context_analyzer import ContextAnalyzer, get_context_analyzer
 from .event_bus import EventBus, EventPayload
 from .novelty_controller import NoveltyController, get_novelty_controller
+from .session_mixer import SessionMixer, TransitionFeatures, get_session_mixer
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +85,8 @@ class SessionManager:
         config: Optional[V3Config] = None,
         context: Optional[ContextAnalyzer] = None,
         novelty: Optional[NoveltyController] = None,
-        event_bus: Optional[EventBus] = None
+        event_bus: Optional[EventBus] = None,
+        session_mixer: Optional[SessionMixer] = None
     ):
         """
         Initialize session manager.
@@ -89,11 +96,13 @@ class SessionManager:
             context: Context analyzer for session profiles
             novelty: Novelty controller for diversity tracking
             event_bus: Event bus for notifications
+            session_mixer: Session mixer for adaptive weights
         """
         self.config = config or V3Config()
         self.context = context or get_context_analyzer()
         self.novelty = novelty or get_novelty_controller()
         self.event_bus = event_bus or EventBus()
+        self.session_mixer = session_mixer or get_session_mixer()
         
         # Active sessions
         self._sessions: dict[str, SessionData] = {}
@@ -121,6 +130,7 @@ class SessionManager:
         # Initialize dependencies
         await self.context.initialize()
         await self.novelty.initialize()
+        await self.session_mixer.initialize()
         
         self._initialized = True
         logger.info(f"Session manager initialized with {len(self._sessions)} sessions")
@@ -310,7 +320,10 @@ class SessionManager:
         song_id: str,
         was_skipped: bool,
         duration_played_ms: int,
-        total_duration_ms: int
+        total_duration_ms: int,
+        bpm: Optional[float] = None,
+        energy: Optional[float] = None,
+        key: Optional[str] = None
     ) -> None:
         """
         Record a song playback event.
@@ -321,6 +334,9 @@ class SessionManager:
             was_skipped: Whether song was skipped
             duration_played_ms: How long it played
             total_duration_ms: Total song duration
+            bpm: Track BPM (for transition features)
+            energy: Track energy (for transition features)
+            key: Track key (for transition features)
         """
         session = self._sessions.get(session_id)
         if not session:
@@ -333,12 +349,35 @@ class SessionManager:
         
         session.last_activity = time.time()
         
-        # Update state based on play count
-        if session.play_count <= self.config.cold_start_threshold:
+        # Build transition features if available
+        features = None
+        if bpm is not None or energy is not None:
+            features = TransitionFeatures(
+                bpm=bpm or 120.0,
+                energy=energy or 0.5,
+                key=key
+            )
+        
+        # Record in session mixer for adaptive weights
+        skip_type = self.session_mixer.record_playback(
+            session_id=session_id,
+            song_id=song_id,
+            duration_played_ms=duration_played_ms,
+            total_duration_ms=total_duration_ms,
+            was_skipped=was_skipped,
+            features=features
+        )
+        
+        # Log skip classification for debugging
+        if was_skipped:
+            logger.debug(f"Skip classified as {skip_type.value} for session {session_id}")
+        
+        # Update state based on play count using threshold config
+        if session.play_count <= self.config.thresholds.cold_max:
             session.state = SessionState.COLD.value
-        elif session.play_count <= self.config.warm_threshold:
+        elif session.play_count <= self.config.thresholds.warm_max:
             session.state = SessionState.WARM.value
-        elif session.play_count <= self.config.hot_threshold:
+        elif session.play_count < self.config.thresholds.extended_min:
             session.state = SessionState.HOT.value
         else:
             session.state = SessionState.EXTENDED.value

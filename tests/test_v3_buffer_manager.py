@@ -2,6 +2,7 @@
 Tests for V3 Autoplay Engine Buffer Manager Module
 
 Tests for 5-song Apple Music-style buffer with prefetching.
+Tests both the SessionBuffer class and the BufferManager class.
 """
 
 import pytest
@@ -14,604 +15,461 @@ from dataclasses import dataclass
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.music.Autoplay_Engine.v3.buffer_manager import BufferManager
+from modules.music.Autoplay_Engine.v3.buffer_manager import (
+    BufferManager, 
+    SessionBuffer,
+    BufferedSong,
+    BufferSlotType,
+    BUFFER_COMPOSITION
+)
 from modules.music.Autoplay_Engine.v3.constants import (
-    BufferConfig,
+    V3Config,
     EventType,
     SessionState
 )
+from modules.music.Autoplay_Engine.v3.mappings import SongIdentifier
+from modules.music.Autoplay_Engine.v3.recommender import Recommendation
 
 
-@dataclass
-class MockSong:
-    """Mock song for testing."""
-    id: str
-    title: str
-    artist: str
-    duration: int = 180
+def create_mock_recommendation(song_id: str, title: str, artist: str) -> Recommendation:
+    """Create a mock recommendation for testing."""
+    identifier = SongIdentifier(
+        title=title,
+        artist=artist,
+        deezer_id=song_id
+    )
+    return Recommendation(
+        identifier=identifier,
+        score=0.8,
+        source="test",
+        reason="Test recommendation"
+    )
 
+
+def create_mocked_buffer_manager():
+    """Create a BufferManager with all dependencies mocked."""
+    config = V3Config()
+    
+    # Create mocked dependencies
+    mock_recommender = MagicMock()
+    mock_recommender.initialize = AsyncMock()
+    
+    mock_session_mgr = MagicMock()
+    mock_session_mgr.initialize = AsyncMock()
+    
+    mock_analyzer = MagicMock()
+    mock_analyzer.initialize = AsyncMock()
+    mock_analyzer.enqueue = AsyncMock()
+    
+    mock_event_bus = MagicMock()
+    mock_event_bus.subscribe = MagicMock()
+    mock_event_bus.unsubscribe = MagicMock()
+    
+    manager = BufferManager(
+        config=config,
+        recommender=mock_recommender,
+        session_mgr=mock_session_mgr,
+        analyzer=mock_analyzer,
+        event_bus=mock_event_bus
+    )
+    return manager
+
+
+# ============================================================================
+# SessionBuffer Tests (Low-level buffer operations)
+# ============================================================================
+
+class TestSessionBufferCreation:
+    """Tests for SessionBuffer initialization."""
+    
+    def test_session_buffer_creation(self):
+        """Verify SessionBuffer can be created."""
+        buffer = SessionBuffer("session_123", size=5)
+        assert buffer is not None
+        assert buffer.session_id == "session_123"
+        assert buffer.size == 5
+    
+    def test_initial_state(self):
+        """New buffer should be empty."""
+        buffer = SessionBuffer("session_123", size=5)
+        assert buffer.current_size == 0
+        assert buffer.needs_refill is True
+
+
+class TestSessionBufferOperations:
+    """Tests for SessionBuffer add/pop/peek operations."""
+    
+    @pytest.fixture
+    def session_buffer(self):
+        """Create a session buffer."""
+        return SessionBuffer("session_123", size=5)
+    
+    def test_add_song(self, session_buffer):
+        """Should be able to add a recommendation to buffer."""
+        rec = create_mock_recommendation("1", "Test Song", "Test Artist")
+        song = session_buffer.add(rec, BufferSlotType.SAFE)
+        
+        assert session_buffer.current_size == 1
+        assert song.identifier.title == "Test Song"
+        assert song.slot_type == BufferSlotType.SAFE
+    
+    def test_pop_returns_fifo(self, session_buffer):
+        """Pop should return songs in FIFO order."""
+        for i in range(3):
+            rec = create_mock_recommendation(str(i), f"Song {i}", "Artist")
+            session_buffer.add(rec, BufferSlotType.SAFE)
+        
+        song1 = session_buffer.pop()
+        song2 = session_buffer.pop()
+        song3 = session_buffer.pop()
+        
+        assert song1.identifier.title == "Song 0"
+        assert song2.identifier.title == "Song 1"
+        assert song3.identifier.title == "Song 2"
+    
+    def test_pop_empty_returns_none(self, session_buffer):
+        """Pop on empty buffer should return None."""
+        result = session_buffer.pop()
+        assert result is None
+    
+    def test_peek_without_removing(self, session_buffer):
+        """Peek should see next song without removing."""
+        rec = create_mock_recommendation("1", "Test Song", "Artist")
+        session_buffer.add(rec, BufferSlotType.SAFE)
+        
+        peeked = session_buffer.peek()
+        assert peeked.identifier.title == "Test Song"
+        assert session_buffer.current_size == 1  # Still there
+    
+    def test_peek_all(self, session_buffer):
+        """Peek all should return all songs."""
+        for i in range(3):
+            rec = create_mock_recommendation(str(i), f"Song {i}", "Artist")
+            session_buffer.add(rec, BufferSlotType.SAFE)
+        
+        all_songs = session_buffer.peek_all()
+        assert len(all_songs) == 3
+        assert session_buffer.current_size == 3  # All still there
+    
+    def test_clear(self, session_buffer):
+        """Clear should empty the buffer and return cleared songs."""
+        for i in range(3):
+            rec = create_mock_recommendation(str(i), f"Song {i}", "Artist")
+            session_buffer.add(rec, BufferSlotType.SAFE)
+        
+        cleared = session_buffer.clear()
+        assert len(cleared) == 3
+        assert session_buffer.current_size == 0
+
+
+class TestSessionBufferSlotTypes:
+    """Tests for buffer slot type tracking."""
+    
+    @pytest.fixture
+    def session_buffer(self):
+        return SessionBuffer("session_123", size=5)
+    
+    def test_add_with_different_slot_types(self, session_buffer):
+        """Should track songs by slot type."""
+        safe_rec = create_mock_recommendation("1", "Safe Song", "Artist")
+        exp_rec = create_mock_recommendation("2", "Exploratory", "Artist")
+        
+        session_buffer.add(safe_rec, BufferSlotType.SAFE)
+        session_buffer.add(exp_rec, BufferSlotType.EXPLORATORY)
+        
+        counts = session_buffer.get_slot_type_counts()
+        assert counts[BufferSlotType.SAFE] == 1
+        assert counts[BufferSlotType.EXPLORATORY] == 1
+    
+    def test_is_exploratory_property(self, session_buffer):
+        """BufferedSong should expose is_exploratory property."""
+        rec = create_mock_recommendation("1", "Test", "Artist")
+        song = session_buffer.add(rec, BufferSlotType.EXPLORATORY)
+        
+        assert song.is_exploratory is True
+
+
+class TestSessionBufferNeedsRefill:
+    """Tests for refill detection."""
+    
+    def test_needs_refill_when_empty(self):
+        """Empty buffer needs refill."""
+        buffer = SessionBuffer("session_123", size=5)
+        assert buffer.needs_refill is True
+    
+    def test_needs_refill_partial(self):
+        """Partially filled buffer needs refill."""
+        buffer = SessionBuffer("session_123", size=5)
+        rec = create_mock_recommendation("1", "Song", "Artist")
+        buffer.add(rec, BufferSlotType.SAFE)
+        
+        assert buffer.needs_refill is True
+        assert buffer.slots_needed == 4
+    
+    def test_full_buffer_no_refill(self):
+        """Full buffer should not need refill."""
+        buffer = SessionBuffer("session_123", size=5)
+        for i in range(5):
+            rec = create_mock_recommendation(str(i), f"Song {i}", "Artist")
+            buffer.add(rec, BufferSlotType.SAFE)
+        
+        assert buffer.needs_refill is False
+        assert buffer.slots_needed == 0
+
+
+class TestSessionBufferExcludeSet:
+    """Tests for song exclusion tracking."""
+    
+    def test_exclude_set_tracks_buffered_and_played(self):
+        """Exclude set should include buffered and played song IDs."""
+        buffer = SessionBuffer("session_123", size=5)
+        
+        rec1 = create_mock_recommendation("song_1", "Song 1", "Artist")
+        rec2 = create_mock_recommendation("song_2", "Song 2", "Artist")
+        
+        buffer.add(rec1, BufferSlotType.SAFE)
+        buffer.add(rec2, BufferSlotType.SAFE)
+        
+        # Pop one (becomes played)
+        buffer.pop()
+        
+        exclude = buffer.get_exclude_set()
+        assert "song_1" in exclude  # Was played
+        assert "song_2" in exclude  # Still buffered
+
+
+class TestExploratoryOutcomeTracking:
+    """Tests for tracking exploratory song success/failure."""
+    
+    def test_record_exploratory_outcome(self):
+        """Should record exploratory song outcomes."""
+        buffer = SessionBuffer("session_123", size=5)
+        
+        buffer.record_exploratory_outcome(completed=True)
+        buffer.record_exploratory_outcome(completed=False)
+        buffer.record_exploratory_outcome(completed=True)
+        
+        rate = buffer.get_exploratory_success_rate()
+        # 2 completed out of 3 = ~0.67
+        assert 0.6 <= rate <= 0.7
+
+
+# ============================================================================
+# BufferManager Tests (High-level manager with dependencies)
+# ============================================================================
 
 class TestBufferManagerInitialization:
     """Tests for BufferManager initialization."""
     
     def test_buffer_manager_creation(self):
-        """Verify buffer manager can be created."""
-        config = BufferConfig()
-        manager = BufferManager(config)
+        """Verify buffer manager can be created with mocked deps."""
+        manager = create_mocked_buffer_manager()
         assert manager is not None
     
-    def test_buffer_size_is_five(self):
-        """Buffer should be configured for 5 songs."""
-        config = BufferConfig(size=5)
-        manager = BufferManager(config)
-        assert manager.max_size == 5
+    def test_buffer_size_constant(self):
+        """Buffer size should be defined as constant."""
+        manager = create_mocked_buffer_manager()
+        assert manager.BUFFER_SIZE == 5
     
     @pytest.mark.asyncio
     async def test_initialize(self):
         """Buffer manager should initialize successfully."""
-        config = BufferConfig()
-        manager = BufferManager(config)
+        manager = create_mocked_buffer_manager()
         await manager.initialize()
         assert manager._initialized is True
+        
+        # Verify dependencies were initialized
+        manager.recommender.initialize.assert_called_once()
+        manager.session_mgr.initialize.assert_called_once()
+        manager.analyzer.initialize.assert_called_once()
 
 
-class TestBufferOperations:
-    """Tests for basic buffer operations."""
+class TestBufferManagerGetBuffer:
+    """Tests for get_buffer method."""
     
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create an initialized buffer manager."""
-        config = BufferConfig(size=5, low_threshold=2)
-        manager = BufferManager(config)
-        return manager
+    def test_get_buffer_creates_new(self):
+        """get_buffer should create buffer for new session."""
+        manager = create_mocked_buffer_manager()
+        buffer = manager.get_buffer("session_123")
+        
+        assert buffer is not None
+        assert isinstance(buffer, SessionBuffer)
+        assert buffer.session_id == "session_123"
     
-    @pytest.mark.asyncio
-    async def test_add_song_to_buffer(self, buffer_manager):
-        """Should be able to add a song to the buffer."""
-        await buffer_manager.initialize()
+    def test_get_buffer_returns_existing(self):
+        """get_buffer should return same buffer for same session."""
+        manager = create_mocked_buffer_manager()
+        buffer1 = manager.get_buffer("session_123")
+        buffer2 = manager.get_buffer("session_123")
         
-        song = MockSong(id='1', title='Test Song', artist='Test Artist')
-        await buffer_manager.add('session_123', song)
-        
-        assert buffer_manager.size('session_123') == 1
+        assert buffer1 is buffer2
     
-    @pytest.mark.asyncio
-    async def test_get_next_song(self, buffer_manager):
-        """Should return the next song from buffer."""
-        await buffer_manager.initialize()
-        
-        songs = [
-            MockSong(id='1', title='Song 1', artist='Artist 1'),
-            MockSong(id='2', title='Song 2', artist='Artist 2'),
-            MockSong(id='3', title='Song 3', artist='Artist 3')
-        ]
-        
-        for song in songs:
-            await buffer_manager.add('session_123', song)
-        
-        next_song = await buffer_manager.get_next('session_123')
-        assert next_song.id == '1'  # FIFO order
-    
-    @pytest.mark.asyncio
-    async def test_buffer_fifo_order(self, buffer_manager):
-        """Buffer should maintain FIFO order."""
-        await buffer_manager.initialize()
-        
-        for i in range(3):
-            song = MockSong(id=str(i), title=f'Song {i}', artist='Artist')
-            await buffer_manager.add('session_123', song)
-        
-        # Songs should come out in order
-        song1 = await buffer_manager.get_next('session_123')
-        song2 = await buffer_manager.get_next('session_123')
-        song3 = await buffer_manager.get_next('session_123')
-        
-        assert song1.id == '0'
-        assert song2.id == '1'
-        assert song3.id == '2'
-    
-    @pytest.mark.asyncio
-    async def test_buffer_size_tracking(self, buffer_manager):
-        """Should correctly track buffer size."""
-        await buffer_manager.initialize()
-        
-        assert buffer_manager.size('session_123') == 0
-        
-        await buffer_manager.add('session_123', MockSong('1', 'Song', 'Artist'))
-        assert buffer_manager.size('session_123') == 1
-        
-        await buffer_manager.add('session_123', MockSong('2', 'Song', 'Artist'))
-        assert buffer_manager.size('session_123') == 2
-        
-        await buffer_manager.get_next('session_123')
-        assert buffer_manager.size('session_123') == 1
-
-
-class TestBufferLowThreshold:
-    """Tests for low buffer threshold detection."""
-    
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager with low threshold of 2."""
-        config = BufferConfig(size=5, low_threshold=2)
-        return BufferManager(config)
-    
-    @pytest.mark.asyncio
-    async def test_low_buffer_detection(self, buffer_manager):
-        """Should detect when buffer is low."""
-        await buffer_manager.initialize()
-        
-        # Add 3 songs
-        for i in range(3):
-            await buffer_manager.add('session_123', MockSong(str(i), 'Song', 'Artist'))
-        
-        # Consume 2, leaving 1 (below threshold of 2)
-        await buffer_manager.get_next('session_123')
-        await buffer_manager.get_next('session_123')
-        
-        assert buffer_manager.is_low('session_123') is True
-    
-    @pytest.mark.asyncio
-    async def test_low_buffer_event(self, buffer_manager):
-        """Should emit BUFFER_LOW event when threshold reached."""
-        await buffer_manager.initialize()
-        
-        event_emitted = False
-        
-        async def on_buffer_low(payload):
-            nonlocal event_emitted
-            event_emitted = True
-        
-        if hasattr(buffer_manager, 'on_low'):
-            buffer_manager.on_low(on_buffer_low)
-        
-        # Add 2 songs (at threshold)
-        await buffer_manager.add('session_123', MockSong('1', 'Song', 'Artist'))
-        await buffer_manager.add('session_123', MockSong('2', 'Song', 'Artist'))
-        
-        # Get one, going below threshold
-        await buffer_manager.get_next('session_123')
-        
-        # Event may have been emitted
-        # assert event_emitted is True  # Depends on implementation
-    
-    @pytest.mark.asyncio
-    async def test_not_low_when_full(self, buffer_manager):
-        """Buffer should not be low when full."""
-        await buffer_manager.initialize()
-        
-        for i in range(5):
-            await buffer_manager.add('session_123', MockSong(str(i), 'Song', 'Artist'))
-        
-        assert buffer_manager.is_low('session_123') is False
-
-
-class TestBufferPrefetching:
-    """Tests for prefetch functionality."""
-    
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager with prefetch enabled."""
-        config = BufferConfig(size=5, low_threshold=2, prefetch_enabled=True)
-        return BufferManager(config)
-    
-    @pytest.mark.asyncio
-    async def test_prefetch_enabled(self, buffer_manager):
-        """Prefetch should be enabled by default."""
-        assert buffer_manager.prefetch_enabled is True
-    
-    @pytest.mark.asyncio
-    async def test_prefetch_callback_registration(self, buffer_manager):
-        """Should be able to register prefetch callback."""
-        await buffer_manager.initialize()
-        
-        prefetch_called = False
-        
-        async def prefetch_callback(session_id, count_needed):
-            nonlocal prefetch_called
-            prefetch_called = True
-            return []
-        
-        if hasattr(buffer_manager, 'set_prefetch_callback'):
-            buffer_manager.set_prefetch_callback(prefetch_callback)
-            
-            # Trigger prefetch by going low
-            await buffer_manager.add('session_123', MockSong('1', 'Song', 'Artist'))
-            await buffer_manager.get_next('session_123')
-            
-            # Give async callback time to run
-            await asyncio.sleep(0.1)
-
-
-class TestBufferPerSession:
-    """Tests for per-session buffer isolation."""
-    
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager."""
-        config = BufferConfig(size=5)
-        return BufferManager(config)
-    
-    @pytest.mark.asyncio
-    async def test_separate_buffers_per_session(self, buffer_manager):
+    def test_separate_buffers_per_session(self):
         """Each session should have its own buffer."""
-        await buffer_manager.initialize()
+        manager = create_mocked_buffer_manager()
+        buffer1 = manager.get_buffer("session_1")
+        buffer2 = manager.get_buffer("session_2")
         
-        await buffer_manager.add('session_1', MockSong('1', 'Song 1', 'Artist'))
-        await buffer_manager.add('session_2', MockSong('2', 'Song 2', 'Artist'))
-        
-        assert buffer_manager.size('session_1') == 1
-        assert buffer_manager.size('session_2') == 1
-    
-    @pytest.mark.asyncio
-    async def test_session_buffer_isolation(self, buffer_manager):
-        """Getting from one session should not affect another."""
-        await buffer_manager.initialize()
-        
-        await buffer_manager.add('session_1', MockSong('1', 'Song 1', 'Artist'))
-        await buffer_manager.add('session_2', MockSong('2', 'Song 2', 'Artist'))
-        
-        song = await buffer_manager.get_next('session_1')
-        
-        assert song.id == '1'
-        assert buffer_manager.size('session_1') == 0
-        assert buffer_manager.size('session_2') == 1
+        assert buffer1 is not buffer2
+        assert buffer1.session_id == "session_1"
+        assert buffer2.session_id == "session_2"
 
 
-class TestBufferClearing:
-    """Tests for buffer clearing operations."""
+class TestBufferManagerRemoveBuffer:
+    """Tests for remove_buffer method."""
     
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager."""
-        config = BufferConfig(size=5)
-        return BufferManager(config)
-    
-    @pytest.mark.asyncio
-    async def test_clear_session_buffer(self, buffer_manager):
-        """Should be able to clear a session's buffer."""
-        await buffer_manager.initialize()
+    def test_remove_buffer(self):
+        """remove_buffer should delete session's buffer."""
+        manager = create_mocked_buffer_manager()
         
-        for i in range(3):
-            await buffer_manager.add('session_123', MockSong(str(i), 'Song', 'Artist'))
+        # Create buffer
+        buffer = manager.get_buffer("session_123")
+        rec = create_mock_recommendation("1", "Song", "Artist")
+        buffer.add(rec, BufferSlotType.SAFE)
         
-        await buffer_manager.clear('session_123')
+        # Remove
+        manager.remove_buffer("session_123")
         
-        assert buffer_manager.size('session_123') == 0
-    
-    @pytest.mark.asyncio
-    async def test_clear_all_buffers(self, buffer_manager):
-        """Should be able to clear all buffers."""
-        await buffer_manager.initialize()
-        
-        await buffer_manager.add('session_1', MockSong('1', 'Song', 'Artist'))
-        await buffer_manager.add('session_2', MockSong('2', 'Song', 'Artist'))
-        
-        await buffer_manager.clear_all()
-        
-        assert buffer_manager.size('session_1') == 0
-        assert buffer_manager.size('session_2') == 0
+        # Get again should create new empty buffer
+        new_buffer = manager.get_buffer("session_123")
+        assert new_buffer.current_size == 0
 
 
-class TestBufferUrgency:
-    """Tests for urgency-based refill."""
-    
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager."""
-        config = BufferConfig(size=5, low_threshold=2)
-        return BufferManager(config)
+class TestBufferManagerGetNextSong:
+    """Tests for get_next_song method."""
     
     @pytest.mark.asyncio
-    async def test_urgency_level_empty(self, buffer_manager):
-        """Empty buffer should have highest urgency."""
-        await buffer_manager.initialize()
+    async def test_get_next_song_from_buffer(self):
+        """get_next_song should pop from buffer."""
+        manager = create_mocked_buffer_manager()
+        await manager.initialize()
         
-        if hasattr(buffer_manager, 'get_urgency'):
-            urgency = buffer_manager.get_urgency('session_123')
-            assert urgency == 'critical' or urgency == 1.0
+        # Pre-fill buffer
+        buffer = manager.get_buffer("session_123")
+        rec = create_mock_recommendation("1", "Test Song", "Artist")
+        buffer.add(rec, BufferSlotType.SAFE)
+        
+        song = await manager.get_next_song("session_123", "guild_123")
+        
+        assert song is not None
+        assert song.identifier.title == "Test Song"
+        assert buffer.current_size == 0  # Was removed
     
     @pytest.mark.asyncio
-    async def test_urgency_level_full(self, buffer_manager):
-        """Full buffer should have no urgency."""
-        await buffer_manager.initialize()
+    async def test_get_next_song_empty_buffer(self):
+        """get_next_song on empty buffer returns None."""
+        manager = create_mocked_buffer_manager()
+        await manager.initialize()
         
-        for i in range(5):
-            await buffer_manager.add('session_123', MockSong(str(i), 'Song', 'Artist'))
-        
-        if hasattr(buffer_manager, 'get_urgency'):
-            urgency = buffer_manager.get_urgency('session_123')
-            assert urgency == 'none' or urgency == 0.0
+        song = await manager.get_next_song("session_123", "guild_123")
+        assert song is None
     
     @pytest.mark.asyncio
-    async def test_songs_needed_count(self, buffer_manager):
-        """Should calculate how many songs needed to fill."""
-        await buffer_manager.initialize()
+    async def test_get_next_song_queues_for_analysis(self):
+        """get_next_song should queue returned song for analysis."""
+        manager = create_mocked_buffer_manager()
+        await manager.initialize()
         
-        await buffer_manager.add('session_123', MockSong('1', 'Song', 'Artist'))
-        await buffer_manager.add('session_123', MockSong('2', 'Song', 'Artist'))
+        buffer = manager.get_buffer("session_123")
+        rec = create_mock_recommendation("1", "Test Song", "Artist")
+        buffer.add(rec, BufferSlotType.SAFE)
         
-        needed = buffer_manager.songs_needed('session_123')
-        assert needed == 3  # 5 - 2 = 3
-
-
-class TestBufferPeek:
-    """Tests for peeking at buffer contents."""
-    
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager."""
-        config = BufferConfig(size=5)
-        return BufferManager(config)
-    
-    @pytest.mark.asyncio
-    async def test_peek_next(self, buffer_manager):
-        """Should be able to peek at next song without removing."""
-        await buffer_manager.initialize()
+        await manager.get_next_song("session_123", "guild_123")
         
-        song = MockSong('1', 'Song 1', 'Artist')
-        await buffer_manager.add('session_123', song)
-        
-        if hasattr(buffer_manager, 'peek'):
-            peeked = await buffer_manager.peek('session_123')
-            assert peeked.id == '1'
-            assert buffer_manager.size('session_123') == 1  # Still there
-    
-    @pytest.mark.asyncio
-    async def test_peek_all(self, buffer_manager):
-        """Should be able to see all buffered songs."""
-        await buffer_manager.initialize()
-        
-        for i in range(3):
-            await buffer_manager.add('session_123', MockSong(str(i), 'Song', 'Artist'))
-        
-        if hasattr(buffer_manager, 'peek_all'):
-            songs = await buffer_manager.peek_all('session_123')
-            assert len(songs) == 3
-            assert buffer_manager.size('session_123') == 3  # All still there
-
-
-class TestBufferEmptyHandling:
-    """Tests for empty buffer handling."""
-    
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager."""
-        config = BufferConfig(size=5)
-        return BufferManager(config)
-    
-    @pytest.mark.asyncio
-    async def test_get_from_empty_buffer(self, buffer_manager):
-        """Getting from empty buffer should return None or raise."""
-        await buffer_manager.initialize()
-        
-        result = await buffer_manager.get_next('session_123')
-        assert result is None
-    
-    @pytest.mark.asyncio
-    async def test_is_empty(self, buffer_manager):
-        """Should correctly report if buffer is empty."""
-        await buffer_manager.initialize()
-        
-        assert buffer_manager.is_empty('session_123') is True
-        
-        await buffer_manager.add('session_123', MockSong('1', 'Song', 'Artist'))
-        assert buffer_manager.is_empty('session_123') is False
-
-
-class TestBufferMaxSize:
-    """Tests for buffer max size enforcement."""
-    
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager with size 5."""
-        config = BufferConfig(size=5)
-        return BufferManager(config)
-    
-    @pytest.mark.asyncio
-    async def test_buffer_respects_max_size(self, buffer_manager):
-        """Should not exceed max size."""
-        await buffer_manager.initialize()
-        
-        # Try to add 7 songs
-        for i in range(7):
-            await buffer_manager.add('session_123', MockSong(str(i), 'Song', 'Artist'))
-        
-        assert buffer_manager.size('session_123') <= 5
-    
-    @pytest.mark.asyncio
-    async def test_is_full(self, buffer_manager):
-        """Should correctly report if buffer is full."""
-        await buffer_manager.initialize()
-        
-        assert buffer_manager.is_full('session_123') is False
-        
-        for i in range(5):
-            await buffer_manager.add('session_123', MockSong(str(i), 'Song', 'Artist'))
-        
-        assert buffer_manager.is_full('session_123') is True
+        # Verify analyzer.enqueue was called
+        manager.analyzer.enqueue.assert_called()
 
 
 # ============================================================================
-# Apple Music-Style Slot Type Tests (V3 Clarification)
+# Buffer Composition Tests (Apple Music-style slot allocation)
 # ============================================================================
 
-class TestBufferSlotTypes:
-    """Tests for SAFE/EXPLORATORY slot type system."""
+class TestBufferComposition:
+    """Tests for BUFFER_COMPOSITION configuration."""
     
     def test_slot_type_enum_exists(self):
-        """BufferSlotType enum should exist."""
-        from modules.music.Autoplay_Engine.v3.buffer_manager import BufferSlotType
-        
-        assert hasattr(BufferSlotType, 'SAFE')
-        assert hasattr(BufferSlotType, 'EXPLORATORY')
+        """BufferSlotType enum should have SAFE and EXPLORATORY."""
+        assert BufferSlotType.SAFE.value == "safe"
+        assert BufferSlotType.EXPLORATORY.value == "exploratory"
     
-    def test_buffer_composition_config(self):
-        """BUFFER_COMPOSITION should define phase compositions."""
-        from modules.music.Autoplay_Engine.v3.buffer_manager import BUFFER_COMPOSITION
-        
-        assert 'early' in BUFFER_COMPOSITION
-        assert 'establishing' in BUFFER_COMPOSITION
-        assert 'confident' in BUFFER_COMPOSITION
+    def test_composition_by_session_state(self):
+        """BUFFER_COMPOSITION should define ratios by state."""
+        assert SessionState.COLD in BUFFER_COMPOSITION
+        assert SessionState.WARM in BUFFER_COMPOSITION
+        assert SessionState.HOT in BUFFER_COMPOSITION
+        assert SessionState.EXTENDED in BUFFER_COMPOSITION
     
-    def test_early_phase_composition(self):
-        """Early phase should be 80% safe (4 SAFE, 1 EXPLORATORY)."""
-        from modules.music.Autoplay_Engine.v3.buffer_manager import (
-            BUFFER_COMPOSITION, BufferSlotType
-        )
-        
-        early = BUFFER_COMPOSITION['early']
-        safe_count = early.get(BufferSlotType.SAFE, 0)
-        exploratory_count = early.get(BufferSlotType.EXPLORATORY, 0)
-        
-        # Should be 4:1 ratio
-        assert safe_count == 4
-        assert exploratory_count == 1
+    def test_cold_state_composition(self):
+        """Cold state should be mostly safe (4 safe, 1 exploratory)."""
+        safe, exploratory = BUFFER_COMPOSITION[SessionState.COLD]
+        assert safe == 4
+        assert exploratory == 1
     
-    def test_establishing_phase_composition(self):
-        """Establishing phase should be 60% safe (3 SAFE, 2 EXPLORATORY)."""
-        from modules.music.Autoplay_Engine.v3.buffer_manager import (
-            BUFFER_COMPOSITION, BufferSlotType
-        )
-        
-        establishing = BUFFER_COMPOSITION['establishing']
-        safe_count = establishing.get(BufferSlotType.SAFE, 0)
-        exploratory_count = establishing.get(BufferSlotType.EXPLORATORY, 0)
-        
-        assert safe_count == 3
-        assert exploratory_count == 2
+    def test_warm_state_composition(self):
+        """Warm state should be balanced (3 safe, 2 exploratory)."""
+        safe, exploratory = BUFFER_COMPOSITION[SessionState.WARM]
+        assert safe == 3
+        assert exploratory == 2
     
-    def test_confident_phase_composition(self):
-        """Confident phase should be 40% safe (2 SAFE, 3 EXPLORATORY)."""
-        from modules.music.Autoplay_Engine.v3.buffer_manager import (
-            BUFFER_COMPOSITION, BufferSlotType
-        )
-        
-        confident = BUFFER_COMPOSITION['confident']
-        safe_count = confident.get(BufferSlotType.SAFE, 0)
-        exploratory_count = confident.get(BufferSlotType.EXPLORATORY, 0)
-        
-        assert safe_count == 2
-        assert exploratory_count == 3
+    def test_hot_state_composition(self):
+        """Hot state should favor exploration (2 safe, 3 exploratory)."""
+        safe, exploratory = BUFFER_COMPOSITION[SessionState.HOT]
+        assert safe == 2
+        assert exploratory == 3
+    
+    def test_extended_state_composition(self):
+        """Extended state should match hot state."""
+        hot_comp = BUFFER_COMPOSITION[SessionState.HOT]
+        extended_comp = BUFFER_COMPOSITION[SessionState.EXTENDED]
+        assert hot_comp == extended_comp
 
 
-class TestBufferSlotAllocation:
-    """Tests for slot allocation based on session phase."""
+class TestSessionBufferSlotAllocation:
+    """Tests for getting slots needed by type."""
     
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager for slot testing."""
-        config = BufferConfig(size=5)
-        return BufferManager(config)
-    
-    @pytest.mark.asyncio
-    async def test_get_slots_needed_by_type(self, buffer_manager):
-        """Should report needed slots by type."""
-        await buffer_manager.initialize()
+    def test_slots_needed_by_type_empty_buffer(self):
+        """Empty buffer should need full allocation based on state."""
+        buffer = SessionBuffer("session_123", size=5)
         
-        if hasattr(buffer_manager, 'get_slots_needed_by_type'):
-            needed = buffer_manager.get_slots_needed_by_type('session_123', phase='early')
-            
-            from modules.music.Autoplay_Engine.v3.buffer_manager import BufferSlotType
-            
-            assert BufferSlotType.SAFE in needed
-            assert BufferSlotType.EXPLORATORY in needed
-    
-    @pytest.mark.asyncio
-    async def test_phase_detection_early(self, buffer_manager):
-        """Should detect 'early' phase for 0-5 songs played."""
-        await buffer_manager.initialize()
+        # For cold state (4 safe, 1 exploratory)
+        needed = buffer.get_slots_needed_by_type(SessionState.COLD)
         
-        if hasattr(buffer_manager, 'get_session_phase'):
-            # Simulate session with 3 songs played
-            phase = buffer_manager.get_session_phase('session_123', songs_played=3)
-            assert phase == 'early'
+        assert needed[BufferSlotType.SAFE] == 4
+        assert needed[BufferSlotType.EXPLORATORY] == 1
     
-    @pytest.mark.asyncio
-    async def test_phase_detection_establishing(self, buffer_manager):
-        """Should detect 'establishing' phase for 5-15 songs played."""
-        await buffer_manager.initialize()
+    def test_slots_needed_partial_fill(self):
+        """Partially filled buffer should calculate remaining slots."""
+        buffer = SessionBuffer("session_123", size=5)
         
-        if hasattr(buffer_manager, 'get_session_phase'):
-            phase = buffer_manager.get_session_phase('session_123', songs_played=10)
-            assert phase == 'establishing'
-    
-    @pytest.mark.asyncio
-    async def test_phase_detection_confident(self, buffer_manager):
-        """Should detect 'confident' phase for 15+ songs played."""
-        await buffer_manager.initialize()
+        # Add 2 safe songs
+        for i in range(2):
+            rec = create_mock_recommendation(str(i), f"Song {i}", "Artist")
+            buffer.add(rec, BufferSlotType.SAFE)
         
-        if hasattr(buffer_manager, 'get_session_phase'):
-            phase = buffer_manager.get_session_phase('session_123', songs_played=20)
-            assert phase == 'confident'
+        # For cold state (4 safe, 1 exploratory), with 2 safe already
+        needed = buffer.get_slots_needed_by_type(SessionState.COLD)
+        
+        # Should need 2 more safe (4-2) and 1 exploratory
+        assert needed[BufferSlotType.SAFE] == 2
+        assert needed[BufferSlotType.EXPLORATORY] == 1
 
 
-class TestExploratoryTracking:
-    """Tests for tracking exploratory song success."""
-    
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager for tracking tests."""
-        config = BufferConfig(size=5)
-        return BufferManager(config)
-    
-    @pytest.mark.asyncio
-    async def test_track_exploratory_success(self, buffer_manager):
-        """Should track success rate of exploratory picks."""
-        await buffer_manager.initialize()
-        
-        if hasattr(buffer_manager, 'record_exploratory_outcome'):
-            buffer_manager.record_exploratory_outcome('session_123', 'song_1', success=True)
-            buffer_manager.record_exploratory_outcome('session_123', 'song_2', success=False)
-            
-            if hasattr(buffer_manager, 'get_exploratory_success_rate'):
-                rate = buffer_manager.get_exploratory_success_rate('session_123')
-                assert 0 <= rate <= 1
-    
-    @pytest.mark.asyncio
-    async def test_adjust_allocation_based_on_success(self, buffer_manager):
-        """Should adjust slot allocation based on exploratory success."""
-        await buffer_manager.initialize()
-        
-        # If exploratory songs are succeeding, may increase their allocation
-        # If failing, may reduce
-        pass  # Implementation-dependent
+# ============================================================================
+# BufferManager Shutdown Tests
+# ============================================================================
 
-
-class TestSlotTypedRefill:
-    """Tests for slot-typed buffer refill logic."""
-    
-    @pytest.fixture
-    def buffer_manager(self):
-        """Create buffer manager for refill tests."""
-        config = BufferConfig(size=5)
-        return BufferManager(config)
+class TestBufferManagerShutdown:
+    """Tests for BufferManager shutdown."""
     
     @pytest.mark.asyncio
-    async def test_add_with_slot_type(self, buffer_manager):
-        """Should accept slot type when adding songs."""
-        await buffer_manager.initialize()
+    async def test_shutdown(self):
+        """Shutdown should cancel background tasks."""
+        manager = create_mocked_buffer_manager()
+        await manager.initialize()
         
-        from modules.music.Autoplay_Engine.v3.buffer_manager import BufferSlotType
+        # Shutdown
+        await manager.shutdown()
         
-        if hasattr(buffer_manager, 'add_with_type'):
-            await buffer_manager.add_with_type(
-                'session_123',
-                MockSong('1', 'Safe Song', 'Artist'),
-                slot_type=BufferSlotType.SAFE
-            )
-            await buffer_manager.add_with_type(
-                'session_123',
-                MockSong('2', 'Exploratory Song', 'New Artist'),
-                slot_type=BufferSlotType.EXPLORATORY
-            )
-    
-    @pytest.mark.asyncio
-    async def test_refill_respects_composition(self, buffer_manager):
-        """Refill should maintain target slot type composition."""
-        await buffer_manager.initialize()
-        
-        # When refilling, should request appropriate mix of SAFE/EXPLORATORY
-        # based on current phase
-        pass  # Implementation-dependent
+        # Verify running flag is False
+        assert manager._running is False
 

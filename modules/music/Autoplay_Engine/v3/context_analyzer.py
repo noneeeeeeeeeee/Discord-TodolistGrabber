@@ -336,11 +336,11 @@ class ContextAnalyzer:
         """Update session state based on play count."""
         play_count = len(session.playback_history)
         
-        if play_count <= self.config.cold_start_threshold:
+        if play_count <= self.config.thresholds.cold_max:
             session.state = SessionState.COLD
-        elif play_count <= self.config.warm_threshold:
+        elif play_count <= self.config.thresholds.warm_max:
             session.state = SessionState.WARM
-        elif play_count <= self.config.hot_threshold:
+        elif play_count < self.config.thresholds.extended_min:
             session.state = SessionState.HOT
         else:
             session.state = SessionState.EXTENDED

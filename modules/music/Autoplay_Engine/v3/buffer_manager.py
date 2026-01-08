@@ -659,10 +659,11 @@ class BufferManager:
                     logger.error(f"Exploratory refill failed: {e}")
             
             if added > 0:
+                state_str = session_state.value if hasattr(session_state, 'value') else str(session_state)
                 logger.debug(
                     f"Refilled buffer with {added} songs "
                     f"({buffer.current_size}/{buffer.size}, "
-                    f"state={session_state.value}, success_rate={success_rate:.1%})"
+                    f"state={state_str}, success_rate={success_rate:.1%})"
                 )
             
             return added

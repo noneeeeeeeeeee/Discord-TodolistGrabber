@@ -214,17 +214,16 @@ class MusicPlayer(commands.Cog):
                 self._autoplay_config = get_autoplay_config()
                 self._autoplay_engine = get_autoplay_engine(bot)
                 if self._autoplay_engine and self._autoplay_engine.is_available():
-                    version = self._autoplay_config.get_autoplay_version()
                     LOG.info(
-                        f"[AutoPlay] ✅ Autoplay engine {version.upper()} is READY and AVAILABLE!"
+                        "[AutoPlay] ✅ Autoplay engine V3 is READY and AVAILABLE!"
                     )
                     self._autoplay_available = True
 
-                    # Start background workers if supported (V3+)
+                    # Start background workers if supported
                     if hasattr(self._autoplay_engine, "start"):
                         try:
                             self._autoplay_engine.start()
-                            LOG.info(f"[AutoPlay] Started background workers for {version.upper()}")
+                            LOG.info("[AutoPlay] Started background workers for V3")
                         except Exception as e:
                             LOG.error(f"[AutoPlay] Failed to start background workers: {e}")
                 else:
@@ -1801,15 +1800,20 @@ class MusicPlayer(commands.Cog):
 
         # Enqueue the first recommended track
         track_key, playable_track = recommendations[0]
-        LOG.info(f"[AutoPlay] 🎵 Found recommendation: {playable_track.title}")
+        # playable_track is a dict from V3 wrapper with keys: artist, title, url, etc.
+        track_title = playable_track.get("title", "Unknown") if isinstance(playable_track, dict) else getattr(playable_track, "title", "Unknown")
+        track_artist = playable_track.get("artist", "Unknown") if isinstance(playable_track, dict) else getattr(playable_track, "author", "Unknown")
+        LOG.info(f"[AutoPlay] 🎵 Found recommendation: {track_artist} - {track_title}")
 
         try:
             # Create entry for the track
             item = {
-                "title": playable_track.title,
+                "title": track_title,
+                "author": track_artist,
                 "source": playable_track,
                 "requester": "autoplay",  # Special marker for autoplay
                 "autoplay": True,
+                "url": track_key,  # The URL for playback
             }
 
             result = await self.enqueue(
@@ -1817,18 +1821,18 @@ class MusicPlayer(commands.Cog):
             )
 
             if result.success:
-                LOG.info(f"▶️ [AutoPlay] Now playing: {playable_track.title}")
+                LOG.info(f"▶️ [AutoPlay] Now playing: {track_artist} - {track_title}")
                 # Store this as last successful autoplay track
                 self._last_successful_autoplay_track[guild_id] = track_info.copy()
 
                 # Send appropriate notification based on whether this is first or consecutive track
                 if is_first_autoplay:
                     await self._send_autoplay_started_message(
-                        player.guild, playable_track.title
+                        player.guild, track_title
                     )
                 else:
                     await self._send_autoplay_now_playing_message(
-                        player.guild, playable_track.title
+                        player.guild, track_title
                     )
 
                 return True

@@ -8,27 +8,38 @@ import pytest
 import asyncio
 import sys
 import os
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.music.Autoplay_Engine.v3.context_analyzer import ContextAnalyzer
-from modules.music.Autoplay_Engine.v3.constants import SkipType, V3Config
+from modules.music.Autoplay_Engine.v3.context_analyzer import (
+    ContextAnalyzer,
+    PlaybackEvent,
+    PreferenceScore,
+    SessionProfile,
+    get_context_analyzer
+)
+from modules.music.Autoplay_Engine.v3.constants import SessionState, V3Config
 
 
-@dataclass
-class MockSong:
-    """Mock song for testing."""
-    id: str
-    title: str
-    artist: str
-    duration: int = 180
-    bpm: int = 120
-    genre: str = 'rock'
-    decade: str = '2000s'
+def create_mock_cache():
+    """Create a mock cache manager."""
+    cache = MagicMock()
+    cache.initialize = AsyncMock()
+    cache.get_metadata = AsyncMock(return_value=None)
+    return cache
+
+
+def create_mock_event_bus():
+    """Create a mock event bus."""
+    bus = MagicMock()
+    bus.subscribe = MagicMock()
+    bus.unsubscribe = MagicMock()
+    bus.publish = AsyncMock()
+    return bus
 
 
 class TestContextAnalyzerInitialization:
@@ -37,16 +48,94 @@ class TestContextAnalyzerInitialization:
     def test_context_analyzer_creation(self):
         """Verify context analyzer can be created."""
         config = V3Config()
-        analyzer = ContextAnalyzer(config)
+        cache = create_mock_cache()
+        bus = create_mock_event_bus()
+        analyzer = ContextAnalyzer(config, cache, bus)
         assert analyzer is not None
+        assert analyzer._initialized is False
     
     @pytest.mark.asyncio
     async def test_initialize(self):
         """Context analyzer should initialize successfully."""
         config = V3Config()
-        analyzer = ContextAnalyzer(config)
+        cache = create_mock_cache()
+        bus = create_mock_event_bus()
+        analyzer = ContextAnalyzer(config, cache, bus)
+        
         await analyzer.initialize()
+        
         assert analyzer._initialized is True
+        cache.initialize.assert_awaited_once()
+    
+    @pytest.mark.asyncio
+    async def test_initialize_idempotent(self):
+        """Initialize should be idempotent."""
+        config = V3Config()
+        cache = create_mock_cache()
+        bus = create_mock_event_bus()
+        analyzer = ContextAnalyzer(config, cache, bus)
+        
+        await analyzer.initialize()
+        await analyzer.initialize()
+        
+        # Should only initialize cache once
+        cache.initialize.assert_awaited_once()
+    
+    @pytest.mark.asyncio
+    async def test_shutdown(self):
+        """Shutdown should unsubscribe from events."""
+        config = V3Config()
+        cache = create_mock_cache()
+        bus = create_mock_event_bus()
+        analyzer = ContextAnalyzer(config, cache, bus)
+        
+        await analyzer.initialize()
+        await analyzer.shutdown()
+        
+        assert analyzer._initialized is False
+        assert bus.unsubscribe.call_count == 2
+
+
+class TestSessionManagement:
+    """Tests for session creation and management."""
+    
+    def test_get_or_create_session_creates_new(self):
+        """Should create new session if not exists."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        
+        session = analyzer.get_or_create_session("session_1", "guild_123")
+        
+        assert session is not None
+        assert session.session_id == "session_1"
+        assert session.guild_id == "guild_123"
+        assert session.state == SessionState.COLD
+    
+    def test_get_or_create_session_returns_existing(self):
+        """Should return existing session."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        
+        session1 = analyzer.get_or_create_session("session_1", "guild_123")
+        session2 = analyzer.get_or_create_session("session_1", "guild_123")
+        
+        assert session1 is session2
+    
+    def test_end_session_removes(self):
+        """End session should remove and return profile."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        
+        session = analyzer.get_or_create_session("session_1", "guild_123")
+        ended = analyzer.end_session("session_1")
+        
+        assert ended is session
+        assert analyzer._sessions.get("session_1") is None
+    
+    def test_end_session_nonexistent(self):
+        """End session should return None for nonexistent."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        
+        result = analyzer.end_session("nonexistent")
+        
+        assert result is None
 
 
 class TestAppleMusicStyleSkipDetection:
@@ -55,454 +144,552 @@ class TestAppleMusicStyleSkipDetection:
     @pytest.fixture
     def analyzer(self):
         """Create analyzer for skip tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
+        return ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
     
-    def test_immediate_skip(self, analyzer):
-        """Skip within first 5 seconds should be IMMEDIATE."""
-        skip_type = analyzer.classify_skip(
-            play_duration=3,
-            total_duration=180
+    def test_ended_normally_not_skip(self, analyzer):
+        """Song that ended normally is not a skip."""
+        result = analyzer._detect_skip(
+            duration_played_ms=5000,
+            total_duration_ms=180000,
+            ended_normally=True
         )
-        assert skip_type == SkipType.IMMEDIATE
+        assert result is False
     
-    def test_early_skip(self, analyzer):
-        """Skip at 5-25% should be EARLY."""
-        # 25% of 180s = 45s
-        skip_type = analyzer.classify_skip(
-            play_duration=30,  # ~17%
-            total_duration=180
+    def test_short_song_skip_threshold(self, analyzer):
+        """Short song (<30s): skip if <50% played."""
+        # 20s song, played 8s = 40% - should be skip
+        result = analyzer._detect_skip(
+            duration_played_ms=8000,
+            total_duration_ms=20000,
+            ended_normally=False
         )
-        assert skip_type == SkipType.EARLY
+        assert result is True
     
-    def test_mid_skip(self, analyzer):
-        """Skip at 25-75% should be MID."""
-        skip_type = analyzer.classify_skip(
-            play_duration=90,  # 50%
-            total_duration=180
+    def test_short_song_not_skip(self, analyzer):
+        """Short song (<30s): not skip if >=50% played."""
+        # 20s song, played 12s = 60% - should NOT be skip
+        result = analyzer._detect_skip(
+            duration_played_ms=12000,
+            total_duration_ms=20000,
+            ended_normally=False
         )
-        assert skip_type == SkipType.MID
+        assert result is False
     
-    def test_late_skip(self, analyzer):
-        """Skip at 75-95% should be LATE."""
-        skip_type = analyzer.classify_skip(
-            play_duration=160,  # ~89%
-            total_duration=180
+    def test_long_song_skip_threshold(self, analyzer):
+        """Long song (>=30s): skip if <30s played."""
+        # 3min song, played 20s - should be skip
+        result = analyzer._detect_skip(
+            duration_played_ms=20000,
+            total_duration_ms=180000,
+            ended_normally=False
         )
-        assert skip_type == SkipType.LATE
+        assert result is True
     
-    def test_completed(self, analyzer):
-        """Playing past 95% should be COMPLETED."""
-        skip_type = analyzer.classify_skip(
-            play_duration=175,  # ~97%
-            total_duration=180
+    def test_long_song_not_skip(self, analyzer):
+        """Long song (>=30s): not skip if >=30s played."""
+        # 3min song, played 35s - should NOT be skip
+        result = analyzer._detect_skip(
+            duration_played_ms=35000,
+            total_duration_ms=180000,
+            ended_normally=False
         )
-        assert skip_type == SkipType.COMPLETED
+        assert result is False
     
-    def test_percentage_calculation(self, analyzer):
+    def test_immediate_skip_is_skip(self, analyzer):
+        """Playing only 3 seconds should be a skip."""
+        result = analyzer._detect_skip(
+            duration_played_ms=3000,
+            total_duration_ms=180000,
+            ended_normally=False
+        )
+        assert result is True
+
+
+class TestPlaybackRecording:
+    """Tests for recording playback events."""
+    
+    @pytest.fixture
+    def analyzer(self):
+        """Create initialized analyzer."""
+        cache = create_mock_cache()
+        bus = create_mock_event_bus()
+        analyzer = ContextAnalyzer(cache=cache, event_bus=bus)
+        # Create a session
+        analyzer.get_or_create_session("session_1", "guild_123")
+        return analyzer
+    
+    @pytest.mark.asyncio
+    async def test_record_playback_adds_to_history(self, analyzer):
+        """Recording playback should add to history."""
+        await analyzer.record_playback(
+            session_id="session_1",
+            song_id="song_123",
+            duration_played_ms=180000,
+            total_duration_ms=180000,
+            ended_normally=True
+        )
+        
+        session = analyzer._sessions["session_1"]
+        assert len(session.playback_history) == 1
+        assert session.playback_history[0].song_id == "song_123"
+    
+    @pytest.mark.asyncio
+    async def test_record_playback_updates_play_count(self, analyzer):
+        """Recording playback should update play count."""
+        for i in range(3):
+            await analyzer.record_playback(
+                session_id="session_1",
+                song_id=f"song_{i}",
+                duration_played_ms=180000,
+                total_duration_ms=180000,
+                ended_normally=True
+            )
+        
+        session = analyzer._sessions["session_1"]
+        assert session.total_plays == 3
+        assert session.skip_count == 0
+    
+    @pytest.mark.asyncio
+    async def test_record_playback_detects_skip(self, analyzer):
+        """Recording should detect skips."""
+        await analyzer.record_playback(
+            session_id="session_1",
+            song_id="song_123",
+            duration_played_ms=5000,  # Only 5 seconds
+            total_duration_ms=180000,
+            ended_normally=False  # User stopped it
+        )
+        
+        session = analyzer._sessions["session_1"]
+        assert session.skip_count == 1
+        assert session.playback_history[0].was_skipped is True
+    
+    @pytest.mark.asyncio
+    async def test_record_playback_consecutive_skips(self, analyzer):
+        """Consecutive skips should be tracked."""
+        for i in range(3):
+            await analyzer.record_playback(
+                session_id="session_1",
+                song_id=f"song_{i}",
+                duration_played_ms=5000,
+                total_duration_ms=180000,
+                ended_normally=False
+            )
+        
+        session = analyzer._sessions["session_1"]
+        assert session.consecutive_skips == 3
+    
+    @pytest.mark.asyncio
+    async def test_record_playback_resets_consecutive_on_completion(self, analyzer):
+        """Completing a song should reset consecutive skips."""
+        # Skip 2 songs
+        for i in range(2):
+            await analyzer.record_playback(
+                session_id="session_1",
+                song_id=f"song_{i}",
+                duration_played_ms=5000,
+                total_duration_ms=180000,
+                ended_normally=False
+            )
+        
+        # Complete one
+        await analyzer.record_playback(
+            session_id="session_1",
+            song_id="song_complete",
+            duration_played_ms=180000,
+            total_duration_ms=180000,
+            ended_normally=True
+        )
+        
+        session = analyzer._sessions["session_1"]
+        assert session.consecutive_skips == 0
+    
+    @pytest.mark.asyncio
+    async def test_record_playback_ignores_unknown_session(self, analyzer):
+        """Recording for unknown session should be ignored."""
+        await analyzer.record_playback(
+            session_id="nonexistent",
+            song_id="song_123",
+            duration_played_ms=180000,
+            total_duration_ms=180000,
+            ended_normally=True
+        )
+        # Should not raise
+
+
+class TestSessionStateTransitions:
+    """Tests for session state updates based on play count."""
+    
+    @pytest.fixture
+    def analyzer(self):
+        """Create analyzer with session."""
+        cache = create_mock_cache()
+        bus = create_mock_event_bus()
+        analyzer = ContextAnalyzer(cache=cache, event_bus=bus)
+        analyzer.get_or_create_session("session_1", "guild_123")
+        return analyzer
+    
+    @pytest.mark.asyncio
+    async def test_starts_cold(self, analyzer):
+        """Session should start in COLD state."""
+        session = analyzer._sessions["session_1"]
+        assert session.state == SessionState.COLD
+    
+    @pytest.mark.asyncio
+    async def test_cold_to_warm_transition(self, analyzer):
+        """Should transition to WARM after cold_max plays."""
+        # Play enough songs to exit COLD (default cold_max=10)
+        for i in range(11):
+            await analyzer.record_playback(
+                session_id="session_1",
+                song_id=f"song_{i}",
+                duration_played_ms=180000,
+                total_duration_ms=180000,
+                ended_normally=True
+            )
+        
+        session = analyzer._sessions["session_1"]
+        assert session.state == SessionState.WARM
+    
+    @pytest.mark.asyncio
+    async def test_warm_to_hot_transition(self, analyzer):
+        """Should transition to HOT after warm_max plays."""
+        # Play enough songs to get to HOT (default warm_max=25)
+        for i in range(26):
+            await analyzer.record_playback(
+                session_id="session_1",
+                song_id=f"song_{i}",
+                duration_played_ms=180000,
+                total_duration_ms=180000,
+                ended_normally=True
+            )
+        
+        session = analyzer._sessions["session_1"]
+        assert session.state == SessionState.HOT
+
+
+class TestPreferenceTracking:
+    """Tests for preference score tracking."""
+    
+    def test_preference_score_net_score(self):
+        """Net score should account for plays and skips."""
+        pref = PreferenceScore(
+            value="rock",
+            score=5.0,
+            play_count=5,
+            skip_count=2,
+            last_played=time.time()
+        )
+        
+        # Net = score * recency - skips * 0.5
+        assert pref.net_score > 0  # Should be positive with recent plays
+    
+    def test_preference_score_recency_decay(self):
+        """Older preferences should have lower recency weight."""
+        # Recent preference
+        recent = PreferenceScore(
+            value="rock",
+            score=5.0,
+            play_count=5,
+            skip_count=0,
+            last_played=time.time()
+        )
+        
+        # Old preference (48 hours ago)
+        old = PreferenceScore(
+            value="jazz",
+            score=5.0,
+            play_count=5,
+            skip_count=0,
+            last_played=time.time() - 48 * 3600
+        )
+        
+        assert recent._recency_weight() > old._recency_weight()
+
+
+class TestPlaybackEventProperties:
+    """Tests for PlaybackEvent dataclass properties."""
+    
+    def test_play_percentage_calculation(self):
         """Should correctly calculate play percentage."""
-        percentage = analyzer._calculate_percentage(90, 180)
-        assert percentage == 50.0
+        event = PlaybackEvent(
+            song_id="test",
+            started_at=time.time() - 90,
+            duration_played_ms=90000,
+            total_duration_ms=180000
+        )
+        
+        assert event.play_percentage == 0.5
+    
+    def test_play_percentage_zero_duration(self):
+        """Should handle zero total duration."""
+        event = PlaybackEvent(
+            song_id="test",
+            started_at=time.time(),
+            duration_played_ms=0,
+            total_duration_ms=0
+        )
+        
+        assert event.play_percentage == 0.0
+    
+    def test_play_percentage_capped_at_one(self):
+        """Percentage should not exceed 1.0."""
+        event = PlaybackEvent(
+            song_id="test",
+            started_at=time.time() - 200,
+            duration_played_ms=200000,
+            total_duration_ms=180000  # Played more than total
+        )
+        
+        assert event.play_percentage == 1.0
 
 
-class TestSkipImpact:
-    """Tests for skip impact on preferences."""
+class TestSessionProfileProperties:
+    """Tests for SessionProfile dataclass properties."""
     
-    @pytest.fixture
-    def analyzer(self):
-        """Create analyzer for impact tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
+    def test_skip_rate_calculation(self):
+        """Should correctly calculate skip rate."""
+        profile = SessionProfile(
+            session_id="test",
+            guild_id="guild",
+            started_at=time.time(),
+            total_plays=10,
+            skip_count=3
+        )
+        
+        assert profile.skip_rate == 0.3
     
-    def test_immediate_skip_strong_negative(self, analyzer):
-        """Immediate skip should have strong negative impact."""
-        impact = analyzer.get_skip_impact(SkipType.IMMEDIATE)
-        assert impact < 0
-        assert impact <= -0.8  # Very negative
+    def test_skip_rate_no_plays(self):
+        """Skip rate should be 0 with no plays."""
+        profile = SessionProfile(
+            session_id="test",
+            guild_id="guild",
+            started_at=time.time()
+        )
+        
+        assert profile.skip_rate == 0.0
     
-    def test_early_skip_moderate_negative(self, analyzer):
-        """Early skip should have moderate negative impact."""
-        impact = analyzer.get_skip_impact(SkipType.EARLY)
-        assert impact < 0
-        assert impact > -0.8  # Less negative than immediate
+    def test_avg_energy_calculation(self):
+        """Should calculate average energy from preferences."""
+        profile = SessionProfile(
+            session_id="test",
+            guild_id="guild",
+            started_at=time.time(),
+            energy_preferences=[0.5, 0.6, 0.7, 0.8, 0.9]
+        )
+        
+        assert profile.avg_energy == 0.7
     
-    def test_mid_skip_slight_negative(self, analyzer):
-        """Mid skip should have slight negative impact."""
-        impact = analyzer.get_skip_impact(SkipType.MID)
-        assert impact <= 0
+    def test_avg_energy_default(self):
+        """Default energy should be 0.5."""
+        profile = SessionProfile(
+            session_id="test",
+            guild_id="guild",
+            started_at=time.time()
+        )
+        
+        assert profile.avg_energy == 0.5
     
-    def test_late_skip_neutral_or_positive(self, analyzer):
-        """Late skip should be neutral or slightly positive."""
-        impact = analyzer.get_skip_impact(SkipType.LATE)
-        assert impact >= -0.1
+    def test_avg_bpm_calculation(self):
+        """Should calculate average BPM from preferences."""
+        profile = SessionProfile(
+            session_id="test",
+            guild_id="guild",
+            started_at=time.time(),
+            bpm_preferences=[100.0, 120.0, 140.0]
+        )
+        
+        assert profile.avg_bpm == 120.0
     
-    def test_completed_positive(self, analyzer):
-        """Completed play should have positive impact."""
-        impact = analyzer.get_skip_impact(SkipType.COMPLETED)
-        assert impact > 0
+    def test_avg_bpm_default(self):
+        """Default BPM should be 120."""
+        profile = SessionProfile(
+            session_id="test",
+            guild_id="guild",
+            started_at=time.time()
+        )
+        
+        assert profile.avg_bpm == 120.0
 
 
-class TestGenrePreferenceTracking:
-    """Tests for genre preference tracking."""
+class TestGetTopPreferences:
+    """Tests for get_top_preferences method."""
     
-    @pytest.fixture
-    def analyzer(self):
-        """Create analyzer for genre tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
+    def test_get_top_genres(self):
+        """Should return top genre preferences."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        session = analyzer.get_or_create_session("session_1", "guild_123")
+        
+        # Add some genre preferences
+        session.genre_preferences["rock"] = PreferenceScore(
+            value="rock", score=5.0, play_count=5, skip_count=0, last_played=time.time()
+        )
+        session.genre_preferences["pop"] = PreferenceScore(
+            value="pop", score=2.0, play_count=2, skip_count=0, last_played=time.time()
+        )
+        
+        top = analyzer.get_top_preferences("session_1", "genres", limit=2)
+        
+        assert len(top) == 2
+        assert top[0][0] == "rock"  # Rock should be first
     
-    @pytest.mark.asyncio
-    async def test_record_genre_play(self, analyzer):
-        """Should record genre plays."""
-        await analyzer.initialize()
+    def test_get_top_preferences_empty_session(self):
+        """Should return empty list for unknown session."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
         
-        song = MockSong(id='1', title='Rock Song', artist='Artist', genre='rock')
+        result = analyzer.get_top_preferences("nonexistent", "genres")
         
-        await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        prefs = await analyzer.get_genre_preferences('session_1')
-        assert 'rock' in prefs
-    
-    @pytest.mark.asyncio
-    async def test_genre_preference_accumulation(self, analyzer):
-        """Multiple plays should accumulate preference."""
-        await analyzer.initialize()
-        
-        for i in range(5):
-            song = MockSong(id=str(i), title=f'Rock Song {i}', artist='Artist', genre='rock')
-            await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        song = MockSong(id='99', title='Pop Song', artist='Artist', genre='pop')
-        await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        prefs = await analyzer.get_genre_preferences('session_1')
-        
-        assert prefs.get('rock', 0) > prefs.get('pop', 0)
-    
-    @pytest.mark.asyncio
-    async def test_genre_penalty_on_skip(self, analyzer):
-        """Skipped genres should be penalized."""
-        await analyzer.initialize()
-        
-        # Play and skip jazz songs
-        for i in range(3):
-            song = MockSong(id=str(i), title=f'Jazz Song {i}', artist='Artist', genre='jazz')
-            await analyzer.record_play('session_1', song, SkipType.IMMEDIATE)
-        
-        prefs = await analyzer.get_genre_preferences('session_1')
-        
-        # Jazz should have negative or low preference
-        assert prefs.get('jazz', 0) <= 0
+        assert result == []
 
 
-class TestArtistPreferenceTracking:
-    """Tests for artist preference tracking."""
+class TestGetAvoidedValues:
+    """Tests for get_avoided_values method."""
     
-    @pytest.fixture
-    def analyzer(self):
-        """Create analyzer for artist tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
+    def test_avoided_genres_high_skip_rate(self):
+        """Should identify genres with high skip rate."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        session = analyzer.get_or_create_session("session_1", "guild_123")
+        
+        # Genre with 80% skip rate
+        session.genre_preferences["metal"] = PreferenceScore(
+            value="metal", score=-3.0, play_count=1, skip_count=4, last_played=time.time()
+        )
+        
+        avoided = analyzer.get_avoided_values("session_1", "genres")
+        
+        assert "metal" in avoided
     
-    @pytest.mark.asyncio
-    async def test_record_artist_play(self, analyzer):
-        """Should record artist plays."""
-        await analyzer.initialize()
+    def test_avoided_needs_enough_samples(self):
+        """Should not avoid with too few samples."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        session = analyzer.get_or_create_session("session_1", "guild_123")
         
-        song = MockSong(id='1', title='Song', artist='Queen', genre='rock')
-        await analyzer.record_play('session_1', song, SkipType.COMPLETED)
+        # Only 2 total plays - not enough samples
+        session.genre_preferences["metal"] = PreferenceScore(
+            value="metal", score=-1.0, play_count=0, skip_count=2, last_played=time.time()
+        )
         
-        prefs = await analyzer.get_artist_preferences('session_1')
-        assert 'Queen' in prefs or 'queen' in [k.lower() for k in prefs.keys()]
-    
-    @pytest.mark.asyncio
-    async def test_artist_preference_from_completions(self, analyzer):
-        """Completed plays should increase artist preference."""
-        await analyzer.initialize()
+        avoided = analyzer.get_avoided_values("session_1", "genres")
         
-        for i in range(3):
-            song = MockSong(id=str(i), title=f'Queen Song {i}', artist='Queen', genre='rock')
-            await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        prefs = await analyzer.get_artist_preferences('session_1')
-        queen_pref = prefs.get('Queen', prefs.get('queen', 0))
-        
-        assert queen_pref > 0
+        assert "metal" not in avoided  # Not enough samples
 
 
-class TestBPMPreferenceTracking:
-    """Tests for BPM preference tracking."""
+class TestReanalysisTriggers:
+    """Tests for should_trigger_reanalysis method."""
     
-    @pytest.fixture
-    def analyzer(self):
-        """Create analyzer for BPM tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
+    def test_trigger_on_consecutive_skips(self):
+        """Should trigger reanalysis after 3 consecutive skips."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        session = analyzer.get_or_create_session("session_1", "guild_123")
+        session.consecutive_skips = 3
+        
+        assert analyzer.should_trigger_reanalysis("session_1") is True
     
-    @pytest.mark.asyncio
-    async def test_record_bpm_preference(self, analyzer):
-        """Should track preferred BPM ranges."""
-        await analyzer.initialize()
+    def test_no_trigger_with_few_skips(self):
+        """Should not trigger with 2 or fewer consecutive skips."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        session = analyzer.get_or_create_session("session_1", "guild_123")
+        session.consecutive_skips = 2
         
-        # Play several songs around 120 BPM
-        for i in range(5):
-            song = MockSong(id=str(i), title=f'Song {i}', artist='Artist', bpm=120 + i * 2)
-            await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        bpm_pref = await analyzer.get_bpm_preference('session_1')
-        
-        # Should prefer around 120 BPM
-        assert 100 <= bpm_pref['preferred_bpm'] <= 140 or bpm_pref is not None
+        assert analyzer.should_trigger_reanalysis("session_1") is False
     
-    @pytest.mark.asyncio
-    async def test_bpm_range_extraction(self, analyzer):
-        """Should extract preferred BPM range."""
-        await analyzer.initialize()
+    def test_trigger_on_high_recent_skip_rate(self):
+        """Should trigger when recent skip rate > 50%."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        session = analyzer.get_or_create_session("session_1", "guild_123")
         
-        # Mix of tempos with preference for faster
-        fast_songs = [MockSong(id=str(i), title=f'Fast {i}', artist='A', bpm=140) for i in range(5)]
-        slow_songs = [MockSong(id=str(i+5), title=f'Slow {i}', artist='A', bpm=80) for i in range(2)]
+        # 6 skips out of 10 recent plays
+        for i in range(4):
+            session.playback_history.append(PlaybackEvent(
+                song_id=f"s{i}", started_at=time.time(), was_skipped=False
+            ))
+        for i in range(6):
+            session.playback_history.append(PlaybackEvent(
+                song_id=f"skip{i}", started_at=time.time(), was_skipped=True
+            ))
         
-        for song in fast_songs:
-            await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        for song in slow_songs:
-            await analyzer.record_play('session_1', song, SkipType.EARLY)
-        
-        bpm_pref = await analyzer.get_bpm_preference('session_1')
-        
-        # Should show preference for faster BPMs
-        if 'range' in bpm_pref:
-            assert bpm_pref['range'][0] >= 100
+        assert analyzer.should_trigger_reanalysis("session_1") is True
 
 
-class TestDecadePreferenceTracking:
-    """Tests for decade preference tracking."""
+class TestGetSessionContext:
+    """Tests for get_session_context method."""
     
-    @pytest.fixture
-    def analyzer(self):
-        """Create analyzer for decade tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
+    def test_context_includes_all_fields(self):
+        """Context should include all required fields."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        session = analyzer.get_or_create_session("session_1", "guild_123")
+        
+        context = analyzer.get_session_context("session_1")
+        
+        assert context is not None
+        assert context["session_id"] == "session_1"
+        assert context["guild_id"] == "guild_123"
+        assert "state" in context
+        assert "play_count" in context
+        assert "skip_rate" in context
+        assert "avg_energy" in context
+        assert "avg_bpm" in context
     
-    @pytest.mark.asyncio
-    async def test_record_decade_preference(self, analyzer):
-        """Should track preferred decades."""
-        await analyzer.initialize()
+    def test_context_unknown_session(self):
+        """Should return None for unknown session."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
         
-        # Play 80s songs
-        for i in range(3):
-            song = MockSong(id=str(i), title=f'80s Song {i}', artist='A', decade='1980s')
-            await analyzer.record_play('session_1', song, SkipType.COMPLETED)
+        context = analyzer.get_session_context("nonexistent")
         
-        prefs = await analyzer.get_decade_preferences('session_1')
-        
-        assert '1980s' in prefs or '80s' in str(prefs)
+        assert context is None
 
 
-class TestTimeWeightedPreferences:
-    """Tests for time-weighted preference calculation."""
+class TestGetPreferenceVector:
+    """Tests for get_preference_vector method."""
     
-    @pytest.fixture
-    def analyzer(self):
-        """Create analyzer for time-weighting tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
+    def test_vector_includes_normalized_scores(self):
+        """Vector should have normalized genre/mood scores."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
+        session = analyzer.get_or_create_session("session_1", "guild_123")
+        
+        session.genre_preferences["rock"] = PreferenceScore(
+            value="rock", score=5.0, play_count=5, skip_count=0, last_played=time.time()
+        )
+        session.energy_preferences.append(0.8)
+        session.bpm_preferences.append(140.0)
+        
+        vector = analyzer.get_preference_vector("session_1")
+        
+        assert vector is not None
+        assert "genre:rock" in vector
+        assert "energy" in vector
+        assert "bpm_normalized" in vector
     
-    @pytest.mark.asyncio
-    async def test_recent_plays_weighted_more(self, analyzer):
-        """Recent plays should have higher weight."""
-        await analyzer.initialize()
+    def test_vector_unknown_session(self):
+        """Should return None for unknown session."""
+        analyzer = ContextAnalyzer(cache=create_mock_cache(), event_bus=create_mock_event_bus())
         
-        # Old play (simulated)
-        old_song = MockSong(id='1', title='Old Song', artist='A', genre='jazz')
+        vector = analyzer.get_preference_vector("nonexistent")
         
-        # Recent plays
-        recent_songs = [
-            MockSong(id=str(i+2), title=f'Recent {i}', artist='B', genre='rock')
-            for i in range(5)
-        ]
-        
-        await analyzer.record_play('session_1', old_song, SkipType.COMPLETED)
-        for song in recent_songs:
-            await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        prefs = await analyzer.get_genre_preferences('session_1')
-        
-        # Rock should be higher due to recency
-        assert prefs.get('rock', 0) >= prefs.get('jazz', 0)
-    
-    @pytest.mark.asyncio
-    async def test_decay_function(self, analyzer):
-        """Older preferences should decay over time."""
-        # Test decay calculation
-        weight_recent = analyzer._calculate_time_weight(0)  # 0 songs ago
-        weight_old = analyzer._calculate_time_weight(20)     # 20 songs ago
-        
-        assert weight_recent > weight_old
+        assert vector is None
 
 
-class TestSessionContextBuilding:
-    """Tests for session context/profile building."""
+class TestGlobalSingleton:
+    """Tests for singleton getter."""
     
-    @pytest.fixture
-    def analyzer(self):
-        """Create analyzer for context tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
+    def test_get_context_analyzer_returns_instance(self):
+        """get_context_analyzer should return instance."""
+        # Reset singleton for test
+        import modules.music.Autoplay_Engine.v3.context_analyzer as ctx_mod
+        ctx_mod._context_analyzer = None
+        
+        analyzer = get_context_analyzer()
+        
+        assert analyzer is not None
+        assert isinstance(analyzer, ContextAnalyzer)
     
-    @pytest.mark.asyncio
-    async def test_build_session_context(self, analyzer):
-        """Should build comprehensive session context."""
-        await analyzer.initialize()
+    def test_get_context_analyzer_returns_same_instance(self):
+        """get_context_analyzer should return same instance."""
+        # Reset singleton for test
+        import modules.music.Autoplay_Engine.v3.context_analyzer as ctx_mod
+        ctx_mod._context_analyzer = None
         
-        # Play variety of songs
-        songs = [
-            MockSong('1', 'Rock 1', 'Queen', genre='rock', bpm=120, decade='1980s'),
-            MockSong('2', 'Rock 2', 'AC/DC', genre='rock', bpm=130, decade='1990s'),
-            MockSong('3', 'Pop 1', 'Madonna', genre='pop', bpm=110, decade='1980s'),
-        ]
+        analyzer1 = get_context_analyzer()
+        analyzer2 = get_context_analyzer()
         
-        for song in songs:
-            await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        context = await analyzer.get_session_context('session_1')
-        
-        assert 'genre_preferences' in context or context is not None
-        assert 'artist_preferences' in context or 'artists' in str(context)
-    
-    @pytest.mark.asyncio
-    async def test_context_includes_history(self, analyzer):
-        """Session context should include play history."""
-        await analyzer.initialize()
-        
-        song = MockSong('1', 'Test Song', 'Artist')
-        await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        context = await analyzer.get_session_context('session_1')
-        
-        if 'history' in context:
-            assert len(context['history']) > 0
-
-
-class TestMomentumTracking:
-    """Tests for session momentum/energy tracking."""
-    
-    @pytest.fixture
-    def analyzer(self):
-        """Create analyzer for momentum tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
-    
-    @pytest.mark.asyncio
-    async def test_completion_streak_increases_momentum(self, analyzer):
-        """Consecutive completions should increase momentum."""
-        await analyzer.initialize()
-        
-        for i in range(5):
-            song = MockSong(id=str(i), title=f'Song {i}', artist='A')
-            await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        momentum = await analyzer.get_momentum('session_1')
-        assert momentum > 0.5  # High momentum
-    
-    @pytest.mark.asyncio
-    async def test_skips_decrease_momentum(self, analyzer):
-        """Skips should decrease momentum."""
-        await analyzer.initialize()
-        
-        # Start with completions
-        for i in range(3):
-            song = MockSong(id=str(i), title=f'Song {i}', artist='A')
-            await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        # Then skip
-        for i in range(3, 6):
-            song = MockSong(id=str(i), title=f'Song {i}', artist='A')
-            await analyzer.record_play('session_1', song, SkipType.IMMEDIATE)
-        
-        momentum = await analyzer.get_momentum('session_1')
-        assert momentum < 0.8  # Reduced momentum
-
-
-class TestPreferenceProfile:
-    """Tests for full preference profile generation."""
-    
-    @pytest.fixture
-    def analyzer(self):
-        """Create analyzer for profile tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
-    
-    @pytest.mark.asyncio
-    async def test_generate_full_profile(self, analyzer):
-        """Should generate complete preference profile."""
-        await analyzer.initialize()
-        
-        songs = [
-            MockSong('1', 'Song 1', 'Artist 1', genre='rock', bpm=120, decade='2000s'),
-            MockSong('2', 'Song 2', 'Artist 2', genre='rock', bpm=125, decade='2000s'),
-            MockSong('3', 'Song 3', 'Artist 1', genre='metal', bpm=140, decade='2010s'),
-        ]
-        
-        for song in songs:
-            await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        profile = await analyzer.get_preference_profile('session_1')
-        
-        assert profile is not None
-        assert isinstance(profile, dict)
-    
-    @pytest.mark.asyncio
-    async def test_profile_includes_all_dimensions(self, analyzer):
-        """Profile should include genre, artist, BPM, decade preferences."""
-        await analyzer.initialize()
-        
-        song = MockSong('1', 'Test', 'Artist', genre='rock', bpm=120, decade='2000s')
-        await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        profile = await analyzer.get_preference_profile('session_1')
-        
-        # Check for key dimensions
-        profile_str = str(profile)
-        assert 'genre' in profile_str.lower() or len(profile) > 0
-
-
-class TestContextCleanup:
-    """Tests for context cleanup and memory management."""
-    
-    @pytest.fixture
-    def analyzer(self):
-        """Create analyzer for cleanup tests."""
-        config = V3Config()
-        return ContextAnalyzer(config)
-    
-    @pytest.mark.asyncio
-    async def test_clear_session_context(self, analyzer):
-        """Should clear session context on demand."""
-        await analyzer.initialize()
-        
-        song = MockSong('1', 'Test', 'Artist')
-        await analyzer.record_play('session_1', song, SkipType.COMPLETED)
-        
-        await analyzer.clear_session('session_1')
-        
-        context = await analyzer.get_session_context('session_1')
-        
-        # Should be empty or reset
-        assert context is None or len(context.get('history', [])) == 0
-    
-    @pytest.mark.asyncio
-    async def test_cleanup_all(self, analyzer):
-        """Should clean up all session contexts."""
-        await analyzer.initialize()
-        
-        for i in range(3):
-            song = MockSong(str(i), 'Song', 'Artist')
-            await analyzer.record_play(f'session_{i}', song, SkipType.COMPLETED)
-        
-        await analyzer.cleanup()
-        
-        # All should be cleared
-        for i in range(3):
-            context = await analyzer.get_session_context(f'session_{i}')
-            assert context is None or context == {}
+        assert analyzer1 is analyzer2

@@ -9,6 +9,11 @@ Central orchestration module that coordinates all recommendation strategies:
 
 This is the "head chef" that combines signals from all other modules
 to produce final song recommendations.
+
+NEW: Integrates SessionMixer for adaptive weights based on:
+- Session confidence (queued tracks, completion rate)
+- Recovery state (Normal/Caution/Recovery/Panic)
+- Skip classification (early/late/transition failures)
 """
 
 import asyncio
@@ -28,6 +33,7 @@ from .gemini_manager import GeminiManager, get_gemini_manager
 from .mappings import MappingsManager, SongIdentifier, get_mappings_manager
 from .novelty_controller import NoveltyController, NoveltyNudge, get_novelty_controller
 from .song_analyzer import SongAnalyzer, get_song_analyzer
+from .session_mixer import SessionMixer, RecoveryState, SkipType, TransitionFeatures, get_session_mixer
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +93,8 @@ class Recommender:
     """
     
     # Strategy weights by state
+    # NOTE: These are now FALLBACK weights. When SessionMixer is active,
+    # adaptive weights from get_source_weights() are used instead.
     STRATEGY_WEIGHTS = {
         SessionState.COLD: {
             "lastfm": 0.7,
@@ -127,7 +135,8 @@ class Recommender:
         vector_search: Optional[VectorSearcher] = None,
         collaborative: Optional[CollaborativeRecommender] = None,
         gemini: Optional[GeminiManager] = None,
-        event_bus: Optional[EventBus] = None
+        event_bus: Optional[EventBus] = None,
+        session_mixer: Optional[SessionMixer] = None
     ):
         """
         Initialize recommender with all dependencies.
@@ -135,6 +144,7 @@ class Recommender:
         Dependencies:
         - vector_search: Content-based similarity (audio features)
         - collaborative: Behavioral recommendations (transitions, user prefs)
+        - session_mixer: Adaptive weight calculation based on confidence/recovery
         """
         self.config = config or V3Config()
         self.cache = cache or get_cache_manager()
@@ -146,6 +156,7 @@ class Recommender:
         self.collaborative = collaborative or get_collaborative_recommender()
         self.gemini = gemini or get_gemini_manager()
         self.event_bus = event_bus or EventBus()
+        self.session_mixer = session_mixer or get_session_mixer()
         
         # Daydreamer reference (set externally)
         self._daydreamer = None
@@ -158,25 +169,41 @@ class Recommender:
         }
         
         self._initialized = False
+        self._gemini_available = False
+    
+    async def _safe_init(self, component, name: str) -> bool:
+        """Safely initialize a component, logging errors but not failing."""
+        try:
+            await component.initialize()
+            return True
+        except Exception as e:
+            logger.warning(f"{name} initialization failed: {e}")
+            return False
     
     async def initialize(self) -> None:
-        """Initialize all dependencies."""
+        """Initialize all dependencies with graceful degradation."""
         if self._initialized:
             return
         
-        await asyncio.gather(
-            self.cache.initialize(),
-            self.mappings.initialize(),
-            self.analyzer.initialize(),
-            self.context.initialize(),
-            self.novelty.initialize(),
-            self.vector_search.initialize(),
-            self.collaborative.initialize(),
-            self.gemini.initialize()
-        )
+        # Core components (must succeed)
+        await self.cache.initialize()
+        await self.mappings.initialize()
+        await self.context.initialize()
+        await self.novelty.initialize()
+        await self.session_mixer.initialize()
+        
+        # Optional components (can fail gracefully)
+        await self._safe_init(self.analyzer, "Song analyzer")
+        await self._safe_init(self.vector_search, "Vector search")
+        await self._safe_init(self.collaborative, "Collaborative filtering")
+        
+        # Gemini is optional
+        self._gemini_available = await self._safe_init(self.gemini, "Gemini")
+        if not self._gemini_available:
+            logger.info("Gemini unavailable - using Deezer/Last.fm only")
         
         self._initialized = True
-        logger.info("Recommender (head chef) initialized")
+        logger.info("Recommender (head chef) initialized with SessionMixer")
     
     async def shutdown(self) -> None:
         """Shutdown all dependencies."""
@@ -187,7 +214,8 @@ class Recommender:
             self.novelty.shutdown(),
             self.vector_search.shutdown(),
             self.collaborative.shutdown(),
-            self.gemini.shutdown()
+            self.gemini.shutdown(),
+            self.session_mixer.shutdown()
         )
         self._initialized = False
     
@@ -201,7 +229,8 @@ class Recommender:
         guild_id: str,
         seed_songs: list[SongIdentifier],
         exclude_songs: Optional[set[str]] = None,
-        count: int = 1
+        count: int = 1,
+        mode: str = "normal"  # "safe", "exploratory", or "normal"
     ) -> list[Recommendation]:
         """
         Get song recommendations for a session.
@@ -212,6 +241,10 @@ class Recommender:
             seed_songs: Recent songs to base recommendations on
             exclude_songs: Songs to exclude (recently played, in queue)
             count: Number of recommendations to return
+            mode: Recommendation mode:
+                - "safe": Conservative picks, high similarity to seeds
+                - "exploratory": Discovery picks, more diverse
+                - "normal": Balanced approach (default)
             
         Returns:
             List of Recommendation objects
@@ -223,6 +256,14 @@ class Recommender:
         # Get or create session profile
         session = self.context.get_or_create_session(session_id, guild_id)
         state = session.state
+        
+        # Adjust state based on mode for weight selection
+        if mode == "safe":
+            # Use COLD weights even in HOT state for safer picks
+            state = SessionState.COLD
+        elif mode == "exploratory":
+            # Use EXTENDED weights for more exploration
+            state = SessionState.EXTENDED
         
         # Get session context
         ctx = self.context.get_session_context(session_id)
@@ -287,14 +328,30 @@ class Recommender:
         context: Optional[dict],
         count: int
     ) -> list[RecommendationCandidate]:
-        """Gather candidates from all sources based on session state."""
+        """Gather candidates from all sources based on session state and adaptive weights."""
         candidates = []
-        weights = self.STRATEGY_WEIGHTS.get(state, self.STRATEGY_WEIGHTS[SessionState.COLD])
+        
+        # Get adaptive weights from SessionMixer
+        adaptive_weights = self.session_mixer.get_source_weights(session_id)
+        recovery_state = self.session_mixer.get_recovery_state(session_id)
+        
+        # Map adaptive pool weights to source weights
+        # hot → lastfm/vector_search (high certainty)
+        # warm → cf/context (transition-safe)
+        # cold → cache/gemini (exploration)
+        # extended → daydreamer (generator)
+        weights = self._map_adaptive_to_source_weights(adaptive_weights, state)
+        
+        # In panic mode, use fallback strategy
+        if recovery_state == RecoveryState.PANIC:
+            fallback = self.session_mixer.get_safe_fallback_strategy(session_id)
+            logger.info(f"Panic mode: using fallback strategy '{fallback}'")
+            weights = self._get_panic_weights(fallback)
         
         # Parallelize candidate gathering
         tasks = []
         
-        # Last.fm similarity
+        # Last.fm similarity (hot pool)
         if weights.get("lastfm", 0) > 0 and seed_songs:
             tasks.append(self._get_lastfm_candidates(
                 seed_songs[-3:],  # Use last 3 songs as seeds
@@ -302,7 +359,7 @@ class Recommender:
                 count
             ))
         
-        # Collaborative filtering (using vector search for content similarity)
+        # Collaborative filtering / vector search (warm pool)
         if weights.get("cf", 0) > 0 and self.vector_search.is_active:
             seed_ids = [s.primary_id for s in seed_songs if s.primary_id]
             if seed_ids:
@@ -312,7 +369,7 @@ class Recommender:
                     count
                 ))
         
-        # Cache-based fallback
+        # Cache-based fallback (cold pool)
         if weights.get("cache", 0) > 0:
             tasks.append(self._get_cache_candidates(
                 context,
@@ -338,6 +395,86 @@ class Recommender:
                 logger.warning(f"Candidate gathering error: {result}")
         
         return candidates
+    
+    def _map_adaptive_to_source_weights(
+        self,
+        adaptive_weights: dict[str, float],
+        state: SessionState
+    ) -> dict[str, float]:
+        """
+        Map adaptive pool weights (hot/warm/cold/extended) to source weights.
+        
+        Pool → Source mapping:
+        - hot → lastfm, vector_search (high certainty, known taste)
+        - warm → cf, behavioral, context (transition-safe bridges)
+        - cold → cache, gemini (controlled exploration)
+        - extended → daydreamer (on-demand generator)
+        
+        Args:
+            adaptive_weights: Weights from SessionMixer {hot, warm, cold, extended}
+            state: Current session state for fallback logic
+            
+        Returns:
+            Source weights dict
+        """
+        hot = adaptive_weights.get("hot", 0.4)
+        warm = adaptive_weights.get("warm", 0.35)
+        cold = adaptive_weights.get("cold", 0.2)
+        extended = adaptive_weights.get("extended", 0.05)
+        
+        # Distribute within pools
+        return {
+            # Hot pool sources (high certainty)
+            "lastfm": hot * 0.6,
+            "vector_search": hot * 0.4,
+            
+            # Warm pool sources (transition-safe)
+            "cf": warm * 0.4,
+            "behavioral": warm * 0.3,
+            "context": warm * 0.3,
+            
+            # Cold pool sources (exploration)
+            "cache": cold * 0.6,
+            "gemini": cold * 0.4,
+            "novelty": cold * 0.2,
+            
+            # Extended (on-demand)
+            "daydreamer": extended
+        }
+    
+    def _get_panic_weights(self, fallback_strategy: str) -> dict[str, float]:
+        """
+        Get weights for panic mode based on fallback strategy.
+        
+        Panic mode priorities safety over exploration.
+        
+        Args:
+            fallback_strategy: "best_session", "anchor_popular", or "hard_pivot"
+            
+        Returns:
+            Source weights dict
+        """
+        if fallback_strategy == "best_session":
+            # Use what worked in this session
+            return {
+                "lastfm": 0.6,  # Similar to completed songs
+                "cache": 0.3,  # Safe fallback
+                "behavioral": 0.1
+            }
+        elif fallback_strategy == "anchor_popular":
+            # Use popular tracks near anchors
+            return {
+                "lastfm": 0.7,  # Close to queued songs
+                "cache": 0.2,
+                "context": 0.1
+            }
+        else:  # "hard_pivot"
+            # Complete change of direction
+            return {
+                "cache": 0.5,   # Random from cache
+                "gemini": 0.3,  # Fresh suggestions
+                "daydreamer": 0.2
+            }
     
     async def _get_lastfm_candidates(
         self,

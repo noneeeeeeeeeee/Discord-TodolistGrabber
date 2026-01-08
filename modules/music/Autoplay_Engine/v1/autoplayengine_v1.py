@@ -2029,6 +2029,10 @@ class LastFMAutoplay:
         """Check if Last.fm autoplay is available."""
         return self._initialized and self.api_key is not None
 
+    def can_recommend(self) -> bool:
+        """Check if recommendations are available (same as is_available for V1)."""
+        return self.is_available()
+
     def _normalize_artist_for_diversity(self, artist: str) -> str:
         """Normalize artist name for diversity scoring to catch variations."""
         normalized = artist.lower().strip()

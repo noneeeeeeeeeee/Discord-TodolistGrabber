@@ -544,12 +544,8 @@ class PlayerControlView(View):
         self._feedback_votes: Dict[int, str] = {}
         self._active_track_key: Optional[str] = self._current_track_key()
 
-        # Add feedback buttons if V2+ autoplay is enabled
-        # Note: V3 removes "Less Like This" button - dislikes are tracked via skip behavior
         if player.supports_feedback_buttons():
             self.add_item(self.more_like_this_button_item())
-            # Less Like This removed in V3 - consecutive skips handle negative feedback
-            # Add "Low Quality" button for autoplay tracks only
             self.add_item(self.low_quality_button_item())
 
     async def on_timeout(self):

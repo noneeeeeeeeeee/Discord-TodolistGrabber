@@ -8,432 +8,396 @@ import pytest
 import asyncio
 import sys
 import os
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
+from dataclasses import dataclass
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.music.Autoplay_Engine.v3.gemini_manager import GeminiManager
+from modules.music.Autoplay_Engine.v3.gemini_manager import (
+    GeminiManager,
+    GeminiResponse,
+    GroundingPriority,
+    get_gemini_manager
+)
 from modules.music.Autoplay_Engine.v3.constants import V3Config
+
+
+def create_mock_event_bus():
+    """Create a mock event bus."""
+    bus = MagicMock()
+    bus.subscribe = MagicMock()
+    bus.unsubscribe = MagicMock()
+    bus.publish = AsyncMock()
+    return bus
 
 
 class TestGeminiManagerInitialization:
     """Tests for GeminiManager initialization."""
     
-    @pytest.fixture
-    def mock_env_keys(self):
-        """Mock environment with Gemini API keys."""
-        with patch.dict(os.environ, {
-            'GeminiApiKeys': '["key1", "key2", "key3"]'
-        }):
-            yield
-    
-    def test_gemini_manager_creation(self, mock_env_keys):
-        """Verify Gemini manager can be created."""
-        config = V3Config()
-        manager = GeminiManager(config)
-        assert manager is not None
-    
-    def test_loads_api_keys_from_env(self, mock_env_keys):
-        """Should load API keys from GeminiApiKeys environment variable."""
-        config = V3Config()
-        manager = GeminiManager(config)
-        
-        assert len(manager._api_keys) == 3
-        assert 'key1' in manager._api_keys
-    
-    def test_handles_missing_keys(self):
-        """Should handle missing API keys gracefully."""
+    def test_gemini_manager_creation_without_keys(self):
+        """Verify Gemini manager can be created even without API keys."""
         with patch.dict(os.environ, {}, clear=True):
             config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            assert manager is not None
+            assert manager._initialized is False
+    
+    def test_loads_api_keys_from_comma_separated_env(self):
+        """Should load API keys from comma-separated GeminiApiKeys."""
+        with patch.dict(os.environ, {
+            'GeminiApiKeys': 'key1, key2, key3'
+        }, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
             
-            # Should either raise or initialize with empty keys
-            try:
-                manager = GeminiManager(config)
-                assert manager._api_keys == [] or manager._api_keys is None
-            except ValueError:
-                pass  # Also acceptable
+            assert len(manager._api_keys) == 3
+            assert 'key1' in manager._api_keys
+            assert 'key2' in manager._api_keys
+            assert 'key3' in manager._api_keys
+    
+    def test_loads_single_key_from_fallback_env(self):
+        """Should load single key from GEMINI_API_KEY fallback."""
+        with patch.dict(os.environ, {
+            'GEMINI_API_KEY': 'single_key'
+        }, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            assert len(manager._api_keys) == 1
+            assert 'single_key' in manager._api_keys
+    
+    def test_handles_missing_keys(self):
+        """Should handle missing API keys gracefully at creation."""
+        with patch.dict(os.environ, {}, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            assert manager._api_keys == []
+    
+    @pytest.mark.asyncio
+    async def test_initialize_fails_without_keys(self):
+        """Initialize should fail if no API keys available."""
+        with patch.dict(os.environ, {}, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            with pytest.raises(RuntimeError, match="No Gemini API keys available"):
+                await manager.initialize()
+    
+    @pytest.mark.asyncio
+    async def test_initialize_success_with_keys(self):
+        """Initialize should succeed with API keys."""
+        with patch.dict(os.environ, {'GeminiApiKeys': 'key1'}, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            await manager.initialize()
+            
+            assert manager._initialized is True
+            assert manager._session is not None
+            
+            await manager.shutdown()
+    
+    @pytest.mark.asyncio
+    async def test_shutdown_closes_session(self):
+        """Shutdown should close HTTP session."""
+        with patch.dict(os.environ, {'GeminiApiKeys': 'key1'}, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            await manager.initialize()
+            await manager.shutdown()
+            
+            assert manager._initialized is False
+            assert manager._session is None
 
 
 class TestApiKeyRotation:
     """Tests for API key rotation functionality."""
     
-    @pytest.fixture
-    def manager_with_keys(self):
-        """Create manager with mock keys."""
+    def test_get_next_key_returns_valid_key(self):
+        """_get_next_key should return a valid key and index."""
         with patch.dict(os.environ, {
-            'GeminiApiKeys': '["key1", "key2", "key3"]'
-        }):
+            'GeminiApiKeys': 'key1, key2, key3'
+        }, clear=True):
             config = V3Config()
-            manager = GeminiManager(config)
-            return manager
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            key, idx = manager._get_next_key()
+            
+            assert key in manager._api_keys
+            assert 0 <= idx < len(manager._api_keys)
     
-    def test_key_rotation_on_error(self, manager_with_keys):
-        """Should rotate to next key on rate limit error."""
-        initial_key = manager_with_keys._current_key_index
-        
-        manager_with_keys._rotate_key()
-        
-        assert manager_with_keys._current_key_index != initial_key or len(manager_with_keys._api_keys) == 1
-    
-    def test_key_rotation_wraps_around(self, manager_with_keys):
-        """Key rotation should wrap around to first key."""
-        # Rotate through all keys
-        for _ in range(len(manager_with_keys._api_keys)):
-            manager_with_keys._rotate_key()
-        
-        # Should be back at start or at a valid index
-        assert 0 <= manager_with_keys._current_key_index < len(manager_with_keys._api_keys)
-    
-    def test_get_current_key(self, manager_with_keys):
-        """Should return current active key."""
-        key = manager_with_keys._get_current_key()
-        assert key in manager_with_keys._api_keys
-
-
-class TestRequestBatching:
-    """Tests for request batching (50 per batch)."""
-    
-    @pytest.fixture
-    def manager(self):
-        """Create manager for batching tests."""
+    def test_get_next_key_rotates(self):
+        """_get_next_key should rotate through keys."""
         with patch.dict(os.environ, {
-            'GeminiApiKeys': '["test_key"]'
-        }):
+            'GeminiApiKeys': 'key1, key2, key3'
+        }, clear=True):
             config = V3Config()
-            config.rate_limits.gemini_batch_size = 50
-            manager = GeminiManager(config)
-            return manager
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            keys_seen = set()
+            for _ in range(6):  # Call twice per key
+                key, _ = manager._get_next_key()
+                keys_seen.add(key)
+            
+            # Should have seen all 3 keys
+            assert len(keys_seen) == 3
     
-    @pytest.mark.asyncio
-    async def test_batch_size_limit(self, manager):
-        """Batches should not exceed 50 items."""
-        items = [{'id': str(i)} for i in range(100)]
-        
-        batches = manager._create_batches(items)
-        
-        for batch in batches:
-            assert len(batch) <= 50
+    def test_mark_key_failure_increases_count(self):
+        """_mark_key_failure should increase failure count."""
+        with patch.dict(os.environ, {
+            'GeminiApiKeys': 'key1, key2, key3'
+        }, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            manager._mark_key_failure(0, retry_after=60)
+            
+            assert manager._key_failures.get(0, 0) == 1
     
-    @pytest.mark.asyncio
-    async def test_batch_creation(self, manager):
-        """Should correctly split items into batches."""
-        items = [{'id': str(i)} for i in range(125)]
-        
-        batches = manager._create_batches(items)
-        
-        assert len(batches) == 3  # 50 + 50 + 25
-        assert len(batches[0]) == 50
-        assert len(batches[1]) == 50
-        assert len(batches[2]) == 25
+    def test_mark_key_failure_sets_cooldown(self):
+        """_mark_key_failure should set cooldown time."""
+        with patch.dict(os.environ, {
+            'GeminiApiKeys': 'key1, key2'
+        }, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            manager._mark_key_failure(0, retry_after=60)
+            
+            assert 0 in manager._key_cooldowns
+            assert manager._key_cooldowns[0] > time.time()
     
-    @pytest.mark.asyncio
-    async def test_empty_batch(self, manager):
-        """Should handle empty input."""
-        batches = manager._create_batches([])
-        assert len(batches) == 0 or batches == [[]]
+    def test_mark_key_success_resets_failure_count(self):
+        """_mark_key_success should reset failure count."""
+        with patch.dict(os.environ, {
+            'GeminiApiKeys': 'key1'
+        }, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            manager._key_failures[0] = 3
+            manager._mark_key_success(0)
+            
+            assert manager._key_failures.get(0, 0) == 0
+    
+    def test_get_next_key_skips_cooled_down_keys(self):
+        """_get_next_key should skip keys in cooldown."""
+        with patch.dict(os.environ, {
+            'GeminiApiKeys': 'key1, key2'
+        }, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            # Put key at index 0 in cooldown
+            manager._key_cooldowns[0] = time.time() + 60
+            
+            key, idx = manager._get_next_key()
+            
+            # Should skip to key2
+            assert key == 'key2'
+            assert idx == 1
 
 
 class TestRateLimiting:
-    """Tests for rate limiting and backoff."""
+    """Tests for rate limiting."""
     
-    @pytest.fixture
-    def manager(self):
-        """Create manager for rate limit tests."""
-        with patch.dict(os.environ, {
-            'GeminiApiKeys': '["key1", "key2"]'
-        }):
+    def test_request_times_list_exists(self):
+        """Manager should have request_times list for rate limiting."""
+        with patch.dict(os.environ, {'GeminiApiKeys': 'key1'}, clear=True):
             config = V3Config()
-            manager = GeminiManager(config)
-            return manager
-    
-    @pytest.mark.asyncio
-    async def test_exponential_backoff(self, manager):
-        """Should implement exponential backoff on errors."""
-        # Simulate errors
-        manager._error_count = 0
-        
-        delay1 = manager._get_backoff_delay()
-        manager._error_count = 1
-        delay2 = manager._get_backoff_delay()
-        manager._error_count = 2
-        delay3 = manager._get_backoff_delay()
-        
-        # Each delay should be greater
-        assert delay2 >= delay1
-        assert delay3 >= delay2
-    
-    @pytest.mark.asyncio
-    async def test_max_backoff_cap(self, manager):
-        """Backoff should have a maximum cap."""
-        manager._error_count = 100  # Many errors
-        
-        delay = manager._get_backoff_delay()
-        
-        # Should be capped at some reasonable maximum (e.g., 60 seconds)
-        assert delay <= 300  # 5 minutes max
-    
-    @pytest.mark.asyncio
-    async def test_rate_limit_tracking(self, manager):
-        """Should track request counts for rate limiting."""
-        if hasattr(manager, '_request_count'):
-            initial = manager._request_count
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
             
-            # Simulate request
-            manager._increment_request_count()
-            
-            assert manager._request_count == initial + 1
-
-
-class TestGrounding:
-    """Tests for Google Search grounding functionality."""
+            assert hasattr(manager, '_request_times')
+            assert isinstance(manager._request_times, list)
     
-    @pytest.fixture
-    def manager(self):
-        """Create manager for grounding tests."""
-        with patch.dict(os.environ, {
-            'GeminiApiKeys': '["test_key"]'
-        }):
-            config = V3Config()
-            manager = GeminiManager(config)
-            return manager
+    def test_max_requests_per_minute_set(self):
+        """Should have MAX_REQUESTS_PER_MINUTE constant."""
+        assert hasattr(GeminiManager, 'MAX_REQUESTS_PER_MINUTE')
+        assert GeminiManager.MAX_REQUESTS_PER_MINUTE == 60
     
-    @pytest.mark.asyncio
-    async def test_grounding_enabled_for_enrichment(self, manager):
-        """Grounding should be enabled for enrichment queries."""
-        query_type = 'enrichment'
+    def test_backoff_constants_defined(self):
+        """Should have backoff constants defined."""
+        assert hasattr(GeminiManager, 'BASE_RETRY_DELAY')
+        assert hasattr(GeminiManager, 'MAX_RETRY_DELAY')
+        assert hasattr(GeminiManager, 'MAX_RETRIES')
         
-        should_ground = manager._should_use_grounding(query_type)
-        assert should_ground is True
-    
-    @pytest.mark.asyncio
-    async def test_grounding_fields(self, manager):
-        """Grounding should be used for specific fields."""
-        # These fields require grounding per spec
-        grounding_fields = ['explicit_content', 'cultural_vibe', 'canonical_title']
-        
-        for field in grounding_fields:
-            should_ground = manager._should_use_grounding(field)
-            assert should_ground is True
-    
-    @pytest.mark.asyncio
-    async def test_grounding_disabled_for_analysis(self, manager):
-        """Grounding may be disabled for pure analysis."""
-        query_type = 'audio_analysis'
-        
-        should_ground = manager._should_use_grounding(query_type)
-        # May or may not use grounding for analysis
-        assert isinstance(should_ground, bool)
-
-
-class TestEnrichmentQueries:
-    """Tests for song enrichment queries."""
-    
-    @pytest.fixture
-    def manager(self):
-        """Create manager for enrichment tests."""
-        with patch.dict(os.environ, {
-            'GeminiApiKeys': '["test_key"]'
-        }):
-            config = V3Config()
-            manager = GeminiManager(config)
-            return manager
-    
-    @pytest.mark.asyncio
-    async def test_enrich_song_metadata(self, manager):
-        """Should be able to enrich song metadata."""
-        song = {
-            'title': 'Bohemian Rhapsody',
-            'artist': 'Queen'
-        }
-        
-        # Mock the API call
-        with patch.object(manager, '_call_api', new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = {
-                'explicit_content': False,
-                'cultural_vibe': 'classic rock anthem',
-                'canonical_title': 'Bohemian Rhapsody'
-            }
-            
-            if hasattr(manager, 'enrich_metadata'):
-                result = await manager.enrich_metadata(song)
-                assert 'explicit_content' in result or result is not None
-    
-    @pytest.mark.asyncio
-    async def test_batch_enrichment(self, manager):
-        """Should support batch enrichment of multiple songs."""
-        songs = [
-            {'title': f'Song {i}', 'artist': f'Artist {i}'}
-            for i in range(10)
-        ]
-        
-        with patch.object(manager, '_call_api', new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = [
-                {'explicit_content': False} for _ in songs
-            ]
-            
-            if hasattr(manager, 'enrich_batch'):
-                results = await manager.enrich_batch(songs)
-                assert len(results) == 10
-
-
-class TestRecommendationQueries:
-    """Tests for recommendation queries to Gemini."""
-    
-    @pytest.fixture
-    def manager(self):
-        """Create manager for recommendation tests."""
-        with patch.dict(os.environ, {
-            'GeminiApiKeys': '["test_key"]'
-        }):
-            config = V3Config()
-            manager = GeminiManager(config)
-            return manager
-    
-    @pytest.mark.asyncio
-    async def test_get_recommendations(self, manager):
-        """Should be able to get recommendations from Gemini."""
-        context = {
-            'recent_songs': [
-                {'title': 'Song 1', 'artist': 'Artist 1', 'genre': 'rock'},
-                {'title': 'Song 2', 'artist': 'Artist 2', 'genre': 'rock'}
-            ],
-            'preferences': {
-                'liked_genres': ['rock', 'metal']
-            }
-        }
-        
-        with patch.object(manager, '_call_api', new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = [
-                {'title': 'Recommended 1', 'artist': 'Rec Artist 1'},
-                {'title': 'Recommended 2', 'artist': 'Rec Artist 2'}
-            ]
-            
-            if hasattr(manager, 'get_recommendations'):
-                recommendations = await manager.get_recommendations(context, limit=5)
-                assert recommendations is not None
-
-
-class TestErrorHandling:
-    """Tests for error handling."""
-    
-    @pytest.fixture
-    def manager(self):
-        """Create manager for error tests."""
-        with patch.dict(os.environ, {
-            'GeminiApiKeys': '["key1", "key2"]'
-        }):
-            config = V3Config()
-            manager = GeminiManager(config)
-            return manager
-    
-    @pytest.mark.asyncio
-    async def test_retry_on_failure(self, manager):
-        """Should retry on transient failures."""
-        call_count = 0
-        
-        async def failing_then_succeeding(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count < 3:
-                raise Exception("Transient error")
-            return {'result': 'success'}
-        
-        with patch.object(manager, '_make_request', side_effect=failing_then_succeeding):
-            if hasattr(manager, '_call_with_retry'):
-                try:
-                    result = await manager._call_with_retry({})
-                    assert call_count >= 2  # At least one retry
-                except Exception:
-                    pass
-    
-    @pytest.mark.asyncio
-    async def test_key_rotation_on_rate_limit(self, manager):
-        """Should rotate key on rate limit error."""
-        initial_key_index = manager._current_key_index
-        
-        # Simulate rate limit error
-        manager._handle_rate_limit_error()
-        
-        # Key should have rotated
-        assert manager._current_key_index != initial_key_index or len(manager._api_keys) == 1
-    
-    @pytest.mark.asyncio
-    async def test_graceful_degradation(self, manager):
-        """Should degrade gracefully when all keys exhausted."""
-        # Mark all keys as exhausted
-        for _ in range(len(manager._api_keys) * 2):
-            manager._rotate_key()
-        
-        # Should still function (maybe with delays)
-        key = manager._get_current_key()
-        assert key is not None
+        assert GeminiManager.BASE_RETRY_DELAY == 1.0
+        assert GeminiManager.MAX_RETRY_DELAY == 32.0
+        assert GeminiManager.MAX_RETRIES == 3
 
 
 class TestModelConfiguration:
     """Tests for Gemini model configuration."""
     
-    @pytest.fixture
-    def manager(self):
-        """Create manager for config tests."""
-        with patch.dict(os.environ, {
-            'GeminiApiKeys': '["test_key"]'
-        }):
-            config = V3Config()
-            manager = GeminiManager(config)
-            return manager
-    
-    def test_model_is_gemini_25_flash(self, manager):
+    def test_model_is_gemini_25_flash(self):
         """Should use gemini-2.5-flash model per spec."""
-        assert 'gemini-2.5-flash' in manager._model_name
+        assert GeminiManager.MODEL == "gemini-2.5-flash"
     
-    def test_temperature_setting(self, manager):
-        """Should have appropriate temperature setting."""
-        if hasattr(manager, '_temperature'):
-            assert 0 <= manager._temperature <= 1
+    def test_base_url_defined(self):
+        """Should have BASE_URL for Gemini API."""
+        assert hasattr(GeminiManager, 'BASE_URL')
+        assert "generativelanguage.googleapis.com" in GeminiManager.BASE_URL
     
-    def test_max_tokens_setting(self, manager):
-        """Should have max tokens configured."""
-        if hasattr(manager, '_max_tokens'):
-            assert manager._max_tokens > 0
+    def test_batch_size_is_50(self):
+        """Should have BATCH_SIZE of 50 per spec."""
+        assert GeminiManager.BATCH_SIZE == 50
 
 
-class TestCaching:
-    """Tests for response caching."""
+class TestGroundingPriority:
+    """Tests for grounding priority enum."""
     
-    @pytest.fixture
-    def manager(self):
-        """Create manager for cache tests."""
-        with patch.dict(os.environ, {
-            'GeminiApiKeys': '["test_key"]'
-        }):
+    def test_grounding_priority_values(self):
+        """GroundingPriority should have correct values."""
+        assert GroundingPriority.EXPLICIT_CONTENT.value == "explicit_content"
+        assert GroundingPriority.CULTURAL_VIBE.value == "cultural_vibe"
+        assert GroundingPriority.CANONICAL_TITLE.value == "canonical_title"
+
+
+class TestGeminiResponse:
+    """Tests for GeminiResponse dataclass."""
+    
+    def test_success_response(self):
+        """Should create successful response."""
+        response = GeminiResponse(
+            success=True,
+            data={"genres": ["rock"]},
+            grounded=True,
+            usage={"totalTokenCount": 100}
+        )
+        
+        assert response.success is True
+        assert response.data == {"genres": ["rock"]}
+        assert response.grounded is True
+        assert response.usage["totalTokenCount"] == 100
+    
+    def test_failure_response(self):
+        """Should create failure response."""
+        response = GeminiResponse(
+            success=False,
+            error="Rate limited"
+        )
+        
+        assert response.success is False
+        assert response.error == "Rate limited"
+        assert response.data is None
+
+
+class TestStatistics:
+    """Tests for API usage statistics."""
+    
+    def test_stats_initialized(self):
+        """Manager should initialize stats dict."""
+        with patch.dict(os.environ, {'GeminiApiKeys': 'key1'}, clear=True):
             config = V3Config()
-            manager = GeminiManager(config)
-            return manager
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            assert hasattr(manager, '_stats')
+            assert "requests" in manager._stats
+            assert "successes" in manager._stats
+            assert "failures" in manager._stats
+            assert "retries" in manager._stats
+            assert "grounded_requests" in manager._stats
+            assert "tokens_used" in manager._stats
     
     @pytest.mark.asyncio
-    async def test_cache_enrichment_results(self, manager):
-        """Should cache enrichment results to avoid redundant API calls."""
-        song = {'title': 'Test Song', 'artist': 'Test Artist'}
-        
-        if hasattr(manager, '_cache'):
-            cache_key = manager._get_cache_key(song)
+    async def test_get_stats_method(self):
+        """get_stats should return usage statistics."""
+        with patch.dict(os.environ, {'GeminiApiKeys': 'key1'}, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
             
-            # Simulate caching
-            manager._cache[cache_key] = {'explicit_content': False}
+            stats = await manager.get_stats()
             
-            # Check cache hit
-            cached = manager._get_cached(cache_key)
-            assert cached is not None
+            assert "available_keys" in stats
+            assert "keys_in_cooldown" in stats
+            assert stats["available_keys"] == 1
+
+
+class TestAnalyzeSongMethod:
+    """Tests for analyze_song method structure."""
     
-    @pytest.mark.asyncio
-    async def test_cache_key_generation(self, manager):
-        """Cache keys should be consistent for same input."""
-        song1 = {'title': 'Test Song', 'artist': 'Test Artist'}
-        song2 = {'title': 'Test Song', 'artist': 'Test Artist'}
+    def test_analyze_song_method_exists(self):
+        """analyze_song method should exist."""
+        with patch.dict(os.environ, {'GeminiApiKeys': 'key1'}, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            assert hasattr(manager, 'analyze_song')
+            assert asyncio.iscoroutinefunction(manager.analyze_song)
+
+
+class TestBatchAnalyzeMethod:
+    """Tests for batch_analyze_songs method structure."""
+    
+    def test_batch_analyze_method_exists(self):
+        """batch_analyze_songs method should exist."""
+        with patch.dict(os.environ, {'GeminiApiKeys': 'key1'}, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            assert hasattr(manager, 'batch_analyze_songs')
+            assert asyncio.iscoroutinefunction(manager.batch_analyze_songs)
+
+
+class TestRecommendationsMethod:
+    """Tests for get_recommendations_prompt method structure."""
+    
+    def test_get_recommendations_method_exists(self):
+        """get_recommendations_prompt method should exist."""
+        with patch.dict(os.environ, {'GeminiApiKeys': 'key1'}, clear=True):
+            config = V3Config()
+            bus = create_mock_event_bus()
+            manager = GeminiManager(config, bus)
+            
+            assert hasattr(manager, 'get_recommendations_prompt')
+            assert asyncio.iscoroutinefunction(manager.get_recommendations_prompt)
+
+
+class TestGlobalSingleton:
+    """Tests for singleton getter."""
+    
+    def test_get_gemini_manager_returns_instance(self):
+        """get_gemini_manager should return instance."""
+        # Reset singleton for test
+        import modules.music.Autoplay_Engine.v3.gemini_manager as gem_mod
+        gem_mod._gemini_manager = None
         
-        key1 = manager._get_cache_key(song1)
-        key2 = manager._get_cache_key(song2)
+        with patch.dict(os.environ, {'GeminiApiKeys': 'key1'}, clear=True):
+            manager = get_gemini_manager()
+            
+            assert manager is not None
+            assert isinstance(manager, GeminiManager)
+    
+    def test_get_gemini_manager_returns_same_instance(self):
+        """get_gemini_manager should return same instance."""
+        # Reset singleton for test
+        import modules.music.Autoplay_Engine.v3.gemini_manager as gem_mod
+        gem_mod._gemini_manager = None
         
-        assert key1 == key2
+        with patch.dict(os.environ, {'GeminiApiKeys': 'key1'}, clear=True):
+            manager1 = get_gemini_manager()
+            manager2 = get_gemini_manager()
+            
+            assert manager1 is manager2

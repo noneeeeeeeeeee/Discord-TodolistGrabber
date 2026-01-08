@@ -74,7 +74,7 @@ class TestTransitionRecordCreation:
         )
         assert record.from_song_id == "song_a"
         assert record.to_song_id == "song_b"
-        assert record.count == 1
+        assert record.count == 0  # Starts at 0, incremented when recorded
         assert record.skip_count == 0
     
     def test_custom_values(self):

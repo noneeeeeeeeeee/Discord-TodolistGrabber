@@ -28,6 +28,7 @@ from typing import Any, Optional
 from .constants import (
     CacheConfig,
     CacheType,
+    CACHE_VERSION,
     EventType,
     V3Config,
     SongMetadata,
@@ -424,9 +425,9 @@ class CacheManager:
             data={
                 "cache_type": "metadata",
                 "song_id": song_id,
-                "has_physics": metadata.audio_features is not None,
-                "has_semantics": metadata.semantic_features is not None,
-                "has_librarian": metadata.librarian_info is not None
+                "has_physics": metadata.physics is not None,
+                "has_semantics": metadata.semantics is not None,
+                "has_librarian": metadata.librarian is not None
             }
         ))
     
@@ -670,22 +671,22 @@ class CacheManager:
             if len(results) >= limit:
                 break
             
-            audio = entry.get("audio_features", {})
-            librarian = entry.get("librarian_info", {})
+            physics = entry.get("physics", {})
+            librarian = entry.get("librarian", {})
             
             # Check BPM range
             if bpm_range:
-                entry_bpm = audio.get("bpm", 0)
+                entry_bpm = physics.get("computed_bpm", 0)
                 if not (bpm_range[0] <= entry_bpm <= bpm_range[1]):
                     continue
             
             # Check key
-            if key and audio.get("key") != key:
+            if key and physics.get("computed_key") != key:
                 continue
             
             # Check genres (any match)
             if genres:
-                entry_genres = librarian.get("genres", [])
+                entry_genres = librarian.get("micro_genre", [])
                 if not any(g in entry_genres for g in genres):
                     continue
             
@@ -696,57 +697,41 @@ class CacheManager:
     def _metadata_to_dict(self, metadata: SongMetadata) -> dict:
         """Convert SongMetadata dataclass to dictionary for storage."""
         data = {
-            "song_id": metadata.song_id,
-            "title": metadata.title,
-            "artist": metadata.artist,
-            "album": metadata.album,
-            "duration_ms": metadata.duration_ms,
-            "preview_url": metadata.preview_url,
-            "isrc": metadata.isrc,
-            "analysis_version": metadata.analysis_version,
-            "created_at": metadata.created_at,
-            "updated_at": metadata.updated_at
+            "deezer_id": metadata.deezer_id,
+            "metadata_version": metadata.metadata_version
         }
         
-        if metadata.audio_features:
-            data["audio_features"] = asdict(metadata.audio_features)
+        if metadata.physics:
+            data["physics"] = asdict(metadata.physics)
         
-        if metadata.semantic_features:
-            data["semantic_features"] = asdict(metadata.semantic_features)
+        if metadata.semantics:
+            data["semantics"] = asdict(metadata.semantics)
         
-        if metadata.librarian_info:
-            data["librarian_info"] = asdict(metadata.librarian_info)
+        if metadata.librarian:
+            data["librarian"] = asdict(metadata.librarian)
         
         return data
     
     def _dict_to_metadata(self, data: dict) -> SongMetadata:
         """Convert stored dictionary back to SongMetadata dataclass."""
-        audio_features = None
-        if data.get("audio_features"):
-            audio_features = PhysicsLayer(**data["audio_features"])
+        physics = None
+        if data.get("physics"):
+            physics = PhysicsLayer(**data["physics"])
         
-        semantic_features = None
-        if data.get("semantic_features"):
-            semantic_features = SemanticsLayer(**data["semantic_features"])
+        semantics = None
+        if data.get("semantics"):
+            semantics = SemanticsLayer(**data["semantics"])
         
-        librarian_info = None
-        if data.get("librarian_info"):
-            librarian_info = LibrarianLayer(**data["librarian_info"])
+        librarian = None
+        if data.get("librarian"):
+            librarian = LibrarianLayer(**data["librarian"])
         
         return SongMetadata(
-            song_id=data["song_id"],
-            title=data["title"],
-            artist=data["artist"],
-            album=data.get("album"),
-            duration_ms=data.get("duration_ms"),
-            preview_url=data.get("preview_url"),
-            isrc=data.get("isrc"),
-            audio_features=audio_features,
-            semantic_features=semantic_features,
-            librarian_info=librarian_info,
-            analysis_version=data.get("analysis_version"),
-            created_at=data.get("created_at"),
-            updated_at=data.get("updated_at")
+            deezer_id=data["deezer_id"],
+            physics=physics,
+            semantics=semantics,
+            librarian=librarian,
+            metadata_version=data.get("metadata_version", CACHE_VERSION)
         )
     
     async def shutdown(self) -> None:
