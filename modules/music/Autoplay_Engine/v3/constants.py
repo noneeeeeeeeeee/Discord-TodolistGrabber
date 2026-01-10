@@ -11,6 +11,57 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 
+
+# =============================================================================
+# Environment Variable Helpers (supports multiple naming conventions)
+# =============================================================================
+
+def get_env_with_fallback(*names: str, default: str = "") -> str:
+    """Get environment variable with fallback names.
+    
+    Supports both the reimplementation plan naming (GEMINI_API_KEYS) and
+    legacy naming (GeminiApiKeys) for backwards compatibility.
+    
+    Args:
+        *names: Variable names to try in order
+        default: Default value if none found
+        
+    Returns:
+        First found value or default
+    """
+    for name in names:
+        value = os.getenv(name)
+        if value is not None:
+            return value
+    return default
+
+
+def get_env_int(*names: str, default: int = 0) -> int:
+    """Get integer environment variable with fallback names."""
+    value = get_env_with_fallback(*names, default=str(default))
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def get_env_float(*names: str, default: float = 0.0) -> float:
+    """Get float environment variable with fallback names."""
+    value = get_env_with_fallback(*names, default=str(default))
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def get_env_list(*names: str, default: Optional[List[str]] = None) -> List[str]:
+    """Get comma-separated list environment variable with fallback names."""
+    value = get_env_with_fallback(*names, default="")
+    if not value:
+        return default or []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 # =============================================================================
 # Directory Configuration
 # =============================================================================
@@ -25,16 +76,47 @@ METADATA_DIR = CACHE_ROOT / "metadata"
 SESSIONS_DIR = CACHE_ROOT / "sessions"
 DAYDREAMER_DIR = CACHE_ROOT / "daydreamer"
 
-# Ensure directories exist
-for directory in [MAPPINGS_DIR, METADATA_DIR, SESSIONS_DIR, DAYDREAMER_DIR]:
-    directory.mkdir(parents=True, exist_ok=True)
+# Ensure directories exist (do lazily on first access to avoid import-time side effects)
+_directories_initialized = False
+
+def ensure_cache_directories() -> None:
+    """Ensure cache directories exist. Called lazily to avoid import-time IO."""
+    global _directories_initialized
+    if _directories_initialized:
+        return
+    for directory in [MAPPINGS_DIR, METADATA_DIR, SESSIONS_DIR, DAYDREAMER_DIR]:
+        directory.mkdir(parents=True, exist_ok=True)
+    _directories_initialized = True
+
+# =============================================================================
+# Versioning
+# =============================================================================
+
+# V3 Engine version for API compatibility
+V3_ENGINE_VERSION = "3.0.0"
+
+# Component versions - increment when schema changes require migration
+CACHE_VERSION = 1       # Cache schema version
+MAPPING_VERSION = 1     # Song mapping format version  
+METADATA_VERSION = 1    # Song metadata format version
+SESSION_VERSION = 1     # Session state format version
+
+# For external API responses
+def get_v3_version_info() -> dict:
+    """Get version information for API responses and diagnostics."""
+    return {
+        "engine": V3_ENGINE_VERSION,
+        "cache_schema": CACHE_VERSION,
+        "mapping_schema": MAPPING_VERSION,
+        "metadata_schema": METADATA_VERSION,
+        "session_schema": SESSION_VERSION
+    }
 
 # =============================================================================
 # Cache Configuration
 # =============================================================================
 
 SHARD_MAX_ENTRIES = 5000  # Maximum entries per shard file
-CACHE_VERSION = 1  # Increment when schema changes require migration
 
 # Shard naming: a, b, ..., z, aa, ab, ...
 def get_next_shard_suffix(current: str) -> str:
@@ -67,15 +149,6 @@ class SessionState(Enum):
     WARM = "warm"      # 11-25 songs: Stable, consistent
     HOT = "hot"        # 25+ songs: Diversifying, extended session
     EXTENDED = "extended"  # 50+ songs: Long-running session
-
-
-class CacheType(Enum):
-    """Types of caches managed by the system."""
-    MAPPINGS = "mappings"       # Deezer/YouTube/Last.fm ID mappings
-    METADATA = "metadata"       # Song analysis metadata
-    ANALYSIS = "analysis"       # Raw analysis data
-    PREFERENCES = "preferences" # User preference data
-    SESSIONS = "sessions"       # Session history data
     
     @staticmethod
     def from_song_count(song_count: int, consecutive_skips: int = 0) -> 'SessionState':
@@ -96,8 +169,19 @@ class CacheType(Enum):
             return SessionState.COLD
         elif song_count <= 25:
             return SessionState.WARM
-        else:
+        elif song_count <= 50:
             return SessionState.HOT
+        else:
+            return SessionState.EXTENDED
+
+
+class CacheType(Enum):
+    """Types of caches managed by the system."""
+    MAPPINGS = "mappings"       # Deezer/YouTube/Last.fm ID mappings
+    METADATA = "metadata"       # Song analysis metadata
+    ANALYSIS = "analysis"       # Raw analysis data
+    PREFERENCES = "preferences" # User preference data
+    SESSIONS = "sessions"       # Session history data
 
 
 class AnalysisPriority(Enum):
@@ -269,6 +353,23 @@ class GeminiConfig:
     def is_free_tier(self) -> bool:
         """Check if using free tier from environment."""
         return os.getenv("GEMINI_FREE_TIER", "true").lower() == "true"
+    
+    @property
+    def api_keys(self) -> List[str]:
+        """Get Gemini API keys from environment.
+        
+        Supports both naming conventions:
+        - New (reimplementation plan): GEMINI_API_KEYS
+        - Legacy: GeminiApiKeys
+        
+        Keys can be comma-separated for rotation.
+        """
+        return get_env_list("GEMINI_API_KEYS", "GeminiApiKeys", default=[])
+    
+    @property
+    def is_available(self) -> bool:
+        """Check if Gemini API is available (has at least one key)."""
+        return len(self.api_keys) > 0
 
 
 GEMINI_CONFIG = GeminiConfig()
@@ -340,10 +441,19 @@ class SessionConfig:
     
     @classmethod
     def from_env(cls) -> 'SessionConfig':
-        """Load configuration from environment variables."""
+        """Load configuration from environment variables.
+        
+        Supports both naming conventions:
+        - New (reimplementation plan): MAX_CONCURRENT_SESSIONS
+        - Legacy: AUTOPLAY_MAX_SESSIONS
+        """
         return cls(
-            max_concurrent_sessions=int(os.getenv("AUTOPLAY_MAX_SESSIONS", "2")),
-            consecutive_request_limit=int(os.getenv("AUTOPLAY_CONSECUTIVE_LIMIT", "5"))
+            max_concurrent_sessions=get_env_int(
+                "MAX_CONCURRENT_SESSIONS", "AUTOPLAY_MAX_SESSIONS", default=2
+            ),
+            consecutive_request_limit=get_env_int(
+                "AUTOPLAY_CONSECUTIVE_LIMIT", default=5
+            )
         )
 
 
@@ -450,79 +560,169 @@ WEBHOOK_CONFIG = WebhookConfig.from_env()
 
 @dataclass
 class PhysicsLayer:
-    """Physics layer metadata (Librosa analysis)."""
-    computed_bpm: float
-    computed_key: str
-    computed_loudness: float
-    timbre_vector: List[float]  # MFCC coefficients
+    """Physics layer metadata (Librosa analysis).
+    
+    Extracted features:
+    - Tempo (BPM) and musical key/mode
+    - Loudness (dB) and energy levels
+    - Spectral characteristics (centroid, rolloff)
+    - Timbre representation (MFCC coefficients)
+    - Percussiveness indicator (zero crossing rate)
+    """
+    bpm: float
+    key: str
+    mode: str  # "major" or "minor"
+    loudness_db: float
+    energy: float  # Normalized RMS energy (0-1)
+    spectral_centroid: float
+    spectral_rolloff: float
+    mfcc_coefficients: Optional[List[float]] = None  # 13 MFCC coefficients for timbre
+    zero_crossing_rate: Optional[float] = None  # Percussiveness indicator
 
 
 @dataclass
 class SemanticsLayer:
-    """Semantics layer metadata (EfficientAT analysis)."""
-    embedding_vector: List[float]
-    instrument_tags: Dict[str, float]  # instrument -> probability
-    quality_score: float
+    """Semantics layer metadata (EfficientAT analysis).
+    
+    Fields:
+    - embedding: Neural audio embedding vector (128-dim from EfficientAT)
+    - instrument_tags: List of detected instruments
+    - sound_tags: List of detected sound characteristics  
+    - predicted_genres: Optional genre predictions from audio
+    - quality_score: Audio quality assessment (0-1)
+    """
+    embedding: List[float]  # Neural embedding vector
+    instrument_tags: List[str]  # Detected instruments
+    sound_tags: List[str]  # Sound characteristics
+    predicted_genres: Optional[List[str]] = None  # Genre predictions from audio
+    quality_score: Optional[float] = None  # Audio quality (0-1)
 
 
 @dataclass
 class LibrarianLayer:
-    """Librarian layer metadata (Gemini analysis)."""
-    canonical_title: str
-    canonical_artist: str
-    release_era: str
-    cultural_vibe: List[str]
-    micro_genre: List[str]
-    explicit_content: bool
-
-
-# Primary type names for the three analysis layers
+    """Librarian layer metadata (Gemini analysis).
+    
+    Also aliased as 'librarian_info' for compatibility.
+    
+    Contains contextual/cultural metadata about the song:
+    - Genre classification
+    - Mood/theme tagging
+    - Energy/danceability metrics
+    - Cultural context
+    - Content flags
+    """
+    # Core genre/mood classification
+    genres: List[str] = field(default_factory=list)
+    moods: List[str] = field(default_factory=list)
+    themes: List[str] = field(default_factory=list)
+    
+    # Energy and danceability (0-1 scale)
+    energy_level: Optional[float] = None
+    danceability: Optional[float] = None
+    
+    # Cultural context
+    cultural_vibe: List[str] = field(default_factory=list)
+    
+    # Content flags
+    explicit_content: bool = False
+    
+    # Canonical metadata (Gemini-corrected)
+    canonical_title: Optional[str] = None
+    canonical_artist: Optional[str] = None
+    
+    # Additional context
+    release_era: Optional[str] = None  # e.g., "2020s", "1980s"
+    micro_genre: List[str] = field(default_factory=list)  # Fine-grained genre tags
 
 
 @dataclass
 class SongMetadata:
-    """Complete song metadata with all layers."""
-    deezer_id: str
-    physics: Optional[PhysicsLayer] = None
-    semantics: Optional[SemanticsLayer] = None
-    librarian: Optional[LibrarianLayer] = None
+    """Complete song metadata with all layers.
+    
+    Fields:
+    - song_id: Primary identifier (Deezer ID preferred)
+    - title, artist, album: Song info
+    - audio_features: PhysicsLayer (Librosa analysis)
+    - semantic_features: SemanticsLayer (EfficientAT analysis)
+    - librarian_info: LibrarianLayer (Gemini analysis)
+    """
+    song_id: str = ""
+    
+    # Basic song info
+    title: str = ""
+    artist: str = ""
+    album: Optional[str] = None
+    duration_ms: Optional[int] = None
+    preview_url: Optional[str] = None
+    isrc: Optional[str] = None
+    
+    # Analysis layers
+    audio_features: Optional[PhysicsLayer] = None
+    semantic_features: Optional[SemanticsLayer] = None
+    librarian_info: Optional[LibrarianLayer] = None
+    
+    # Version tracking
     metadata_version: int = CACHE_VERSION
+    analysis_version: int = 1
+    created_at: Optional[float] = None
+    updated_at: Optional[float] = None
     
     @property
     def is_fully_analyzed(self) -> bool:
         """Check if all three layers are complete."""
-        return all([self.physics, self.semantics, self.librarian])
+        return all([self.audio_features, self.semantic_features, self.librarian_info])
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         result = {
-            "deezer_id": self.deezer_id,
-            "metadata_version": self.metadata_version
+            "song_id": self.song_id,
+            "title": self.title,
+            "artist": self.artist,
+            "album": self.album,
+            "duration_ms": self.duration_ms,
+            "preview_url": self.preview_url,
+            "isrc": self.isrc,
+            "metadata_version": self.metadata_version,
+            "analysis_version": self.analysis_version,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }
         
-        if self.physics:
-            result["physics"] = {
-                "computed_bpm": self.physics.computed_bpm,
-                "computed_key": self.physics.computed_key,
-                "computed_loudness": self.physics.computed_loudness,
-                "timbre_vector": self.physics.timbre_vector
+        if self.audio_features:
+            result["audio_features"] = {
+                "bpm": self.audio_features.bpm,
+                "key": self.audio_features.key,
+                "mode": self.audio_features.mode,
+                "loudness_db": self.audio_features.loudness_db,
+                "energy": self.audio_features.energy,
+                "spectral_centroid": self.audio_features.spectral_centroid,
+                "spectral_rolloff": self.audio_features.spectral_rolloff,
+                "mfcc_coefficients": self.audio_features.mfcc_coefficients,
+                "zero_crossing_rate": self.audio_features.zero_crossing_rate,
             }
         
-        if self.semantics:
-            result["semantics"] = {
-                "embedding_vector": self.semantics.embedding_vector,
-                "instrument_tags": self.semantics.instrument_tags,
-                "quality_score": self.semantics.quality_score
+        if self.semantic_features:
+            result["semantic_features"] = {
+                "embedding": self.semantic_features.embedding,
+                "instrument_tags": self.semantic_features.instrument_tags,
+                "sound_tags": self.semantic_features.sound_tags,
+                "predicted_genres": self.semantic_features.predicted_genres,
+                "quality_score": self.semantic_features.quality_score,
             }
         
-        if self.librarian:
-            result["librarian"] = {
-                "canonical_title": self.librarian.canonical_title,
-                "canonical_artist": self.librarian.canonical_artist,
-                "release_era": self.librarian.release_era,
-                "cultural_vibe": self.librarian.cultural_vibe,
-                "micro_genre": self.librarian.micro_genre,
-                "explicit_content": self.librarian.explicit_content
+        if self.librarian_info:
+            result["librarian_info"] = {
+                "genres": self.librarian_info.genres,
+                "moods": self.librarian_info.moods,
+                "themes": self.librarian_info.themes,
+                "energy_level": self.librarian_info.energy_level,
+                "danceability": self.librarian_info.danceability,
+                "cultural_vibe": self.librarian_info.cultural_vibe,
+                "explicit_content": self.librarian_info.explicit_content,
+                "canonical_title": self.librarian_info.canonical_title,
+                "canonical_artist": self.librarian_info.canonical_artist,
+                "release_era": self.librarian_info.release_era,
+                "micro_genre": self.librarian_info.micro_genre,
             }
         
         return result
@@ -530,44 +730,65 @@ class SongMetadata:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'SongMetadata':
         """Create from dictionary (JSON deserialization)."""
-        physics = None
-        semantics = None
-        librarian = None
+        audio_features = None
+        semantic_features = None
+        librarian_info = None
         
-        if "physics" in data:
-            p = data["physics"]
-            physics = PhysicsLayer(
-                computed_bpm=p["computed_bpm"],
-                computed_key=p["computed_key"],
-                computed_loudness=p["computed_loudness"],
-                timbre_vector=p["timbre_vector"]
+        if data.get("audio_features"):
+            af = data["audio_features"]
+            audio_features = PhysicsLayer(
+                bpm=af.get("bpm", 0.0),
+                key=af.get("key", "C"),
+                mode=af.get("mode", "major"),
+                loudness_db=af.get("loudness_db", 0.0),
+                energy=af.get("energy", 0.5),
+                spectral_centroid=af.get("spectral_centroid", 0.0),
+                spectral_rolloff=af.get("spectral_rolloff", 0.0),
+                mfcc_coefficients=af.get("mfcc_coefficients"),
+                zero_crossing_rate=af.get("zero_crossing_rate")
             )
         
-        if "semantics" in data:
-            s = data["semantics"]
-            semantics = SemanticsLayer(
-                embedding_vector=s["embedding_vector"],
-                instrument_tags=s["instrument_tags"],
-                quality_score=s["quality_score"]
+        if data.get("semantic_features"):
+            sf = data["semantic_features"]
+            semantic_features = SemanticsLayer(
+                embedding=sf.get("embedding", []),
+                instrument_tags=sf.get("instrument_tags", []),
+                sound_tags=sf.get("sound_tags", []),
+                predicted_genres=sf.get("predicted_genres"),
+                quality_score=sf.get("quality_score")
             )
         
-        if "librarian" in data:
-            lib = data["librarian"]
-            librarian = LibrarianLayer(
-                canonical_title=lib["canonical_title"],
-                canonical_artist=lib["canonical_artist"],
-                release_era=lib["release_era"],
-                cultural_vibe=lib["cultural_vibe"],
-                micro_genre=lib["micro_genre"],
-                explicit_content=lib["explicit_content"]
+        if data.get("librarian_info"):
+            li = data["librarian_info"]
+            librarian_info = LibrarianLayer(
+                genres=li.get("genres", []),
+                moods=li.get("moods", []),
+                themes=li.get("themes", []),
+                energy_level=li.get("energy_level"),
+                danceability=li.get("danceability"),
+                cultural_vibe=li.get("cultural_vibe", []),
+                explicit_content=li.get("explicit_content", False),
+                canonical_title=li.get("canonical_title"),
+                canonical_artist=li.get("canonical_artist"),
+                release_era=li.get("release_era"),
+                micro_genre=li.get("micro_genre", [])
             )
         
         return cls(
-            deezer_id=data["deezer_id"],
-            physics=physics,
-            semantics=semantics,
-            librarian=librarian,
-            metadata_version=data.get("metadata_version", CACHE_VERSION)
+            song_id=data.get("song_id", ""),
+            title=data.get("title", ""),
+            artist=data.get("artist", ""),
+            album=data.get("album"),
+            duration_ms=data.get("duration_ms"),
+            preview_url=data.get("preview_url"),
+            isrc=data.get("isrc"),
+            audio_features=audio_features,
+            semantic_features=semantic_features,
+            librarian_info=librarian_info,
+            metadata_version=data.get("metadata_version", CACHE_VERSION),
+            analysis_version=data.get("analysis_version", 1),
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at")
         )
 
 
@@ -613,11 +834,55 @@ class SongMapping:
 # =============================================================================
 
 def get_verbosity() -> int:
-    """Get verbosity level from environment."""
-    return int(os.getenv("AUTOPLAY_V3_VERBOSITY", "0"))
+    """Get verbosity level from environment.
+    
+    Levels:
+        0 = Errors only (ERROR level)
+        1 = Overview (WARNING level - errors + important events)
+        2 = Detailed (INFO level - full operation logging)
+        3 = Debug (DEBUG level - developer diagnostics)
+    """
+    return int(os.getenv("AUTOPLAY_V3_VERBOSITY", "1"))
 
 
 VERBOSITY = get_verbosity()
+
+
+def configure_v3_logging() -> None:
+    """Configure logging levels based on AUTOPLAY_V3_VERBOSITY.
+    
+    This should be called once at engine startup to set appropriate
+    log levels for all V3 modules.
+    """
+    import logging
+    
+    # Map verbosity to log level
+    level_map = {
+        0: logging.ERROR,    # Errors only
+        1: logging.WARNING,  # Overview (errors + important events)  
+        2: logging.INFO,     # Detailed
+        3: logging.DEBUG     # Debug
+    }
+    
+    log_level = level_map.get(VERBOSITY, logging.INFO)
+    
+    # Get the V3 package logger (parent of all module loggers)
+    v3_logger = logging.getLogger("modules.music.Autoplay_Engine.v3")
+    v3_logger.setLevel(log_level)
+    
+    # If no handlers exist, add a console handler
+    if not v3_logger.handlers and not v3_logger.parent.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(log_level)
+        formatter = logging.Formatter(
+            '[V3-Autoplay] %(levelname)s | %(name)s | %(message)s'
+        )
+        handler.setFormatter(formatter)
+        v3_logger.addHandler(handler)
+    
+    # Log the configured level
+    if VERBOSITY >= 2:
+        v3_logger.info(f"V3 Autoplay logging configured: verbosity={VERBOSITY}, level={logging.getLevelName(log_level)}")
 
 
 # =============================================================================

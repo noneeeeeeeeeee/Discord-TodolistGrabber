@@ -525,13 +525,70 @@ class ControlCommands(commands.Cog):
         guild_id = ctx.guild.id
         autoplay_enabled = player.is_session_autoplay_enabled(guild_id)
 
-        # Check if this is V2
+        # Check version: V3 first, then V2, then V1
+        is_v3 = hasattr(lastfm_autoplay, '_engine') or type(lastfm_autoplay).__name__ == 'LastFMAutoplayV3'
         is_v2 = hasattr(lastfm_autoplay, '_context_tracker')
         
-        if is_v2:
+        if is_v3:
+            await self._show_autoplay_status_v3(ctx, player, lastfm_autoplay, guild_id, autoplay_enabled)
+        elif is_v2:
             await self._show_autoplay_status_v2(ctx, player, lastfm_autoplay, guild_id, autoplay_enabled)
         else:
             await self._show_autoplay_status_v1(ctx, player, lastfm_autoplay, guild_id, autoplay_enabled)
+
+    async def _show_autoplay_status_v3(self, ctx, player, lastfm_autoplay, guild_id, autoplay_enabled):
+        """V3 status display - simplified session-based approach."""
+        import discord
+        
+        embed = discord.Embed(
+            title="🎲 AutoPlay Status (V3 - Session-Based Recommender)",
+            description=f"**Status:** {'✅ Enabled' if autoplay_enabled else '❌ Disabled'}",
+            color=discord.Color.blue() if autoplay_enabled else discord.Color.grayed_out()
+        )
+        
+        # Get session info if available
+        session_info = "No active session"
+        if hasattr(lastfm_autoplay, '_engine') and lastfm_autoplay._engine:
+            engine = lastfm_autoplay._engine
+            if hasattr(engine, 'session_mgr'):
+                session = await engine.session_mgr.get_session(str(guild_id))
+                if session:
+                    session_info = f"**Session ID:** `{session.session_id[:16]}...`\n"
+                    session_info += f"**State:** {session.state}\n"
+                    session_info += f"**Tracks Played:** {session.play_count}\n"
+                    session_info += f"**Skips:** {session.skip_count}"
+                    
+                    # Calculate skip rate
+                    total = session.play_count + session.skip_count
+                    if total > 0:
+                        skip_rate = session.skip_count / total
+                        session_info += f" ({skip_rate * 100:.0f}% skip rate)"
+        
+        embed.add_field(name="📊 Session Info", value=session_info, inline=False)
+        
+        # Data sources
+        sources = []
+        sources.append("✅ Deezer (primary)")
+        sources.append("✅ Last.fm (similar artists)")
+        
+        # Check Gemini availability
+        import os
+        if os.getenv("GeminiApiKeys"):
+            sources.append("✅ Gemini AI (enrichment)")
+        else:
+            sources.append("❌ Gemini AI (not configured)")
+            
+        embed.add_field(name="🔌 Data Sources", value="\n".join(sources), inline=True)
+        
+        # Algorithm info
+        algo_info = "**Strategy:** Buffer-based recommendations\n"
+        algo_info += "**Buffer Size:** 5 tracks\n"
+        algo_info += "**Fallback:** Genre-based exploration"
+        embed.add_field(name="🧠 Algorithm", value=algo_info, inline=True)
+        
+        embed.set_footer(text="V3 uses session-based learning with Deezer + Last.fm")
+        
+        await ctx.send(embed=embed)
 
     async def _show_autoplay_status_v2(self, ctx, player, lastfm_autoplay, guild_id, autoplay_enabled):
         """Enhanced V2 status with context tracking."""

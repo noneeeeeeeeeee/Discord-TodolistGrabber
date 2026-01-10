@@ -412,8 +412,8 @@ class CacheManager:
         lock_key = f"metadata_{shard_index}"
         
         async with self._locks[lock_key]:
-            # Store in memory
-            data = self._metadata_to_dict(metadata)
+            # Store in memory using canonical to_dict method
+            data = metadata.to_dict()
             self._memory_cache["metadata"][song_id] = data
             
             # Mark shard as dirty
@@ -425,9 +425,9 @@ class CacheManager:
             data={
                 "cache_type": "metadata",
                 "song_id": song_id,
-                "has_physics": metadata.physics is not None,
-                "has_semantics": metadata.semantics is not None,
-                "has_librarian": metadata.librarian is not None
+                "has_audio_features": metadata.audio_features is not None,
+                "has_semantic_features": metadata.semantic_features is not None,
+                "has_librarian_info": metadata.librarian_info is not None,
             }
         ))
     
@@ -626,7 +626,7 @@ class CacheManager:
         Get count of fully analyzed songs in cache.
         
         A song is considered fully analyzed if it has all three
-        analysis layers: physics (audio), semantics, and librarian.
+        analysis layers: audio_features, semantic_features, and librarian_info.
         
         Returns:
             Number of fully analyzed songs
@@ -671,22 +671,22 @@ class CacheManager:
             if len(results) >= limit:
                 break
             
-            physics = entry.get("physics", {})
-            librarian = entry.get("librarian", {})
+            audio = entry.get("audio_features", {})
+            librarian = entry.get("librarian_info", {})
             
             # Check BPM range
             if bpm_range:
-                entry_bpm = physics.get("computed_bpm", 0)
+                entry_bpm = audio.get("bpm", 0)
                 if not (bpm_range[0] <= entry_bpm <= bpm_range[1]):
                     continue
             
             # Check key
-            if key and physics.get("computed_key") != key:
+            if key and audio.get("key") != key:
                 continue
             
             # Check genres (any match)
             if genres:
-                entry_genres = librarian.get("micro_genre", [])
+                entry_genres = librarian.get("genres", []) + librarian.get("micro_genre", [])
                 if not any(g in entry_genres for g in genres):
                     continue
             
@@ -695,44 +695,18 @@ class CacheManager:
         return results
     
     def _metadata_to_dict(self, metadata: SongMetadata) -> dict:
-        """Convert SongMetadata dataclass to dictionary for storage."""
-        data = {
-            "deezer_id": metadata.deezer_id,
-            "metadata_version": metadata.metadata_version
-        }
+        """Convert SongMetadata dataclass to dictionary for storage.
         
-        if metadata.physics:
-            data["physics"] = asdict(metadata.physics)
-        
-        if metadata.semantics:
-            data["semantics"] = asdict(metadata.semantics)
-        
-        if metadata.librarian:
-            data["librarian"] = asdict(metadata.librarian)
-        
-        return data
+        Uses the canonical to_dict method which includes both new and legacy field names.
+        """
+        return metadata.to_dict()
     
     def _dict_to_metadata(self, data: dict) -> SongMetadata:
-        """Convert stored dictionary back to SongMetadata dataclass."""
-        physics = None
-        if data.get("physics"):
-            physics = PhysicsLayer(**data["physics"])
+        """Convert stored dictionary back to SongMetadata dataclass.
         
-        semantics = None
-        if data.get("semantics"):
-            semantics = SemanticsLayer(**data["semantics"])
-        
-        librarian = None
-        if data.get("librarian"):
-            librarian = LibrarianLayer(**data["librarian"])
-        
-        return SongMetadata(
-            deezer_id=data["deezer_id"],
-            physics=physics,
-            semantics=semantics,
-            librarian=librarian,
-            metadata_version=data.get("metadata_version", CACHE_VERSION)
-        )
+        Uses the canonical from_dict method which handles both old and new field names.
+        """
+        return SongMetadata.from_dict(data)
     
     async def shutdown(self) -> None:
         """

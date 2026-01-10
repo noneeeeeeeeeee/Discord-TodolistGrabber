@@ -49,11 +49,6 @@ Architecture:
     │  └──────────────────────────────────────────────────────┘   │
     └─────────────────────────────────────────────────────────────┘
 
-Session States:
-    - COLD (1-10 songs): Last.fm similarity, safe picks
-    - WARM (11-25 songs): Hybrid recommendations, light CF
-    - HOT (25+ songs): Full CF + context + novelty
-    - EXTENDED (25+ special): Daydreamer integration
 
 Usage:
     from modules.music.Autoplay_Engine.v3 import V3Engine
@@ -101,6 +96,10 @@ from .constants import (
     SessionState,
     SongMetadata,
     V3Config,
+    # Layer types
+    PhysicsLayer,
+    SemanticsLayer,
+    LibrarianLayer,
 )
 from .context_analyzer import ContextAnalyzer, get_context_analyzer
 from .daydreamer import Daydreamer, get_daydreamer
@@ -114,7 +113,10 @@ from .song_analyzer import SongAnalyzer, get_song_analyzer
 
 logger = logging.getLogger(__name__)
 
-__version__ = "3.0.0"
+# Import version from centralized constants
+from .constants import V3_ENGINE_VERSION, get_v3_version_info
+
+__version__ = V3_ENGINE_VERSION
 __all__ = [
     # Main engine
     "V3Engine",
@@ -141,6 +143,10 @@ __all__ = [
     "SessionData",
     "BufferedSong",
     "EventPayload",
+    # Layer types
+    "PhysicsLayer",
+    "SemanticsLayer", 
+    "LibrarianLayer",
     
     # Managers (for advanced usage)
     "SessionManager",
@@ -497,7 +503,7 @@ class V3Engine:
         await self.initialize()
         
         return {
-            "version": __version__,
+            "version": get_v3_version_info(),
             "sessions": self.session_mgr.get_stats(),
             "cache": await self.cache.get_stats(),
             "analyzer": await self.analyzer.get_queue_status(),
@@ -593,6 +599,34 @@ class LastFMAutoplayV3:
             except Exception as e:
                 logger.error(f"Failed to initialize V3 engine: {e}")
                 return False
+    
+    def start(self) -> None:
+        """
+        Start the V3 Autoplay Engine (called by music_player on bot start).
+        
+        This initiates engine initialization including Daydreamer background
+        exploration. Since this is called from a synchronous context, we
+        create a background task for the async initialization.
+        """
+        if not self._prerequisites_available:
+            logger.warning("Cannot start V3 engine - prerequisites not available")
+            return
+        
+        # Configure logging based on verbosity
+        from .constants import configure_v3_logging
+        configure_v3_logging()
+        
+        # Schedule async initialization as background task
+        asyncio.create_task(self._start_async())
+        logger.info("V3 Autoplay Engine start requested - initializing in background")
+    
+    async def _start_async(self) -> None:
+        """Async startup routine."""
+        try:
+            await self._ensure_initialized()
+            logger.info("✅ V3 Autoplay Engine started with Daydreamer exploration active")
+        except Exception as e:
+            logger.error(f"Failed to start V3 engine: {e}")
     
     def is_available(self) -> bool:
         """

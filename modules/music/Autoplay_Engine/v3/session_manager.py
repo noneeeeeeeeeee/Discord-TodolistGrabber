@@ -77,7 +77,6 @@ class SessionManager:
     - Cleared if guild is no longer in voice
     """
     
-    MAX_CONCURRENT_SESSIONS = 2
     SESSION_TIMEOUT_HOURS = 4
     
     def __init__(
@@ -98,7 +97,7 @@ class SessionManager:
             event_bus: Event bus for notifications
             session_mixer: Session mixer for adaptive weights
         """
-        self.config = config or V3Config()
+        self.config = config or V3Config.from_env()
         self.context = context or get_context_analyzer()
         self.novelty = novelty or get_novelty_controller()
         self.event_bus = event_bus or EventBus()
@@ -220,10 +219,11 @@ class SessionManager:
                 return self._sessions.get(existing_id)
             
             # Check capacity
-            if len(self._sessions) >= self.MAX_CONCURRENT_SESSIONS:
+            max_sessions = self.config.max_concurrent_sessions
+            if len(self._sessions) >= max_sessions:
                 logger.warning(
                     f"Cannot create session for guild {guild_id}: "
-                    f"at capacity ({self.MAX_CONCURRENT_SESSIONS})"
+                    f"at capacity ({max_sessions})"
                 )
                 return None
             
@@ -523,7 +523,7 @@ class SessionManager:
         
         return {
             "active_sessions": len(self._sessions),
-            "max_sessions": self.MAX_CONCURRENT_SESSIONS,
+            "max_sessions": self.config.max_concurrent_sessions,
             "total_plays": total_plays,
             "total_skips": total_skips,
             "avg_skip_rate": total_skips / total_plays if total_plays > 0 else 0,
