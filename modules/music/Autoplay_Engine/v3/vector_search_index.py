@@ -18,6 +18,7 @@ skip behavior), see collaborative_recommender.py.
 """
 
 import asyncio
+import inspect
 import logging
 import math
 from dataclasses import dataclass
@@ -201,11 +202,11 @@ class VectorSearcher:
         
         await self.cache.initialize()
         
-        # Subscribe to analysis events (subscribe is synchronous)
-        self.event_bus.subscribe(
-            EventType.SONG_ANALYZED,
-            self._on_song_analyzed
+        subscribe_result = self.event_bus.subscribe(
+            EventType.SONG_ANALYZED, self._on_song_analyzed
         )
+        if inspect.isawaitable(subscribe_result):
+            await subscribe_result
         
         # Build initial index from cache
         await self._build_index()
@@ -218,10 +219,11 @@ class VectorSearcher:
     
     async def shutdown(self) -> None:
         """Clean up."""
-        self.event_bus.unsubscribe(
-            EventType.SONG_ANALYZED,
-            self._on_song_analyzed
+        unsubscribe_result = self.event_bus.unsubscribe(
+            EventType.SONG_ANALYZED, self._on_song_analyzed
         )
+        if inspect.isawaitable(unsubscribe_result):
+            await unsubscribe_result
         self._initialized = False
     
     async def _build_index(self) -> None:
@@ -267,10 +269,13 @@ class VectorSearcher:
         song_id = metadata.song_id
         
         # Index embedding if available
-        if metadata.semantic_features and metadata.semantic_features.embedding:
+        if (
+            metadata.semantic_features
+            and metadata.semantic_features.embedding_vector
+        ):
             self._embedding_index.add(
                 song_id,
-                metadata.semantic_features.embedding
+                metadata.semantic_features.embedding_vector
             )
         
         # Build and index feature vector
@@ -447,7 +452,7 @@ class VectorSearcher:
         
         # Get embedding from metadata if not provided
         if embedding is None and metadata and metadata.semantic_features:
-            embedding = metadata.semantic_features.embedding
+            embedding = metadata.semantic_features.embedding_vector
         
         # Get features from metadata if not provided
         if features is None and metadata:
@@ -527,8 +532,11 @@ class VectorSearcher:
             if not metadata:
                 continue
             
-            if metadata.semantic_features and metadata.semantic_features.embedding:
-                embeddings.append(metadata.semantic_features.embedding)
+            if (
+                metadata.semantic_features
+                and metadata.semantic_features.embedding_vector
+            ):
+                embeddings.append(metadata.semantic_features.embedding_vector)
             
             feature_vec = self._build_feature_vector(metadata)
             if feature_vec:

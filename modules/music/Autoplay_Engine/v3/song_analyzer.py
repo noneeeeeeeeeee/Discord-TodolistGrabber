@@ -139,6 +139,7 @@ class SongAnalyzer:
         # EfficientAT model (lazy loaded)
         self._efficientat_model = None
         self._efficientat_labels = None
+        self._efficientat_unavailable = False
         
         # Gemini bulk processing queue
         self._gemini_batch: list[tuple[AnalysisTask, PhysicsLayer, Optional[SemanticsLayer]]] = []
@@ -598,7 +599,8 @@ class SongAnalyzer:
         model = await self._get_efficientat_model()
         
         if model is None:
-            logger.warning("EfficientAT not available, using placeholder")
+            if not self._efficientat_unavailable:
+                logger.warning("EfficientAT not available, using placeholder")
             return SemanticsLayer(
                 embedding_vector=[0.0] * 128,
                 instrument_tags={"unknown": 1.0},
@@ -617,6 +619,8 @@ class SongAnalyzer:
     
     async def _get_efficientat_model(self):
         """Lazy load EfficientAT model."""
+        if self._efficientat_unavailable:
+            return None
         if self._efficientat_model is not None:
             return self._efficientat_model
         
@@ -625,23 +629,25 @@ class SongAnalyzer:
             from .dependency_manager import DependencyManager
             
             dep_manager = DependencyManager()
-            model_path = await dep_manager.ensure_model_file("mn10_as")
+            model_path = dep_manager.ensure_model()
             
             if model_path:
-                import torch
-                
-                # Load model (implementation depends on EfficientAT structure)
-                # This is a placeholder for the actual loading logic
-                logger.info(f"Loading EfficientAT model from {model_path}")
-                
-                # Model would be loaded here
-                # self._efficientat_model = torch.load(model_path)
-                
-                return self._efficientat_model
+                # EfficientAT inference is not fully implemented in this repo yet.
+                # We still download/verify the checkpoint path, then disable
+                # further attempts to avoid noisy repeated warnings.
+                try:
+                    import torch  # noqa: F401
+                except Exception:
+                    pass
+                logger.info(f"EfficientAT checkpoint available at {model_path} (placeholder inference)")
+                self._efficientat_unavailable = True
+                return None
                 
         except Exception as e:
             logger.warning(f"Failed to load EfficientAT: {e}")
+            self._efficientat_unavailable = True
         
+        self._efficientat_unavailable = True
         return None
     
     def _efficientat_inference(
