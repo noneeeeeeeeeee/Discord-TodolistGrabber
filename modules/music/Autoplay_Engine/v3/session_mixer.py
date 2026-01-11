@@ -621,14 +621,17 @@ class SessionMixer:
             weights["hot"] -= 0.15
             weights["cold"] -= 0.05
         
-        # Normalize weights
+        # Clamp to non-negative first (some adjustments can push values negative)
+        weights = {k: max(0.0, float(v)) for k, v in weights.items()}
+
+        # Normalize weights so they sum to ~1.0
         total = sum(weights.values())
-        if total > 0:
-            weights = {k: v / total for k, v in weights.items()}
-        
-        # Clamp to non-negative
-        weights = {k: max(0.0, v) for k, v in weights.items()}
-        
+        if total <= 0:
+            # Fallback to conservative defaults if everything was clamped to 0
+            weights = {"hot": 0.4, "warm": 0.35, "cold": 0.2, "extended": 0.05}
+            total = sum(weights.values())
+
+        weights = {k: v / total for k, v in weights.items()}
         return weights
     
     def should_use_extended(self, session_id: str) -> bool:

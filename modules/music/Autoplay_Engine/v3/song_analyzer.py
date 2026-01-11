@@ -223,11 +223,13 @@ class SongAnalyzer:
         
         if self._session:
             await self._session.close()
+            self._session = None
         
         # Clean up temp directory
         if self._temp_dir and self._temp_dir.exists():
             import shutil
             shutil.rmtree(self._temp_dir, ignore_errors=True)
+        self._temp_dir = None
         
         self._initialized = False
         logger.info("Song analyzer shutdown complete")
@@ -598,9 +600,9 @@ class SongAnalyzer:
         if model is None:
             logger.warning("EfficientAT not available, using placeholder")
             return SemanticsLayer(
-                embedding=[0.0] * 128,
-                instrument_tags=["unknown"],
-                sound_tags=["music"],
+                embedding_vector=[0.0] * 128,
+                instrument_tags={"unknown": 1.0},
+                sound_tags={"music": 1.0},
                 predicted_genres=[]
             )
         
@@ -620,7 +622,7 @@ class SongAnalyzer:
         
         try:
             # Import and load model
-            from dependency_manager import DependencyManager
+            from .dependency_manager import DependencyManager
             
             dep_manager = DependencyManager()
             model_path = await dep_manager.ensure_model_file("mn10_as")
@@ -655,9 +657,9 @@ class SongAnalyzer:
         # 3. Post-process outputs
         
         return SemanticsLayer(
-            embedding=[0.0] * 128,
-            instrument_tags=["placeholder"],
-            sound_tags=["music"],
+            embedding_vector=[0.0] * 128,
+            instrument_tags={"placeholder": 1.0},
+            sound_tags={"music": 1.0},
             predicted_genres=[]
         )
     
@@ -684,9 +686,8 @@ class SongAnalyzer:
         # Get semantic tags
         semantic_tags = None
         if semantic_features:
-            semantic_tags = (
-                semantic_features.instrument_tags +
-                semantic_features.sound_tags
+            semantic_tags = list(semantic_features.instrument_tags.keys()) + list(
+                semantic_features.sound_tags.keys()
             )
         
         # Call Gemini
@@ -704,17 +705,24 @@ class SongAnalyzer:
         
         data = response.data
         
+        cultural_vibe = data.get("cultural_vibe")
+        if isinstance(cultural_vibe, str):
+            cultural_vibe = [cultural_vibe] if cultural_vibe else []
+        elif not isinstance(cultural_vibe, list):
+            cultural_vibe = []
+
         return LibrarianLayer(
-            genres=data.get("genres", []),
-            moods=data.get("moods", []),
-            themes=data.get("themes", []),
-            energy_level=data.get("energy_level", 0.5),
-            danceability=data.get("danceability", 0.5),
-            explicit_content=data.get("explicit_content", False),
-            cultural_vibe=data.get("cultural_vibe", ""),
+            genres=data.get("genres", []) or [],
+            moods=data.get("moods", []) or [],
+            themes=data.get("themes", []) or [],
+            energy_level=data.get("energy_level"),
+            danceability=data.get("danceability"),
+            explicit_content=bool(data.get("explicit_content", False)),
+            cultural_vibe=cultural_vibe,
             canonical_title=data.get("canonical_title"),
-            similar_artists=data.get("similar_artists", []),
-            recommendation_tags=data.get("recommendation_tags", [])
+            canonical_artist=data.get("canonical_artist"),
+            release_era=data.get("release_era"),
+            micro_genre=data.get("micro_genre", []) or [],
         )
     
     async def _queue_for_gemini_batch(
@@ -808,8 +816,8 @@ class SongAnalyzer:
             }
             
             if semantic:
-                song_info["semantic_tags"] = (
-                    semantic.instrument_tags + semantic.sound_tags
+                song_info["semantic_tags"] = list(semantic.instrument_tags.keys()) + list(
+                    semantic.sound_tags.keys()
                 )
             
             songs_data.append(song_info)
@@ -825,18 +833,25 @@ class SongAnalyzer:
             for (task, audio, semantic), result in zip(batch, results):
                 if result and result.get("success"):
                     data = result.get("data", {})
-                    
-                    librarian_info = LibrarianInfo(
-                        genres=data.get("genres", []),
-                        moods=data.get("moods", []),
-                        themes=data.get("themes", []),
-                        energy_level=data.get("energy_level", 0.5),
-                        danceability=data.get("danceability", 0.5),
-                        explicit_content=data.get("explicit_content", False),
-                        cultural_vibe=data.get("cultural_vibe", ""),
+
+                    cultural_vibe = data.get("cultural_vibe")
+                    if isinstance(cultural_vibe, str):
+                        cultural_vibe = [cultural_vibe] if cultural_vibe else []
+                    elif not isinstance(cultural_vibe, list):
+                        cultural_vibe = []
+
+                    librarian_info = LibrarianLayer(
+                        genres=data.get("genres", []) or [],
+                        moods=data.get("moods", []) or [],
+                        themes=data.get("themes", []) or [],
+                        energy_level=data.get("energy_level"),
+                        danceability=data.get("danceability"),
+                        explicit_content=bool(data.get("explicit_content", False)),
+                        cultural_vibe=cultural_vibe,
                         canonical_title=data.get("canonical_title"),
-                        similar_artists=data.get("similar_artists", []),
-                        recommendation_tags=data.get("recommendation_tags", [])
+                        canonical_artist=data.get("canonical_artist"),
+                        release_era=data.get("release_era"),
+                        micro_genre=data.get("micro_genre", []) or [],
                     )
                     
                     # Update cached metadata

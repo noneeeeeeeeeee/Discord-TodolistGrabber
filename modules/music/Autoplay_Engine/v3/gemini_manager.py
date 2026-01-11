@@ -548,6 +548,28 @@ For canonical_title, provide the official/standardized title if different from t
         ))
         
         return results
+
+    async def analyze_songs_bulk(self, songs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Compatibility wrapper for bulk song analysis.
+
+        `SongAnalyzer` expects a list of dictionaries with at least:
+        - success: bool
+        - data: dict | None
+        - error: str | None
+
+        Internally we already implement batching via `batch_analyze_songs()`.
+        """
+        responses = await self.batch_analyze_songs(songs)
+        return [
+            {
+                "success": r.success,
+                "data": r.data,
+                "error": r.error,
+                "grounded": r.grounded,
+                "usage": r.usage,
+            }
+            for r in responses
+        ]
     
     async def get_recommendations_prompt(
         self,

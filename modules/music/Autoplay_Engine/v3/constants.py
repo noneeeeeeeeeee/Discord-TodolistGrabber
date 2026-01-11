@@ -569,15 +569,55 @@ class PhysicsLayer:
     - Timbre representation (MFCC coefficients)
     - Percussiveness indicator (zero crossing rate)
     """
-    bpm: float
-    key: str
-    mode: str  # "major" or "minor"
-    loudness_db: float
-    energy: float  # Normalized RMS energy (0-1)
-    spectral_centroid: float
-    spectral_rolloff: float
+    # Canonical V3 field names
+    bpm: float = 0.0
+    key: str = ""
+    mode: str = ""  # "major" or "minor"
+    loudness_db: float = 0.0
+    energy: float = 0.5  # Normalized RMS energy (0-1)
+    spectral_centroid: float = 0.0
+    spectral_rolloff: float = 0.0
     mfcc_coefficients: Optional[List[float]] = None  # 13 MFCC coefficients for timbre
     zero_crossing_rate: Optional[float] = None  # Percussiveness indicator
+
+    # Legacy field names (kept for tests/backwards compatibility)
+    computed_bpm: Optional[float] = None
+    computed_key: Optional[str] = None
+    computed_loudness: Optional[float] = None
+    timbre_vector: Optional[List[float]] = None
+
+    def __post_init__(self) -> None:
+        # If legacy values were provided, populate canonical fields.
+        if self.computed_bpm is not None and not self.bpm:
+            self.bpm = float(self.computed_bpm)
+        if self.computed_loudness is not None and not self.loudness_db:
+            self.loudness_db = float(self.computed_loudness)
+        if self.timbre_vector is not None and self.mfcc_coefficients is None:
+            self.mfcc_coefficients = list(self.timbre_vector)
+
+        # Parse legacy computed_key like "C major" / "A minor" if canonical not set.
+        if self.computed_key and not self.key:
+            parts = str(self.computed_key).strip().split()
+            if parts:
+                self.key = parts[0]
+                if len(parts) > 1 and not self.mode:
+                    m = parts[1].lower()
+                    if m in ("major", "minor"):
+                        self.mode = m
+        if self.computed_key is None and self.key:
+            # Reconstruct a reasonable legacy string when only canonical data exists.
+            if self.mode:
+                self.computed_key = f"{self.key} {self.mode}".strip()
+            else:
+                self.computed_key = self.key
+
+        # Keep legacy mirrors populated for callers expecting them.
+        if self.computed_bpm is None:
+            self.computed_bpm = self.bpm
+        if self.computed_loudness is None:
+            self.computed_loudness = self.loudness_db
+        if self.timbre_vector is None and self.mfcc_coefficients is not None:
+            self.timbre_vector = list(self.mfcc_coefficients)
 
 
 @dataclass
@@ -585,15 +625,15 @@ class SemanticsLayer:
     """Semantics layer metadata (EfficientAT analysis).
     
     Fields:
-    - embedding: Neural audio embedding vector (128-dim from EfficientAT)
-    - instrument_tags: List of detected instruments
-    - sound_tags: List of detected sound characteristics  
+    - embedding_vector: Neural audio embedding vector (128-dim from EfficientAT)
+    - instrument_tags: Mapping of instrument->confidence
+    - sound_tags: Mapping of sound tag->confidence
     - predicted_genres: Optional genre predictions from audio
     - quality_score: Audio quality assessment (0-1)
     """
-    embedding: List[float]  # Neural embedding vector
-    instrument_tags: List[str]  # Detected instruments
-    sound_tags: List[str]  # Sound characteristics
+    embedding_vector: List[float] = field(default_factory=list)  # Neural embedding vector
+    instrument_tags: Dict[str, float] = field(default_factory=dict)  # Detected instruments
+    sound_tags: Dict[str, float] = field(default_factory=dict)  # Sound characteristics
     predicted_genres: Optional[List[str]] = None  # Genre predictions from audio
     quality_score: Optional[float] = None  # Audio quality (0-1)
 
@@ -646,7 +686,10 @@ class SongMetadata:
     - semantic_features: SemanticsLayer (EfficientAT analysis)
     - librarian_info: LibrarianLayer (Gemini analysis)
     """
+    # Canonical V3 identifier
     song_id: str = ""
+    # Legacy alias used by older code/tests
+    deezer_id: str = ""
     
     # Basic song info
     title: str = ""
@@ -658,6 +701,8 @@ class SongMetadata:
     
     # Analysis layers
     audio_features: Optional[PhysicsLayer] = None
+    # Legacy alias used by older code/tests
+    physics: Optional[PhysicsLayer] = None
     semantic_features: Optional[SemanticsLayer] = None
     librarian_info: Optional[LibrarianLayer] = None
     
@@ -666,6 +711,19 @@ class SongMetadata:
     analysis_version: int = 1
     created_at: Optional[float] = None
     updated_at: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        # Sync legacy/canonical IDs
+        if self.deezer_id and not self.song_id:
+            self.song_id = self.deezer_id
+        if self.song_id and not self.deezer_id:
+            self.deezer_id = self.song_id
+
+        # Sync legacy/canonical physics/audio_features
+        if self.physics is not None and self.audio_features is None:
+            self.audio_features = self.physics
+        if self.audio_features is not None and self.physics is None:
+            self.physics = self.audio_features
     
     @property
     def is_fully_analyzed(self) -> bool:
@@ -676,6 +734,7 @@ class SongMetadata:
         """Convert to dictionary for JSON serialization."""
         result = {
             "song_id": self.song_id,
+            "deezer_id": self.deezer_id,
             "title": self.title,
             "artist": self.artist,
             "album": self.album,
@@ -700,10 +759,18 @@ class SongMetadata:
                 "mfcc_coefficients": self.audio_features.mfcc_coefficients,
                 "zero_crossing_rate": self.audio_features.zero_crossing_rate,
             }
+
+            # Legacy representation
+            result["physics"] = {
+                "computed_bpm": self.audio_features.computed_bpm,
+                "computed_key": self.audio_features.computed_key,
+                "computed_loudness": self.audio_features.computed_loudness,
+                "timbre_vector": self.audio_features.timbre_vector,
+            }
         
         if self.semantic_features:
             result["semantic_features"] = {
-                "embedding": self.semantic_features.embedding,
+                "embedding_vector": self.semantic_features.embedding_vector,
                 "instrument_tags": self.semantic_features.instrument_tags,
                 "sound_tags": self.semantic_features.sound_tags,
                 "predicted_genres": self.semantic_features.predicted_genres,
@@ -733,6 +800,9 @@ class SongMetadata:
         audio_features = None
         semantic_features = None
         librarian_info = None
+
+        # Accept both legacy and canonical IDs
+        song_id = data.get("song_id") or data.get("deezer_id") or ""
         
         if data.get("audio_features"):
             af = data["audio_features"]
@@ -747,13 +817,37 @@ class SongMetadata:
                 mfcc_coefficients=af.get("mfcc_coefficients"),
                 zero_crossing_rate=af.get("zero_crossing_rate")
             )
+
+        # Legacy physics payload
+        if audio_features is None and data.get("physics"):
+            ph = data["physics"]
+            audio_features = PhysicsLayer(
+                computed_bpm=ph.get("computed_bpm"),
+                computed_key=ph.get("computed_key"),
+                computed_loudness=ph.get("computed_loudness"),
+                timbre_vector=ph.get("timbre_vector"),
+            )
         
         if data.get("semantic_features"):
             sf = data["semantic_features"]
+
+            embedding = sf.get("embedding_vector")
+            if embedding is None:
+                embedding = sf.get("embedding", [])
+
+            instrument_tags = sf.get("instrument_tags", {})
+            sound_tags = sf.get("sound_tags", {})
+
+            # Be tolerant of older list-style tags.
+            if isinstance(instrument_tags, list):
+                instrument_tags = {str(t): 1.0 for t in instrument_tags}
+            if isinstance(sound_tags, list):
+                sound_tags = {str(t): 1.0 for t in sound_tags}
+
             semantic_features = SemanticsLayer(
-                embedding=sf.get("embedding", []),
-                instrument_tags=sf.get("instrument_tags", []),
-                sound_tags=sf.get("sound_tags", []),
+                embedding_vector=list(embedding or []),
+                instrument_tags=dict(instrument_tags or {}),
+                sound_tags=dict(sound_tags or {}),
                 predicted_genres=sf.get("predicted_genres"),
                 quality_score=sf.get("quality_score")
             )
@@ -775,7 +869,8 @@ class SongMetadata:
             )
         
         return cls(
-            song_id=data.get("song_id", ""),
+            song_id=song_id,
+            deezer_id=data.get("deezer_id", song_id),
             title=data.get("title", ""),
             artist=data.get("artist", ""),
             album=data.get("album"),
@@ -783,6 +878,7 @@ class SongMetadata:
             preview_url=data.get("preview_url"),
             isrc=data.get("isrc"),
             audio_features=audio_features,
+            physics=audio_features,
             semantic_features=semantic_features,
             librarian_info=librarian_info,
             metadata_version=data.get("metadata_version", CACHE_VERSION),

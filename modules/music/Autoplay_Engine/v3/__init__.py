@@ -874,3 +874,40 @@ def get_lastfm_autoplay_v3(bot=None) -> LastFMAutoplayV3:
     if _lastfm_autoplay_v3 is None:
         _lastfm_autoplay_v3 = LastFMAutoplayV3(bot)
     return _lastfm_autoplay_v3
+
+
+async def shutdown_all_v3_singletons() -> None:
+    """
+    Shutdown all global V3 singleton instances.
+    
+    Call this during bot shutdown or test teardown to properly
+    release resources (aiohttp sessions, file handles, etc).
+    """
+    global _v3_engine, _lastfm_autoplay_v3
+    
+    if _lastfm_autoplay_v3:
+        await _lastfm_autoplay_v3.shutdown()
+        _lastfm_autoplay_v3 = None
+    
+    if _v3_engine:
+        await _v3_engine.shutdown()
+        _v3_engine = None
+    
+    # Shutdown component singletons
+    from .cache_manager import _cache_manager
+    from .mappings import _mappings_manager
+    from .song_analyzer import _song_analyzer
+    from .gemini_manager import _gemini_manager
+    from .daydreamer import _daydreamer
+    
+    if _cache_manager:
+        await _cache_manager.shutdown()
+    if _mappings_manager:
+        await _mappings_manager.shutdown()
+    if _song_analyzer:
+        await _song_analyzer.shutdown()
+    if _gemini_manager:
+        await _gemini_manager.shutdown()
+    if _daydreamer:
+        await _daydreamer.shutdown()
+

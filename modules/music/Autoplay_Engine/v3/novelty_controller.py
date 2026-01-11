@@ -218,9 +218,8 @@ class NoveltyController:
                 metrics.same_genre_streak = 1
             metrics.last_genre = primary_genre
     
+    # Placeholder event handler (not actively used but EventBus compatible)
     async def _on_SONG_PLAYED(self, payload: EventPayload) -> None:
-        """Handle track played event from event bus."""
-        # This is handled externally via record_played
         pass
     
     def get_nudges(

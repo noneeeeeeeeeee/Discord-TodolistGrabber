@@ -4,7 +4,7 @@ This module provides common functions used by both slash commands and player but
 """
 
 import discord
-from typing import Union, Optional, Dict, Any
+from typing import Optional, Dict, Any
 import logging
 
 LOG = logging.getLogger(__name__)

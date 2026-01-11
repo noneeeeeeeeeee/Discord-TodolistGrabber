@@ -179,7 +179,6 @@ class MusicPlayer(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.voteskip: Dict[int, set] = defaultdict(set)
         self.repeat_mode: Dict[int, str] = {}
         self._idle_tasks: Dict[int, asyncio.Task] = {}
         self.connection_cooldowns: Dict[int, float] = {}
@@ -824,25 +823,6 @@ class MusicPlayer(commands.Cog):
     async def _before_bootstrap(self):
         await self.bot.wait_until_ready()
 
-        # Clear all guild history files on startup for fresh sessions
-        if self._lastfm_autoplay:
-            try:
-                cache_dir = Path("cache/music")
-                if cache_dir.exists():
-                    deleted_count = 0
-                    for history_file in cache_dir.glob("*_history.json"):
-                        try:
-                            history_file.unlink()
-                            deleted_count += 1
-                        except Exception as e:
-                            LOG.warning(f"Failed to delete {history_file}: {e}")
-                    if deleted_count > 0:
-                        LOG.info(
-                            f"🗑️ [Last.fm] Cleared {deleted_count} guild history files on startup"
-                        )
-            except Exception as e:
-                LOG.warning(f"Failed to clear guild histories on startup: {e}")
-
     async def _try_connect_node(
         self, retry_delay: float = 1.0, attempts: int = 3
     ) -> bool:
@@ -1034,24 +1014,21 @@ class MusicPlayer(commands.Cog):
         )
         await self._announce_now_playing(player, track)
 
+    # Event listeners for unsupported Pomice events (no-op to avoid errors)
     @commands.Cog.listener()
     async def on_pomice_chapters_loaded(self, *args, **kwargs):
-        """Suppress Pomice chapter events if not supported."""
         pass
 
     @commands.Cog.listener()
     async def on_pomice_chapter_started(self, *args, **kwargs):
-        """Suppress Pomice chapter events if not supported."""
         pass
 
     @commands.Cog.listener()
     async def on_pomice_segments_loaded(self, *args, **kwargs):
-        """Suppress SponsorBlock segment events not supported by Pomice."""
         pass
 
     @commands.Cog.listener()
     async def on_pomice_segment_skipped(self, *args, **kwargs):
-        """Suppress SponsorBlock segment events not supported by Pomice."""
         pass
 
     @commands.Cog.listener()
@@ -1086,17 +1063,7 @@ class MusicPlayer(commands.Cog):
             reason,
         )
 
-        # Debug: Log track end details
-        gid = player.guild.id
-        queue_size = len(player.queue._queue) if hasattr(player.queue, "_queue") else 0
-        print(
-            f"[TRACK_END] Guild {gid}, reason='{reason}' (type={type(reason).__name__}, repr={repr(reason)}), queue_size={queue_size}, repeat_mode={self.repeat_mode.get(gid, 'off')}"
-        )
-
         pending_feedback = self._pending_feedback.pop(player.guild.id, None)
-        print(
-            f"[TRACK_END] Guild {gid}: pending_feedback exists = {pending_feedback is not None}, value = {pending_feedback}"
-        )
 
         await self._record_playback_feedback_for_current(
             player,
@@ -1118,9 +1085,10 @@ class MusicPlayer(commands.Cog):
         # Track repeat: replay the same track immediately
         if mode == "track" and last:
             LOG.info(f"[Repeat] Repeating track in guild {gid}")
-            self.voteskip[gid].clear()
+            self.clear_votes_for_guild(gid)
             self._playing_flags[gid] = True
             try:
+                self._initialize_playback_state(gid, last, entry)
                 await player.play(last)
             except Exception:
                 LOG.debug(
@@ -1203,7 +1171,6 @@ class MusicPlayer(commands.Cog):
                     self._playing_flags[guild_id] = False
                     self._current_entries.pop(guild_id, None)
                     self.queues[guild_id].clear()
-                    self.voteskip.pop(guild_id, None)
                     self.repeat_mode.pop(guild_id, None)
                     self.shuffle_flags.pop(guild_id, None)
                     self.connection_cooldowns.pop(guild_id, None)
@@ -1347,20 +1314,24 @@ class MusicPlayer(commands.Cog):
             return result
 
     async def _play_next(self, player: pomice.Player):
-        print(
-            f"[PLAY_NEXT] Called for guild {player.guild.id}, queue_empty={player.queue.is_empty}"
+        LOG.debug(
+            "[PLAY_NEXT] Called for guild %s, queue_empty=%s",
+            player.guild.id,
+            getattr(player.queue, "is_empty", True),
         )
 
         if player.queue.is_empty:
-            print(
-                f"[PLAY_NEXT] Queue is empty for guild {player.guild.id}, scheduling idle disconnect"
+            LOG.debug(
+                "[PLAY_NEXT] Queue empty for guild %s; scheduling idle disconnect",
+                player.guild.id,
             )
             await self._schedule_idle_disconnect(player)
             return
         try:
             track: pomice.Track = player.queue.get()
-            print(
-                f"[PLAY_NEXT] Got track from queue: {getattr(track, 'title', 'Unknown')}"
+            LOG.debug(
+                "[PLAY_NEXT] Dequeued track: %s",
+                getattr(track, "title", "Unknown"),
             )
 
             meta = self.queues[player.guild.id]
@@ -1373,16 +1344,13 @@ class MusicPlayer(commands.Cog):
             entry["identifier"] = getattr(track, "identifier", None)
             entry["track"] = track
             self._current_entries[player.guild.id] = entry
-            self.voteskip[player.guild.id].clear()
+            self.clear_votes_for_guild(player.guild.id)
             self._playing_flags[player.guild.id] = True
 
-            print(f"[PLAY_NEXT] Starting playback: {entry['title']}")
+            LOG.debug("[PLAY_NEXT] Starting playback: %s", entry.get("title"))
             await player.play(track)
             await self._cancel_idle(player.guild.id)
         except Exception as e:
-            print(
-                f"[PLAY_NEXT] ERROR: Failed to start track for guild {player.guild.id}: {e}"
-            )
             LOG.warning("Failed to start track: %s", e)
             self._playing_flags[player.guild.id] = False
             await self._advance_or_idle(player)
@@ -1430,34 +1398,35 @@ class MusicPlayer(commands.Cog):
         self, player: Optional[Any], guild_id: int
     ) -> Optional[float]:
         state = self._playback_state.get(guild_id)
-        print(f"[ESTIMATE_RATIO] Guild {guild_id}: state exists = {state is not None}")
+        LOG.debug("[ESTIMATE_RATIO] Guild %s: state exists=%s", guild_id, state is not None)
 
         if state is None:
             entry = self._current_entries.get(guild_id, {})
             track = entry.get("track") if isinstance(entry, dict) else None
             self._initialize_playback_state(guild_id, track, entry)
             state = self._playback_state.get(guild_id)
-            print(f"[ESTIMATE_RATIO] Guild {guild_id}: Initialized state = {state}")
+            LOG.debug("[ESTIMATE_RATIO] Guild %s: initialized state=%s", guild_id, bool(state))
         if not state:
-            print(f"[ESTIMATE_RATIO] Guild {guild_id}: No state, returning None")
+            LOG.debug("[ESTIMATE_RATIO] Guild %s: no state; returning None", guild_id)
             return None
 
         if isinstance(player, pomice.Player):
             self._refresh_player_position(player, guild_id)
 
         length_ms = state.get("length_ms")
-        print(f"[ESTIMATE_RATIO] Guild {guild_id}: length_ms = {length_ms}")
+        LOG.debug("[ESTIMATE_RATIO] Guild %s: length_ms=%s", guild_id, length_ms)
 
         if not length_ms or length_ms <= 0:
-            print(
-                f"[ESTIMATE_RATIO] Guild {guild_id}: Invalid length_ms, returning None"
-            )
+            LOG.debug("[ESTIMATE_RATIO] Guild %s: invalid length_ms; returning None", guild_id)
             return None
 
         position_ms = max(0.0, float(state.get("last_known_position_ms", 0)))
         timestamp = state.get("position_timestamp")
-        print(
-            f"[ESTIMATE_RATIO] Guild {guild_id}: position_ms = {position_ms}, timestamp = {timestamp}"
+        LOG.debug(
+            "[ESTIMATE_RATIO] Guild %s: position_ms=%.1f timestamp=%s",
+            guild_id,
+            position_ms,
+            timestamp,
         )
 
         if timestamp is not None:
@@ -1465,12 +1434,15 @@ class MusicPlayer(commands.Cog):
             position_ms = min(position_ms + elapsed_ms, float(length_ms))
             state["last_known_position_ms"] = int(position_ms)
             state["position_timestamp"] = time.time()
-            print(
-                f"[ESTIMATE_RATIO] Guild {guild_id}: After elapsed calc - position_ms = {position_ms}, elapsed_ms = {elapsed_ms}"
+            LOG.debug(
+                "[ESTIMATE_RATIO] Guild %s: elapsed_ms=%.1f position_ms=%.1f",
+                guild_id,
+                elapsed_ms,
+                position_ms,
             )
 
         ratio = position_ms / float(length_ms)
-        print(f"[ESTIMATE_RATIO] Guild {guild_id}: FINAL ratio = {ratio}")
+        LOG.debug("[ESTIMATE_RATIO] Guild %s: final ratio=%.4f", guild_id, ratio)
         return max(0.0, min(1.0, ratio))
 
     def note_seek(self, guild_id: int, position_ms: int) -> None:
@@ -1563,14 +1535,14 @@ class MusicPlayer(commands.Cog):
         ratio = None
         if pending:
             ratio = pending.get("ratio")
-            print(f"[FEEDBACK_DEBUG] Guild {guild_id}: Got ratio from pending: {ratio}")
+            LOG.debug("[FEEDBACK_DEBUG] Guild %s: ratio from pending=%s", guild_id, ratio)
         if ratio is None:
             state = self._playback_state.get(guild_id)
             if state and state.get("recorded"):
-                print(f"[FEEDBACK_DEBUG] Guild {guild_id}: Already recorded, skipping")
+                LOG.debug("[FEEDBACK_DEBUG] Guild %s: already recorded; skipping", guild_id)
                 return
             ratio = self._estimate_progress_ratio(player, guild_id)
-            print(f"[FEEDBACK_DEBUG] Guild {guild_id}: Estimated ratio: {ratio}")
+            LOG.debug("[FEEDBACK_DEBUG] Guild %s: estimated ratio=%s", guild_id, ratio)
             state = self._playback_state.get(guild_id)
         if ratio is None:
             LOG.debug(
@@ -1578,41 +1550,50 @@ class MusicPlayer(commands.Cog):
                 guild_id,
             )
             return
-
-        print(
-            f"[FEEDBACK_DEBUG] Guild {guild_id}: BEFORE reason check - reason='{reason}', ratio={ratio}, pending={pending is not None}"
+        LOG.debug(
+            "[FEEDBACK_DEBUG] Guild %s: before reason check reason=%r ratio=%.4f pending=%s",
+            guild_id,
+            reason,
+            float(ratio),
+            bool(pending),
         )
 
         # Check if track finished naturally (Lavalink sends "finished" in lowercase)
         # However, some Pomice/Lavalink versions send empty string for all end events
         if reason and reason.lower() in ("finished", "finish"):
-            print(
-                f"[FEEDBACK_DEBUG] Guild {guild_id}: Reason is '{reason}', setting ratio to 1.0"
+            LOG.debug(
+                "[FEEDBACK_DEBUG] Guild %s: finish reason=%r; forcing ratio=1.0",
+                guild_id,
+                reason,
             )
             ratio = 1.0
         elif not reason or reason.strip() == "":
             # Empty reason - need to infer from context
             # If no pending feedback, ALWAYS assume natural finish (autoplay doesn't skip without user action)
             if pending:
-                print(
-                    f"[FEEDBACK_DEBUG] Guild {guild_id}: Empty reason WITH pending feedback (manual skip), keeping ratio={ratio:.3f}"
+                LOG.debug(
+                    "[FEEDBACK_DEBUG] Guild %s: empty reason with pending; keeping ratio=%.4f",
+                    guild_id,
+                    float(ratio),
                 )
             else:
                 # No pending feedback = no manual skip = natural finish
                 # Position tracking often fails (ratio=0.0), so we can't rely on it
-                print(
-                    f"[FEEDBACK_DEBUG] Guild {guild_id}: Empty reason, NO pending feedback (natural finish), setting ratio to 1.0 (was {ratio:.3f})"
+                LOG.debug(
+                    "[FEEDBACK_DEBUG] Guild %s: empty reason without pending; forcing ratio=1.0 (was %.4f)",
+                    guild_id,
+                    float(ratio),
                 )
                 ratio = 1.0
         else:
-            print(
-                f"[FEEDBACK_DEBUG] Guild {guild_id}: Reason is '{reason}', NOT a finish reason"
+            LOG.debug(
+                "[FEEDBACK_DEBUG] Guild %s: non-finish reason=%r",
+                guild_id,
+                reason,
             )
 
         ratio = max(0.0, min(1.0, float(ratio)))
-        print(
-            f"[FEEDBACK_DEBUG] Guild {guild_id}: AFTER reason check - final ratio={ratio}"
-        )
+        LOG.debug("[FEEDBACK_DEBUG] Guild %s: final ratio=%.4f", guild_id, ratio)
         primary_bias = bool(pending.get("primary_listener_bias")) if pending else False
 
         duration_ms = None
@@ -1648,14 +1629,19 @@ class MusicPlayer(commands.Cog):
 
     async def _advance_or_idle(self, player: pomice.Player):
         queue_empty = player.queue.is_empty
-        print(f"[ADVANCE_OR_IDLE] Guild {player.guild.id}, queue_empty={queue_empty}")
+        LOG.debug(
+            "[ADVANCE_OR_IDLE] Guild %s, queue_empty=%s",
+            player.guild.id,
+            queue_empty,
+        )
 
         if not queue_empty:
-            print(f"[ADVANCE_OR_IDLE] Calling _play_next for guild {player.guild.id}")
+            LOG.debug("[ADVANCE_OR_IDLE] Calling _play_next for guild %s", player.guild.id)
             await self._play_next(player)
         else:
-            print(
-                f"[ADVANCE_OR_IDLE] Queue empty, attempting autoplay for guild {player.guild.id}"
+            LOG.debug(
+                "[ADVANCE_OR_IDLE] Queue empty; attempting autoplay for guild %s",
+                player.guild.id,
             )
             autoplayed = await self._maybe_autoplay(player)
             if not autoplayed:
@@ -2507,29 +2493,6 @@ lavalink:
 
         return recs
 
-    # votes
-    def votes_needed(self, guild: discord.Guild) -> int:
-        try:
-            members = [m for m in guild.voice_client.channel.members if not m.bot]
-        except Exception:
-            return 1
-
-        listeners = len(members)
-        if listeners <= 1:
-            return 1
-
-        needed = math.ceil(listeners * (DEFAULT_VOTESKIP_PERCENT / 100.0))
-        return max(1, needed)
-
-    async def handle_vote_skip(
-        self, guild: discord.Guild, user_id: int
-    ) -> tuple[bool, int, int]:
-        s = self.voteskip[guild.id]
-        if user_id in s:
-            return False, len(s), self.votes_needed(guild)
-        s.add(user_id)
-        return True, len(s), self.votes_needed(guild)
-
     async def _check_dj(self, user: discord.Member, guild: discord.Guild) -> bool:
         """
         Check if user has DJ role or admin permissions.
@@ -2729,15 +2692,6 @@ lavalink:
         ]
         for key in keys_to_remove:
             self._active_votes.pop(key, None)
-
-    async def _delete_now_playing_message(self, guild_id: int) -> None:
-        """Delete the now playing message for a guild."""
-        message = self._now_playing_messages.pop(guild_id, None)
-        if message:
-            try:
-                await message.delete()
-            except Exception:
-                pass
 
 
 async def setup(bot):

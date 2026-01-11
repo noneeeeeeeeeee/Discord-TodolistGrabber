@@ -437,14 +437,11 @@ class ContextAnalyzer:
         else:
             pref.play_count += 1
     
+    # Event handlers (registered with EventBus but tracking done via record_playback)
     async def _on_SONG_PLAYED(self, payload: EventPayload) -> None:
-        """Handle track played event."""
-        # Events handled in record_playback, this is for external events
         pass
     
     async def _on_SONG_SKIPPED(self, payload: EventPayload) -> None:
-        """Handle track skipped event."""
-        # Events handled in record_playback, this is for external events
         pass
     
     def get_top_preferences(

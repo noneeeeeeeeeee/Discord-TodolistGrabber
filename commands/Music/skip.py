@@ -29,6 +29,8 @@ class SkipCommands(commands.Cog):
         aliases=["s"],
     )
     async def skip(self, ctx: commands.Context, index: int = None):
+        from modules.music.player_actions import handle_skip_action
+
         player = self.bot.get_cog("MusicPlayer")
         if not player:
             await ctx.send(":x: Player backend missing.")
@@ -44,20 +46,43 @@ class SkipCommands(commands.Cog):
                 await ctx.send(":x: DJ/Admin required to skip to specific position.")
                 return
 
+            vc = ctx.guild.voice_client
+            pomice_player = vc if isinstance(vc, __import__("pomice").Player) else None
+            if not pomice_player or not hasattr(pomice_player, "queue"):
+                await ctx.send(":x: Player is not ready.")
+                return
+
             q = player.queues.get(ctx.guild.id)
-            if not q:
+            if not q or pomice_player.queue.is_empty:
                 await ctx.send(":x: Queue is empty.")
                 return
 
-            if index < 1 or index > len(q):
-                await ctx.send(f":x: Invalid index. Queue has {len(q)} tracks.")
+            if index < 1:
+                await ctx.send(":x: Invalid index.")
                 return
 
-            # Skip to index by removing all tracks before it
+            # Remove tracks before the requested index from BOTH queues to keep them in sync.
+            removed = 0
             for _ in range(index - 1):
-                q.popleft()
+                if pomice_player.queue.is_empty:
+                    break
+                try:
+                    item = pomice_player.queue.get()
+                    if __import__("asyncio").iscoroutine(item):
+                        await item
+                except Exception:
+                    break
+                if q:
+                    try:
+                        q.popleft()
+                    except Exception:
+                        pass
+                removed += 1
 
-            vc = ctx.guild.voice_client
+            if removed == 0:
+                await ctx.send(":x: Nothing to remove before that position.")
+                return
+
             if vc and is_voice_playing(vc):
                 await player.note_skip(
                     vc, ctx.guild.id, ctx.author.id, primary_listener_bias=True
@@ -68,78 +93,26 @@ class SkipCommands(commands.Cog):
             return
 
         # Regular skip (no index)
+        vc = ctx.guild.voice_client
+        if vc and is_voice_playing(vc):
+            result = await handle_skip_action(
+                player, ctx.guild, ctx.author, vc, ctx.channel
+            )
+            if result.get("embed"):
+                await ctx.send(result.get("message", ""), embed=result["embed"])
+            else:
+                await ctx.send(result.get("message", ""))
+            return
+
+        # Not currently playing: allow DJs to remove the next queued track.
         if self._is_dj(ctx):
-            vc = ctx.guild.voice_client
-            if vc and is_voice_playing(vc):
-                await player.note_skip(
-                    vc, ctx.guild.id, ctx.author.id, primary_listener_bias=True
-                )
-                await vc.stop()
-                await ctx.send(
-                    f":fast_forward: **{ctx.author.display_name}** skipped the track"
-                )
-                return
             q = player.queues.get(ctx.guild.id)
             if q:
                 q.popleft()
                 await ctx.send(":boom: Removed next queued track.")
                 return
-            await ctx.send("Nothing to skip.")
-            return
 
-        # voteskip
-        added, cur, needed = await player.handle_vote_skip(ctx.guild, ctx.author.id)
-        if not added:
-            await ctx.send("You already voted to skip this track.")
-            return
-
-        remaining = max(0, needed - cur)
-        if cur >= needed:
-            vc = ctx.guild.voice_client
-            player.voteskip[ctx.guild.id].clear()
-
-            # Log queue state before skip
-            pomice_player = vc if isinstance(vc, __import__("pomice").Player) else None
-            queue_size = 0
-            if pomice_player and hasattr(pomice_player, "queue"):
-                queue_size = (
-                    len(pomice_player.queue._queue)
-                    if hasattr(pomice_player.queue, "_queue")
-                    else 0
-                )
-
-            print(
-                f"[VOTESKIP] Vote passed for guild {ctx.guild.id}. Queue size: {queue_size}"
-            )
-
-            if vc and is_voice_playing(vc):
-                await player.note_skip(
-                    vc, ctx.guild.id, ctx.author.id, primary_listener_bias=False
-                )
-                print(f"[VOTESKIP] Calling vc.stop() for guild {ctx.guild.id}")
-                await vc.stop()
-                print(f"[VOTESKIP] vc.stop() completed for guild {ctx.guild.id}")
-            else:
-                print(
-                    f"[VOTESKIP] WARNING: vc is None or not playing (guild={ctx.guild.id}, vc={vc}, playing={is_voice_playing(vc) if vc else False})"
-                )
-
-            await ctx.send(
-                embed=discord.Embed(
-                    title="Skip Vote",
-                    description=f":white_check_mark: **Threshold reached** – {ctx.author.display_name} skipped the track!",
-                    color=discord.Color.green(),
-                )
-            )
-        else:
-            await ctx.send(
-                f"**{ctx.author.display_name}** wants to skip the current track",
-                embed=discord.Embed(
-                    title="Skip Vote",
-                    description=f"**Votes:** {cur}/{needed}\n**Remaining:** {remaining} more vote(s) needed",
-                    color=discord.Color.orange(),
-                ),
-            )
+        await ctx.send("Nothing to skip.")
 
 
 async def setup(bot):

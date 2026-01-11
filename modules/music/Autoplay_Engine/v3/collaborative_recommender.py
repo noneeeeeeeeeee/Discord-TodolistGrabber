@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import time
+import inspect
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -446,10 +447,15 @@ class CollaborativeRecommender:
         await self.transition_matrix.load()
         await self._load_user_profiles()
         
-        # Subscribe to events (subscribe is synchronous)
-        self.event_bus.subscribe(EventType.SONG_PLAYED, self._on_song_played)
-        self.event_bus.subscribe(EventType.SONG_SKIPPED, self._on_song_skipped)
-        self.event_bus.subscribe(EventType.USER_FEEDBACK, self._on_user_feedback)
+        # Subscribe to events (some test doubles/mocks may be async)
+        for event_type, handler in (
+            (EventType.SONG_PLAYED, self._on_song_played),
+            (EventType.SONG_SKIPPED, self._on_song_skipped),
+            (EventType.USER_FEEDBACK, self._on_user_feedback),
+        ):
+            result = self.event_bus.subscribe(event_type, handler)
+            if inspect.isawaitable(result):
+                await result
         
         self._initialized = True
         logger.info("Collaborative recommender initialized")
@@ -459,9 +465,14 @@ class CollaborativeRecommender:
         await self.transition_matrix.save()
         await self._save_user_profiles()
         
-        self.event_bus.unsubscribe(EventType.SONG_PLAYED, self._on_song_played)
-        self.event_bus.unsubscribe(EventType.SONG_SKIPPED, self._on_song_skipped)
-        self.event_bus.unsubscribe(EventType.USER_FEEDBACK, self._on_user_feedback)
+        for event_type, handler in (
+            (EventType.SONG_PLAYED, self._on_song_played),
+            (EventType.SONG_SKIPPED, self._on_song_skipped),
+            (EventType.USER_FEEDBACK, self._on_user_feedback),
+        ):
+            result = self.event_bus.unsubscribe(event_type, handler)
+            if inspect.isawaitable(result):
+                await result
         
         self._initialized = False
     
