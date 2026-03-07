@@ -118,10 +118,6 @@ class QueuePaginationView(View):
         repeat_status = "On" if repeat_mode == "track" else "Off"
         embed.add_field(name="🔁 Repeat", value=repeat_status, inline=True)
 
-        autoplay_enabled = self.player.is_session_autoplay_enabled(self.ctx.guild.id)
-        autoplay_status = "Enabled" if autoplay_enabled else "Disabled (session)"
-        embed.add_field(name="🤖 AutoPlay", value=autoplay_status, inline=True)
-
         # Add empty field for alignment
         embed.add_field(name="​", value="​", inline=True)
 
@@ -304,10 +300,6 @@ class QueueCommands(commands.Cog):
         repeat_status = "On" if repeat_mode == "track" else "Off"
         embed.add_field(name="🔁 Repeat", value=repeat_status, inline=True)
 
-        autoplay_enabled = player.is_session_autoplay_enabled(ctx.guild.id)
-        autoplay_status = "Enabled" if autoplay_enabled else "Disabled (session)"
-        embed.add_field(name="🤖 AutoPlay", value=autoplay_status, inline=True)
-
         embed.add_field(name="​", value="​", inline=True)
 
         if upcoming and total_pages > 1:
@@ -350,9 +342,9 @@ class QueueCommands(commands.Cog):
         if requester:
             who = f"<@{requester}>"
         else:
-            who = "AutoPlay"
+            who = "Bot"
 
-        marker = ":sparkles:" if entry.get("autoplay") else "👤"
+        marker = "👤"
 
         if is_current:
             return f"**{title}**{duration_str}\nRequested by: {who}"

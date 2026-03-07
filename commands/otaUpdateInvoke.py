@@ -7,8 +7,21 @@ import re
 
 
 class Update(commands.Cog):
+    NEW_REPOSITORY_URL = "https://github.com/AGenericMultiPurposeBot/Main"
+
     def __init__(self, bot):
         self.bot = bot
+
+    def _decorate_update_embed(self, embed: discord.Embed) -> discord.Embed:
+        embed.add_field(
+            name="Repository Migration",
+            value=(
+                "This is the final update path for this archived repository. "
+                f"New downloads and migration target: {self.NEW_REPOSITORY_URL}"
+            ),
+            inline=False,
+        )
+        return embed
 
     # --- version helpers ---
     @staticmethod
@@ -251,7 +264,10 @@ class Update(commands.Cog):
             + "\n\n... (changelog truncated, see full release notes on GitHub)"
         )
 
-    @commands.hybrid_command(name="checkupdates", description="Check for updates.")
+    @commands.hybrid_command(
+        name="checkupdates",
+        description="Check migration updates from the new repository.",
+    )
     @discord.app_commands.describe(
         channel="Update channel to check: 'stable' (default) or 'prerelease'"
     )
@@ -366,6 +382,7 @@ class Update(commands.Cog):
                         enable_switch=stable_version is not None,
                         switch_label="Switch to Stable",
                     )
+                    self._decorate_update_embed(embed)
                     view.message = await ctx.send(embed=embed, view=view)
                     await view.wait()
 
@@ -407,6 +424,7 @@ class Update(commands.Cog):
                         enable_switch=stable_version and not on_latest_stable,
                         switch_label="Switch to Stable" if stable_version else "Switch",
                     )
+                    self._decorate_update_embed(embed)
                     view.message = await ctx.send(embed=embed, view=view)
                     await view.wait()
 
@@ -448,6 +466,7 @@ class Update(commands.Cog):
                         enable_switch=stable_version is not None,
                         switch_label="Switch to Stable",
                     )
+                    self._decorate_update_embed(embed)
                     view.message = await ctx.send(embed=embed, view=view)
                     await view.wait()
 
@@ -493,6 +512,7 @@ class Update(commands.Cog):
                         enable_switch=prerelease_makes_sense,
                         switch_label="Switch to Prerelease",
                     )
+                    self._decorate_update_embed(embed)
                     view.message = await ctx.send(embed=embed, view=view)
                     await view.wait()
 
@@ -541,6 +561,7 @@ class Update(commands.Cog):
                             "Switch to Prerelease" if prerelease_version else "Switch"
                         ),
                     )
+                    self._decorate_update_embed(embed)
                     view.message = await ctx.send(embed=embed, view=view)
                     await view.wait()
 
@@ -584,6 +605,7 @@ class Update(commands.Cog):
                         enable_switch=prerelease_makes_sense,
                         switch_label="Switch to Prerelease",
                     )
+                    self._decorate_update_embed(embed)
                     view.message = await ctx.send(embed=embed, view=view)
                     await view.wait()
 
@@ -603,6 +625,7 @@ class Update(commands.Cog):
                 description=f"Error: {e}",
                 color=discord.Color.red(),
             )
+            self._decorate_update_embed(embed)
             await ctx.send(embed=embed)
             print(f"Error in checkupdates: {e}")
 

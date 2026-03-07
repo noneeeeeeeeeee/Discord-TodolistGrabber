@@ -436,34 +436,6 @@ async def handle_seek_action(
                 "ephemeral": True,
             }
 
-
-async def handle_autoplay_action(
-    player,
-    guild: discord.Guild,
-    user: discord.Member,
-    enable: bool,
-    announce_channel: Optional[discord.TextChannel] = None,
-) -> Dict[str, Any]:
-    """
-    Handle autoplay toggle (no voting - instant action).
-
-    Args:
-        enable: True to enable, False to disable
-
-    Returns dict with:
-    - success: bool
-    - message: str (announcement message)
-    - ephemeral: bool (whether message should be ephemeral)
-    """
-    player.set_session_autoplay(guild.id, enable)
-    status = "enabled" if enable else "disabled"
-    return {
-        "success": True,
-        "message": f"🤖 **{user.display_name}** {status} AutoPlay",
-        "ephemeral": False,
-    }
-
-
 # Voice channel validation helpers
 def validate_user_in_voice(user: discord.Member) -> Optional[str]:
     """Check if user is in a voice channel. Returns error message if not, None if valid."""

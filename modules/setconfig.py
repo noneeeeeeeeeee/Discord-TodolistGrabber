@@ -177,13 +177,7 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "min": 30,
             "max": 600,
             "access": 0,
-            "description": "Timeout in seconds for non-skip votes (pause, resume, autoplay). Skip/repeat votes last until track changes.",
-        },
-        "AutoPlay": {
-            "type": "bool",
-            "default": False,
-            "access": 0,
-            "description": "Default AutoPlay state for new sessions. Users can toggle per session, but this sets the default. This is a beta feature, expect bugs.",
+            "description": "Timeout in seconds for non-skip votes (pause, resume). Skip/repeat votes last until track changes.",
         },
         "SponsorBlockCategories": {
             "type": "list[str]",

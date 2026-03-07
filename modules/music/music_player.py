@@ -26,19 +26,6 @@ from modules.music.lavalink.manager import (
     DEFAULT_SPONSORBLOCK_PLUGIN_VERSION,
 )
 
-# Import Last.fm autoplay
-try:
-    from modules.music.Autoplay_Engine.config import (
-        get_autoplay_engine,
-        get_autoplay_config,
-    )
-
-    AUTOPLAY_ENGINE_AVAILABLE = True
-except ImportError:
-    AUTOPLAY_ENGINE_AVAILABLE = False
-    get_autoplay_engine = None
-    get_autoplay_config = None
-
 # -- Pomice compatibility shims -------------------------------------------------
 try:  # pragma: no cover - defensive
     _base_event = getattr(pomice_events, "PomiceEvent", None)
@@ -113,13 +100,10 @@ SPONSORBLOCK_ALLOWED = {
 NON_SONG_SEGMENTS = {"intro", "outro", "preview", "filler", "music_offtopic"}
 
 # Feedback thresholds
-FINISH_THRESHOLD = (
-    0.9  # Progress ratio considered a full completion (same as lastfm_autoplay)
-)
+FINISH_THRESHOLD = 0.9
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
 
-DEFAULT_AUTOPLAY_MAX_RESULTS = 25
 DEFAULT_VOTESKIP_PERCENT = 60
 
 
@@ -193,103 +177,22 @@ class MusicPlayer(commands.Cog):
         self._enqueue_errors: Dict[int, str] = {}
         self._bootstrap_error: Optional[str] = None
         self._now_playing_messages: Dict[int, discord.Message] = {}
-        self._session_autoplay_disabled = defaultdict(bool)
         self._command_channels: Dict[int, discord.abc.Messageable] = {}
-        self._last_successful_autoplay_track: Dict[int, Dict[str, Any]] = {}
-        self._autoplay_session_started: Dict[int, bool] = {}
         self._playback_state: Dict[int, Dict[str, Any]] = {}
         self._pending_feedback: Dict[int, Dict[str, Any]] = {}
 
         # Vote tracking with metadata
         self._active_votes: Dict[str, Dict[str, Any]] = {}
 
-        # Initialize configurable autoplay engine
-        LOG.info("[AutoPlay] Attempting to initialize autoplay module...")
-        self._autoplay_engine = None
-        self._autoplay_config = None
-        self._autoplay_available = False
-        if AUTOPLAY_ENGINE_AVAILABLE and get_autoplay_engine and get_autoplay_config:
-            try:
-                self._autoplay_config = get_autoplay_config()
-                self._autoplay_engine = get_autoplay_engine(bot)
-                if self._autoplay_engine and self._autoplay_engine.is_available():
-                    LOG.info(
-                        "[AutoPlay] ✅ Autoplay engine V3 is READY and AVAILABLE!"
-                    )
-                    self._autoplay_available = True
-
-                    # Start background workers if supported
-                    if hasattr(self._autoplay_engine, "start"):
-                        try:
-                            self._autoplay_engine.start()
-                            LOG.info("[AutoPlay] Started background workers for V3")
-                        except Exception as e:
-                            LOG.error(f"[AutoPlay] Failed to start background workers: {e}")
-                else:
-                    LOG.warning(
-                        "[AutoPlay] Autoplay engine loaded but prerequisites not configured"
-                    )
-            except Exception as e:
-                LOG.error(f"[AutoPlay] ❌ Failed to initialize autoplay engine: {e}")
-                import traceback
-
-                traceback.print_exc()
-        else:
-            LOG.warning(
-                f"[AutoPlay] Autoplay module not available (AVAILABLE={AUTOPLAY_ENGINE_AVAILABLE})"
-            )
-
-        # Backwards compatibility for legacy code paths still referencing _lastfm_autoplay
-        self._lastfm_autoplay = self._autoplay_engine
-
         self._disconnect_messages = self._load_disconnect_messages()
         self._bootstrap_node.start()
 
     def supports_feedback_buttons(self) -> bool:
-        """Check if current autoplay version supports More/Less Like This buttons
-
-        Buttons are shown if:
-        - Config supports feedback (V2+)
-        - Engine instance exists (regardless of Last.fm/Gemini availability)
-
-        This allows feedback collection even when recommendations are unavailable.
-        """
-        if not self._autoplay_config:
-            return False
-        if not self._autoplay_config.supports_feedback_buttons():
-            return False
-        # Just check if engine exists, don't check is_available()
-        # (buttons can collect feedback even if recommendations fail)
-        return self._autoplay_engine is not None
-
-    def is_session_autoplay_enabled(self, guild_id: int) -> bool:
-        return not self._session_autoplay_disabled.get(guild_id, False)
-
-    def set_session_autoplay(self, guild_id: int, enabled: bool) -> None:
-        if enabled:
-            self._session_autoplay_disabled.pop(guild_id, None)
-        else:
-            self._session_autoplay_disabled[guild_id] = True
-            # Reset autoplay session when manually disabled
-            self._autoplay_session_started[guild_id] = False
+        """Interactive feedback buttons are disabled in the archive release."""
+        return False
 
     def reset_session_state(self, guild_id: int) -> None:
-        self._session_autoplay_disabled.pop(guild_id, None)
-        self._autoplay_session_started.pop(guild_id, None)
-
-        # Clear guild telemetry session when bot leaves VC
-        if (
-            hasattr(self, "_autoplay_engine")
-            and self._autoplay_engine
-            and hasattr(self._autoplay_engine, "clear_guild_session")
-        ):
-            try:
-                asyncio.create_task(self._autoplay_engine.clear_guild_session(guild_id))
-                LOG.debug("Scheduled telemetry session cleanup for guild %s", guild_id)
-            except Exception as exc:
-                LOG.debug(
-                    "Failed to clear telemetry session for guild %s: %s", guild_id, exc
-                )
+        return None
 
     def set_command_channel(
         self, guild_id: int, channel: discord.abc.Messageable
@@ -358,7 +261,6 @@ class MusicPlayer(commands.Cog):
             t.cancel()
         if self._local_node_managed:
             asyncio.create_task(shutdown_local_node())
-        # No cleanup needed for Last.fm autoplay
 
     def _set_enqueue_error(self, guild_id: int, message: str) -> None:
         if guild_id:
@@ -465,90 +367,6 @@ class MusicPlayer(commands.Cog):
         except Exception:
             LOG.debug(
                 "Failed to send disconnect message in guild %s", guild.id, exc_info=True
-            )
-        return False
-
-    async def _send_autoplay_no_recommendations_message(
-        self, guild: discord.Guild, track_title: str, track_author: str
-    ) -> bool:
-        """Send a message when autoplay couldn't find any recommendations."""
-        target = self._get_announcement_channel(guild)
-        if not target:
-            LOG.debug(f"No announcement channel found for guild {guild.id}")
-            return False
-
-        try:
-            message = f":x: **AutoPlay** couldn't find any tracks related to `{track_title}` by `{track_author}`"
-            await target.send(message)
-            LOG.info(
-                f"[AutoPlay] Sent 'no recommendations' message to guild {guild.id}"
-            )
-            return True
-        except Exception as e:
-            LOG.debug(
-                f"Failed to send autoplay message in guild {guild.id}: {e}",
-                exc_info=True,
-            )
-        return False
-
-    async def _send_autoplay_started_message(
-        self, guild: discord.Guild, track_title: str
-    ) -> bool:
-        """Send a message when autoplay starts playing a track."""
-        target = self._get_announcement_channel(guild)
-        if not target:
-            LOG.debug(f"No announcement channel found for guild {guild.id}")
-            return False
-
-        try:
-            message = f":sparkles: **AutoPlay** started playing: `{track_title}`"
-            await target.send(message)
-            LOG.info(f"[AutoPlay] Sent 'started playing' message to guild {guild.id}")
-            return True
-        except Exception as e:
-            LOG.debug(
-                f"Failed to send autoplay started message in guild {guild.id}: {e}",
-                exc_info=True,
-            )
-        return False
-
-    async def _send_autoplay_recommending_message(self, guild: discord.Guild) -> bool:
-        """Send a message when autoplay starts recommending tracks."""
-        target = self._get_announcement_channel(guild)
-        if not target:
-            LOG.debug(f"No announcement channel found for guild {guild.id}")
-            return False
-
-        try:
-            message = ":sparkles: **AutoPlay** (Beta) is now Recommending your next tracks. To stop it do `/autoplay state:Disable`"
-            await target.send(message)
-            LOG.info(f"[AutoPlay] Sent 'recommending' message to guild {guild.id}")
-            return True
-        except Exception as e:
-            LOG.debug(
-                f"Failed to send autoplay recommending message in guild {guild.id}: {e}",
-                exc_info=True,
-            )
-        return False
-
-    async def _send_autoplay_now_playing_message(
-        self, guild: discord.Guild, track_title: str
-    ) -> bool:
-        """Send a message for consecutive autoplay tracks."""
-        target = self._get_announcement_channel(guild)
-        if not target:
-            LOG.debug(f"No announcement channel found for guild {guild.id}")
-            return False
-
-        try:
-            message = f":sparkles: AutoPlaying (Beta): **{track_title}**"
-            await target.send(message)
-            LOG.info(f"[AutoPlay] Sent 'now playing' message to guild {guild.id}")
-            return True
-        except Exception as e:
-            LOG.debug(
-                f"Failed to send autoplay now playing message in guild {guild.id}: {e}",
-                exc_info=True,
             )
         return False
 
@@ -869,14 +687,8 @@ class MusicPlayer(commands.Cog):
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        """Clean up history when bot leaves voice channel"""
-        if member.id == self.bot.user.id and before.channel and not after.channel:
-            guild_id = before.channel.guild.id
-            if self._lastfm_autoplay:
-                self._lastfm_autoplay.clear_history(guild_id)
-                LOG.info(
-                    f"🗑️ [AutoPlay] Cleared Last.fm history for guild {guild_id} on disconnect"
-                )
+        """Listen for bot voice state transitions."""
+        return None
 
     @commands.Cog.listener()
     async def on_pomice_websocket_closed(
@@ -1217,90 +1029,6 @@ class MusicPlayer(commands.Cog):
                 player, timeout=idle_timeout, reason="idle"
             )
 
-    async def ensure_player_connected(
-        self, guild: discord.Guild, requester_id: int
-    ) -> EnsureConnectionResult:
-        # Check if node is available, if not attempt reconnection
-        if not self._node_ready.is_set():
-            LOG.warning("Node not ready, checking if reconnection needed...")
-            node_pool_cls = getattr(pomice, "NodePool", None)
-            if node_pool_cls:
-                existing_nodes = getattr(node_pool_cls, "_nodes", {})
-                if not existing_nodes:
-                    LOG.warning("No nodes found, triggering reconnection...")
-                    asyncio.create_task(self._attempt_reconnection())
-
-        # Wait for node with timeout to prevent hanging
-        try:
-            await asyncio.wait_for(self._node_ready.wait(), timeout=20.0)
-        except asyncio.TimeoutError:
-            LOG.error("Timeout waiting for node to be ready")
-            message = (
-                "Music service is currently reconnecting. Please try again in a moment."
-            )
-            result = EnsureConnectionResult(player=None)
-            self._set_enqueue_error(guild.id, message)
-            result.error = message
-            return result
-
-        result = EnsureConnectionResult(player=None)
-
-        now = time.time()
-        cool = self.connection_cooldowns.get(guild.id, 0)
-        if cool > now:
-            message = "Connection temporarily rate-limited. Please wait a moment and try again."
-            self._set_enqueue_error(guild.id, message)
-            result.error = message
-            return result
-
-        existing_vc = getattr(guild, "voice_client", None)
-        if (
-            not existing_vc or not is_voice_connected(existing_vc)
-        ) and self.current_active_instances() >= self.get_global_instance_limit():
-            message = (
-                "Maximum number of active music players reached."
-                " Try again after another guild stops playback."
-            )
-            self._set_enqueue_error(guild.id, message)
-            result.error = message
-            return result
-
-        member = guild.get_member(requester_id)
-        channel = getattr(getattr(member, "voice", None), "channel", None)
-        if channel is None:
-            message = "You need to join a voice channel before using music commands."
-            self._set_enqueue_error(guild.id, message)
-            result.error = message
-            return result
-
-        player = existing_vc if isinstance(existing_vc, pomice.Player) else None
-        if player and is_voice_connected(player):
-            result.player = player
-            result.joined_channel = getattr(player.channel, "name", None)
-            result.joined = False
-            return result
-
-        try:
-            player = await channel.connect(cls=pomice.Player)
-            if not hasattr(player, "queue"):
-                player.queue = pomice.Queue()
-            cfg = self._get_music_config(guild.id)
-
-            remember_volume = cfg.get("RememberLastVolume", False)
-            if remember_volume:
-                # Use saved volume from RememberLastVolumeBetweenSessions (0.0-2.0 range)
-                volume = float(cfg.get("RememberLastVolumeBetweenSessions", 1.0) or 1.0)
-            else:
-                # Default to 100 (1.0 in 0-2.0 range) when not persisting
-                volume = 1.0
-
-            try:
-                await player.set_volume(int(max(0.0, min(2.0, volume)) * 100))
-            except Exception:
-                pass
-            await self._apply_sponsorblock_settings(guild.id)
-            self._playing_flags[guild.id] = False
-            self.reset_session_state(guild.id)
             result.player = player
             result.joined_channel = getattr(channel, "name", None)
             result.joined = True
@@ -1512,120 +1240,7 @@ class MusicPlayer(commands.Cog):
         pending: Optional[Dict[str, Any]] = None,
         reason: Optional[str] = None,
     ) -> None:
-        if not self._lastfm_autoplay or not self._lastfm_autoplay.is_available():
-            return
-
-        entry = self._current_entries.get(guild_id) or {}
-        track = entry.get("track") if isinstance(entry, dict) else None
-        artist = entry.get("author") or getattr(track, "author", None)
-        title = entry.get("title") or getattr(track, "title", None)
-
-        if not artist or not title:
-            return
-
-        LOG.debug(
-            "[Feedback] Preparing feedback record (guild=%s, artist=%s, title=%s, reason=%s, pending=%s)",
-            guild_id,
-            artist,
-            title,
-            reason,
-            bool(pending),
-        )
-
-        ratio = None
-        if pending:
-            ratio = pending.get("ratio")
-            LOG.debug("[FEEDBACK_DEBUG] Guild %s: ratio from pending=%s", guild_id, ratio)
-        if ratio is None:
-            state = self._playback_state.get(guild_id)
-            if state and state.get("recorded"):
-                LOG.debug("[FEEDBACK_DEBUG] Guild %s: already recorded; skipping", guild_id)
-                return
-            ratio = self._estimate_progress_ratio(player, guild_id)
-            LOG.debug("[FEEDBACK_DEBUG] Guild %s: estimated ratio=%s", guild_id, ratio)
-            state = self._playback_state.get(guild_id)
-        if ratio is None:
-            LOG.debug(
-                "[Feedback] Skipping feedback record due to missing ratio (guild=%s)",
-                guild_id,
-            )
-            return
-        LOG.debug(
-            "[FEEDBACK_DEBUG] Guild %s: before reason check reason=%r ratio=%.4f pending=%s",
-            guild_id,
-            reason,
-            float(ratio),
-            bool(pending),
-        )
-
-        # Check if track finished naturally (Lavalink sends "finished" in lowercase)
-        # However, some Pomice/Lavalink versions send empty string for all end events
-        if reason and reason.lower() in ("finished", "finish"):
-            LOG.debug(
-                "[FEEDBACK_DEBUG] Guild %s: finish reason=%r; forcing ratio=1.0",
-                guild_id,
-                reason,
-            )
-            ratio = 1.0
-        elif not reason or reason.strip() == "":
-            # Empty reason - need to infer from context
-            # If no pending feedback, ALWAYS assume natural finish (autoplay doesn't skip without user action)
-            if pending:
-                LOG.debug(
-                    "[FEEDBACK_DEBUG] Guild %s: empty reason with pending; keeping ratio=%.4f",
-                    guild_id,
-                    float(ratio),
-                )
-            else:
-                # No pending feedback = no manual skip = natural finish
-                # Position tracking often fails (ratio=0.0), so we can't rely on it
-                LOG.debug(
-                    "[FEEDBACK_DEBUG] Guild %s: empty reason without pending; forcing ratio=1.0 (was %.4f)",
-                    guild_id,
-                    float(ratio),
-                )
-                ratio = 1.0
-        else:
-            LOG.debug(
-                "[FEEDBACK_DEBUG] Guild %s: non-finish reason=%r",
-                guild_id,
-                reason,
-            )
-
-        ratio = max(0.0, min(1.0, float(ratio)))
-        LOG.debug("[FEEDBACK_DEBUG] Guild %s: final ratio=%.4f", guild_id, ratio)
-        primary_bias = bool(pending.get("primary_listener_bias")) if pending else False
-
-        duration_ms = None
-        state = self._playback_state.get(guild_id)
-        if state:
-            duration_ms = state.get("length_ms")
-
-        try:
-            await self._lastfm_autoplay.record_playback_feedback(
-                guild_id,
-                artist,
-                title,
-                ratio,
-                duration_ms=duration_ms,
-                primary_listener_bias=primary_bias,
-            )
-            if state is not None:
-                state["recorded"] = True
-            LOG.debug(
-                "[Feedback] Recorded playback feedback (guild=%s, ratio=%.3f, bias=%s, reason=%s)",
-                guild_id,
-                ratio,
-                primary_bias,
-                reason,
-            )
-        except Exception:
-            LOG.debug(
-                "Failed to record playback feedback for %s - %s",
-                artist,
-                title,
-                exc_info=True,
-            )
+        return None
 
     async def _advance_or_idle(self, player: pomice.Player):
         queue_empty = player.queue.is_empty
@@ -1639,237 +1254,7 @@ class MusicPlayer(commands.Cog):
             LOG.debug("[ADVANCE_OR_IDLE] Calling _play_next for guild %s", player.guild.id)
             await self._play_next(player)
         else:
-            LOG.debug(
-                "[ADVANCE_OR_IDLE] Queue empty; attempting autoplay for guild %s",
-                player.guild.id,
-            )
-            autoplayed = await self._maybe_autoplay(player)
-            if not autoplayed:
-                await self._schedule_idle_disconnect(player)
-
-    def _has_user_queued_tracks(self, guild_id: int) -> bool:
-        """Check if there are any user-queued (non-autoplay) tracks in the queue."""
-        queue_entries = self.queues.get(guild_id, [])
-        for entry in queue_entries:
-            if not entry.get("autoplay", False):
-                return True
-        return False
-
-    async def _maybe_autoplay(self, player: pomice.Player) -> bool:
-        """Attempt to queue autoplay tracks when queue is empty."""
-        guild_id = player.guild.id
-
-        LOG.debug(
-            f"[AutoPlay] Checking if autoplay should trigger for guild {guild_id}"
-        )
-
-        # Check if autoplay is enabled for this session
-        if not self.is_session_autoplay_enabled(guild_id):
-            LOG.debug(f"[AutoPlay] AutoPlay is DISABLED for guild {guild_id}")
-            return False
-
-        # Don't autoplay if there are user-queued tracks
-        if self._has_user_queued_tracks(guild_id):
-            LOG.debug(
-                f"[AutoPlay] User tracks in queue for guild {guild_id}, skipping autoplay"
-            )
-            return False
-
-        # Get current track info for seed
-        current_entry = self._current_entries.get(guild_id)
-        if not current_entry:
-            LOG.debug(f"[AutoPlay] No current track entry for guild {guild_id}")
-            return False
-
-        LOG.info(
-            f"✨ [AutoPlay] AutoPlay is now recommending your next track for guild {guild_id}!"
-        )
-
-        # Try Last.fm-based recommendations first
-        lastfm_success = False
-        if self._lastfm_autoplay and self._lastfm_autoplay.can_recommend():
-            LOG.info(f"[AutoPlay] Using Last.fm recommendations...")
-            try:
-                lastfm_success = await self._lastfm_autoplay_enqueue(
-                    player, current_entry, guild_id
-                )
-            except Exception as e:
-                LOG.error(f"[AutoPlay] Last.fm autoplay error in guild {guild_id}: {e}")
-                import traceback
-
-                traceback.print_exc()
-        else:
-            LOG.warning(
-                f"[AutoPlay] Last.fm not available, disabling autoplay. Check your .env settings or dependencies. Make sure you've installed the requirements.txt"
-            )
-
-        return lastfm_success
-
-    async def _lastfm_autoplay_enqueue(
-        self, player: pomice.Player, current_entry: Dict[str, Any], guild_id: int
-    ) -> bool:
-        """Use Last.fm recommendations for autoplay."""
-        LOG.info(
-            f"[AutoPlay] Getting Last.fm recommendations based on: {current_entry.get('title', 'Unknown')} by {current_entry.get('author', 'Unknown')}"
-        )
-
-        track_info = {
-            "title": current_entry.get("title", ""),
-            "author": current_entry.get("author", ""),
-            "length": current_entry.get("length"),
-            "guild_id": guild_id,
-        }
-
-        # Check if this is the first autoplay track in this session
-        is_first_autoplay = not self._autoplay_session_started.get(guild_id, False)
-
-        # Send "recommending" message only on first autoplay
-        if is_first_autoplay:
-            await self._send_autoplay_recommending_message(player.guild)
-            self._autoplay_session_started[guild_id] = True
-
-        # Get recommendations
-        engine = self._lastfm_autoplay
-        if engine is None:
-            LOG.debug(
-                "[AutoPlay] Autoplay engine unavailable when enqueueing recommendations"
-            )
-            return False
-
-        recommendations = await engine.get_recommendations_for_track(
-            track_info, limit=1  # Queue 1 track at a time
-        )
-
-        if not recommendations:
-            LOG.warning(
-                f"[AutoPlay] ⚠️ No Last.fm recommendations found for current track in guild {guild_id}"
-            )
-
-            # Try fallback to last successful autoplay track
-            last_successful = self._last_successful_autoplay_track.get(guild_id)
-            if last_successful:
-                LOG.info(
-                    f"[AutoPlay] 🔄 Trying fallback: Last successful track '{last_successful.get('title', 'Unknown')}' by {last_successful.get('author', 'Unknown')}"
-                )
-                recommendations = await engine.get_recommendations_for_track(
-                    last_successful, limit=1
-                )
-
-                if recommendations:
-                    LOG.info(
-                        f"[AutoPlay] ✅ Fallback successful! Found recommendations from last successful track"
-                    )
-                else:
-                    LOG.warning(
-                        f"[AutoPlay] ❌ Fallback also failed - no recommendations from last successful track"
-                    )
-
-            if not recommendations:
-                # Resort to Lavalink-based fallback recommendations 
-                yt_success = await self._lavalink_autoplay_fallback(
-                    player, current_entry, guild_id
-                )
-                if yt_success:
-                    LOG.info(
-                        "[AutoPlay] ▶️ Switched to Lavalink fallback recommendations"
-                    )
-                    return True
-
-            if not recommendations:
-                # Send message to channel
-                await self._send_autoplay_no_recommendations_message(
-                    player.guild,
-                    current_entry.get("title", "Unknown"),
-                    current_entry.get("author", "Unknown"),
-                )
-                return False
-
-        # Enqueue the first recommended track
-        track_key, playable_track = recommendations[0]
-        # playable_track is a dict from V3 wrapper with keys: artist, title, url, etc.
-        track_title = playable_track.get("title", "Unknown") if isinstance(playable_track, dict) else getattr(playable_track, "title", "Unknown")
-        track_artist = playable_track.get("artist", "Unknown") if isinstance(playable_track, dict) else getattr(playable_track, "author", "Unknown")
-        LOG.info(f"[AutoPlay] 🎵 Found recommendation: {track_artist} - {track_title}")
-
-        try:
-            # Create entry for the track
-            item = {
-                "title": track_title,
-                "author": track_artist,
-                "source": playable_track,
-                "requester": "autoplay",  # Special marker for autoplay
-                "autoplay": True,
-                "url": track_key,  # The URL for playback
-            }
-
-            result = await self.enqueue(
-                player.guild, item, from_autoplay=True, player=player
-            )
-
-            if result.success:
-                LOG.info(f"▶️ [AutoPlay] Now playing: {track_artist} - {track_title}")
-                # Store this as last successful autoplay track
-                self._last_successful_autoplay_track[guild_id] = track_info.copy()
-
-                # Send appropriate notification based on whether this is first or consecutive track
-                if is_first_autoplay:
-                    await self._send_autoplay_started_message(
-                        player.guild, track_title
-                    )
-                else:
-                    await self._send_autoplay_now_playing_message(
-                        player.guild, track_title
-                    )
-
-                return True
-            else:
-                LOG.warning(f"[AutoPlay] Failed to enqueue track: {result}")
-                return False
-        except Exception as e:
-            LOG.error(f"[AutoPlay] Failed to enqueue Last.fm recommendation: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
-
-    async def _lavalink_autoplay_fallback(
-        self, player: pomice.Player, current_entry: Dict[str, Any], guild_id: int
-    ) -> bool:
-        """
-        Fallback to Lavalink-based autoplay recommendations.
-        
-        This is a last-resort fallback when V3 Deezer recommendations fail.
-        Uses Lavalink's search functionality to find related tracks.
-        """
-        LOG.debug(f"Using Lavalink autoplay fallback for guild {guild_id}")
-
-        # Use existing recommend method
-        recs = await self.recommend(player.guild, max_rec=1)
-        if not recs:
-            return False
-
-        # Queue only the first recommendation
-        rec = recs[0]
-        item = {
-            "title": rec.get("title", "AutoPlay"),
-            "source": rec.get("url"),
-            "requester": "autoplay",  # Special marker for autoplay
-            "autoplay": True,
-        }
-
-        result = await self.enqueue(
-            player.guild, item, from_autoplay=True, player=player
-        )
-
-        if result.success:
-            LOG.debug(f"Queued 1 YouTube autoplay track for guild {guild_id}")
-            # Send notification that autoplay started
-            await self._send_autoplay_started_message(
-                player.guild, rec.get("title", "AutoPlay")
-            )
-            return True
-
-        return False
+            await self._schedule_idle_disconnect(player)
 
     async def _delete_now_playing_message(self, guild_id: int) -> None:
         message = self._now_playing_messages.pop(guild_id, None)
@@ -2208,8 +1593,6 @@ lavalink:
         self,
         guild: discord.Guild,
         item: Dict[str, Any],
-        *,
-        from_autoplay: bool = False,
         player: Optional["pomice.Player"] = None,
         is_dj: bool = False,
     ) -> EnqueueResult:
@@ -2338,8 +1721,7 @@ lavalink:
         for tr in tracks:
             # Check queue limit (DJ can bypass)
             if (
-                not from_autoplay
-                and not is_dj
+                not is_dj
                 and queue_limit_enabled
                 and total_in_queue + queued >= queue_limit
             ):
@@ -2366,7 +1748,6 @@ lavalink:
                     "title": getattr(tr, "title", "Unknown"),
                     "requester": item.get("requester"),
                     "uri": getattr(tr, "uri", None),
-                    "autoplay": from_autoplay,
                     "track": tr,
                 }
                 self.queues[guild.id].append(entry)
@@ -2430,7 +1811,7 @@ lavalink:
             max_rec_int = int(max_rec)
         except (TypeError, ValueError):
             max_rec_int = 3
-        max_rec = max(1, min(DEFAULT_AUTOPLAY_MAX_RESULTS, max_rec_int))
+        max_rec = max(1, min(25, max_rec_int))
 
         player = (
             guild.voice_client

@@ -59,11 +59,6 @@ class Help(commands.Cog):
                     ("/queue", "Show the current queue", "/queue"),
                     ("/skip", "Vote to skip the current track", "/skip"),
                     (
-                        "/autoplay",
-                        "Toggle AutoPlay for the active voice session",
-                        "/autoplay state:Enable",
-                    ),
-                    (
                         "/volume",
                         "Set the default playback volume (0-200%)",
                         "/volume 100",
@@ -76,7 +71,7 @@ class Help(commands.Cog):
                 ("!setup", "Run setup wizard (server administrators)", "!setup"),
                 (
                     "/checkupdates",
-                    "Check for bot OTA updates (owner/authorized)",
+                    "Final archive update: migrate to the new repository release feed (owner only)",
                     "/checkupdates",
                 ),
             ],
@@ -126,6 +121,7 @@ class Help(commands.Cog):
         embed = discord.Embed(
             title="Help Menu — Command Categories",
             description="Use `/help <category>` to see details for a specific category.\n\n"
+            "Final archive release: use `/checkupdates` to migrate to https://github.com/AGenericMultiPurposeBot/Main.\n\n"
             f"Noticeboard: {'✅ Enabled' if nb_enabled else '❌ Disabled'} • Music: {'✅ Enabled' if music_enabled else '❌ Disabled'}",
             color=discord.Color.blue(),
         )

@@ -15,7 +15,7 @@ LOG = logging.getLogger(__name__)
 
 
 class SessionSettingsView(View):
-    """Session settings dropdown menu for autoplay, repeat, volume, seek, and queue management."""
+    """Session settings dropdown menu for repeat, volume, seek, and queue management."""
 
     def __init__(
         self, ctx: commands.Context, player, timeout=180, allow_everyone=False
@@ -23,13 +23,11 @@ class SessionSettingsView(View):
         super().__init__(timeout=timeout)
         self.ctx = ctx
         self.player = player
-        self.guild_id = ctx.guild.id
         self.allow_everyone = allow_everyone  # If True, anyone can use (with voting)
 
     @discord.ui.select(
         placeholder="Session Settings",
         options=[
-            discord.SelectOption(label="Toggle AutoPlay", value="autoplay", emoji="🤖"),
             discord.SelectOption(label="Repeat Mode", value="repeat", emoji="🔁"),
             discord.SelectOption(label="Volume", value="volume", emoji="🔊"),
             discord.SelectOption(label="Seek Position", value="seek", emoji="⏩"),
@@ -48,15 +46,7 @@ class SessionSettingsView(View):
 
         choice = select.values[0]
 
-        if choice == "autoplay":
-            current = self.player.is_session_autoplay_enabled(self.guild_id)
-            self.player.set_session_autoplay(self.guild_id, not current)
-            status = "enabled" if not current else "disabled"
-            await interaction.response.send_message(
-                f"🤖 **{interaction.user.display_name}** {status} AutoPlay"
-            )
-
-        elif choice == "repeat":
+        if choice == "repeat":
             # Show repeat options
             view = RepeatOptionsView(self.ctx, self.player)
             await interaction.response.send_message(
@@ -541,13 +531,6 @@ class PlayerControlView(View):
         self.is_announcement = (
             is_announcement  # True for announcement player, False for !np
         )
-        self._feedback_votes: Dict[int, str] = {}
-        self._active_track_key: Optional[str] = self._current_track_key()
-
-        if player.supports_feedback_buttons():
-            self.add_item(self.more_like_this_button_item())
-            self.add_item(self.low_quality_button_item())
-
     async def on_timeout(self):
         """Disable all buttons when view times out."""
         for item in self.children:
@@ -792,422 +775,6 @@ class PlayerControlView(View):
         else:
             await interaction.response.send_message("🗑️ Player closed", ephemeral=True)
 
-    def more_like_this_button_item(self):
-        """Factory method for More Like This button (V2+)"""
-        button = Button(
-            emoji="👍",
-            style=discord.ButtonStyle.success,
-            custom_id="player:more_like_this",
-            label="More Like This",
-            row=2,  # Second row
-        )
-        button.callback = self.more_like_this_callback
-        return button
-
-    def less_like_this_button_item(self):
-        """
-        Factory method for Less Like This button (V2 only - DEPRECATED in V3).
-        
-        V3 handles negative feedback through consecutive skip detection instead
-        of explicit "Less Like This" button presses. This provides more natural
-        feedback without requiring user interaction.
-        
-        This method is kept for backwards compatibility with V2 but is no longer
-        used in V3's button initialization.
-        """
-        button = Button(
-            emoji="👎",
-            style=discord.ButtonStyle.danger,
-            custom_id="player:less_like_this",
-            label="Less Like This",
-            row=2,  # Second row
-        )
-        button.callback = self.less_like_this_callback
-        return button
-
-    def low_quality_button_item(self):
-        """Factory method for Low Quality button (V2+) - skips without affecting algorithm"""
-        button = Button(
-            emoji="⚠️",
-            style=discord.ButtonStyle.secondary,
-            custom_id="player:low_quality",
-            label="Low Quality",
-            row=2,  # Second row
-        )
-        button.callback = self.low_quality_callback
-        return button
-
-    async def more_like_this_callback(self, interaction: discord.Interaction):
-        """Handle More Like This feedback (V2+)"""
-        # Defer immediately to avoid 3-second timeout
-        try:
-            await interaction.response.defer(ephemeral=False)
-        except:
-            pass  # Already responded
-
-        self._refresh_feedback_state()
-        member = self._resolve_member(interaction)
-        if not member:
-            await interaction.followup.send(
-                "❌ Unable to resolve your member record.", ephemeral=True
-            )
-            return
-
-        previous_vote = self._feedback_votes.get(member.id)
-        if previous_vote == "more":
-            await interaction.followup.send(
-                "✅ You already told me you like this track.", ephemeral=True
-            )
-            return
-        if previous_vote == "less":
-            await interaction.followup.send(
-                "❌ You already marked this track as less preferred. Each listener can only vote once per track.",
-                ephemeral=True,
-            )
-            return
-
-        # Check if user is in voice channel
-        voice_state = getattr(member, "voice", None)
-        channel = getattr(voice_state, "channel", None)
-        if not voice_state or not channel:
-            await interaction.followup.send(
-                "❌ You must be in a voice channel!", ephemeral=True
-            )
-            return
-
-        guild = member.guild
-        vc = guild.voice_client if guild else None
-        vc_channel = getattr(vc, "channel", None)
-        if not vc or not vc_channel:
-            await interaction.followup.send("❌ Not connected", ephemeral=True)
-            return
-
-        # Check if user is in same channel as bot
-        if channel.id != vc_channel.id:
-            await interaction.followup.send(
-                "❌ You must be in the same voice channel as the bot!", ephemeral=True
-            )
-            return
-
-        # Get current track info
-        current_entry = getattr(self.player, "_current_entries", {}).get(
-            self.guild_id, {}
-        )
-        if not current_entry:
-            await interaction.followup.send(
-                "❌ No track information available for feedback.", ephemeral=True
-            )
-            return
-        track_title = current_entry.get("title", "Unknown")
-
-        # Record positive feedback to V2 engine
-        try:
-            if (
-                hasattr(self.player, "_lastfm_autoplay")
-                and self.player._lastfm_autoplay
-                and self.player._lastfm_autoplay.is_available()
-            ):
-                await self.player._lastfm_autoplay.record_playback_feedback(
-                    guild_id=self.guild_id,
-                    artist=current_entry.get("author", "Unknown"),
-                    title=track_title,
-                    progress_ratio=1.0,  # Full listen implied
-                    feedback_type="more_like_this",
-                    user_id=member.id,
-                )
-                self._feedback_votes[member.id] = "more"
-                await interaction.followup.send(
-                    f"👍 **{member.display_name}** likes **{track_title}**",
-                    ephemeral=False,
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ Feedback system not available", ephemeral=True
-                )
-        except Exception as e:
-            LOG.error(f"Failed to record positive feedback: {e}")
-            await interaction.followup.send(
-                "❌ Failed to record feedback", ephemeral=True
-            )
-
-    async def less_like_this_callback(self, interaction: discord.Interaction):
-        """Handle Less Like This feedback (V2+)"""
-        # Defer immediately to avoid 3-second timeout
-        try:
-            await interaction.response.defer(ephemeral=False)
-        except:
-            pass  # Already responded
-
-        self._refresh_feedback_state()
-        member = self._resolve_member(interaction)
-        if not member:
-            await interaction.followup.send(
-                "❌ Unable to resolve your member record.", ephemeral=True
-            )
-            return
-
-        previous_vote = self._feedback_votes.get(member.id)
-        if previous_vote == "less":
-            await interaction.followup.send(
-                "✅ You already marked this track as less preferred.", ephemeral=True
-            )
-            return
-        if previous_vote == "more":
-            await interaction.followup.send(
-                "❌ You already reacted with More Like This. Each listener only gets one choice per track.",
-                ephemeral=True,
-            )
-            return
-
-        # Check if user is in voice channel
-        voice_state = getattr(member, "voice", None)
-        channel = getattr(voice_state, "channel", None)
-        if not voice_state or not channel:
-            await interaction.followup.send(
-                "❌ You must be in a voice channel!", ephemeral=True
-            )
-            return
-
-        guild = member.guild
-        vc = guild.voice_client if guild else None
-        vc_channel = getattr(vc, "channel", None)
-        if not vc or not vc_channel:
-            await interaction.followup.send("❌ Not connected", ephemeral=True)
-            return
-
-        # Check if user is in same channel as bot
-        if channel.id != vc_channel.id:
-            await interaction.followup.send(
-                "❌ You must be in the same voice channel as the bot!", ephemeral=True
-            )
-            return
-
-        # Get current track info
-        current_entry = getattr(self.player, "_current_entries", {}).get(
-            self.guild_id, {}
-        )
-        if not current_entry:
-            await interaction.followup.send(
-                "❌ No track information available for feedback.", ephemeral=True
-            )
-            return
-        track_title = current_entry.get("title", "Unknown")
-
-        # Record negative feedback to V2 engine
-        try:
-            if (
-                hasattr(self.player, "_lastfm_autoplay")
-                and self.player._lastfm_autoplay
-                and self.player._lastfm_autoplay.is_available()
-            ):
-                await self.player._lastfm_autoplay.record_playback_feedback(
-                    guild_id=self.guild_id,
-                    artist=current_entry.get("author", "Unknown"),
-                    title=track_title,
-                    progress_ratio=0.2,  # Early skip implied
-                    feedback_type="less_like_this",
-                    user_id=member.id,
-                )
-                self._feedback_votes[member.id] = "less"
-                await interaction.followup.send(
-                    f"👎 **{member.display_name}** dislikes **{track_title}**",
-                    ephemeral=False,
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ Feedback system not available", ephemeral=True
-                )
-        except Exception as e:
-            LOG.error(f"Failed to record negative feedback: {e}")
-            await interaction.followup.send(
-                "❌ Failed to record feedback", ephemeral=True
-            )
-
-    async def low_quality_callback(self, interaction: discord.Interaction):
-        """Handle Low Quality report - skips track without affecting algorithm (V2+)"""
-        # Defer immediately to avoid 3-second timeout
-        try:
-            await interaction.response.defer(ephemeral=False)
-        except:
-            pass  # Already responded
-
-        self._refresh_feedback_state()
-        member = self._resolve_member(interaction)
-        if not member:
-            await interaction.followup.send(
-                "❌ Unable to resolve your member record.", ephemeral=True
-            )
-            return
-
-        previous_vote = self._feedback_votes.get(member.id)
-        if previous_vote == "low_quality":
-            await interaction.followup.send(
-                "✅ You already reported this track as low quality.", ephemeral=True
-            )
-            return
-
-        # Check if user is in voice channel
-        voice_state = getattr(member, "voice", None)
-        channel = getattr(voice_state, "channel", None)
-        if not voice_state or not channel:
-            await interaction.followup.send(
-                "❌ You must be in a voice channel!", ephemeral=True
-            )
-            return
-
-        guild = member.guild
-        vc = guild.voice_client if guild else None
-        vc_channel = getattr(vc, "channel", None)
-        if not vc or not vc_channel:
-            await interaction.followup.send("❌ Not connected", ephemeral=True)
-            return
-
-        # Check if user is in same channel as bot
-        if channel.id != vc_channel.id:
-            await interaction.followup.send(
-                "❌ You must be in the same voice channel as the bot!", ephemeral=True
-            )
-            return
-
-        # Check if this is an autoplay track
-        current_entry = getattr(self.player, "_current_entries", {}).get(
-            self.guild_id, {}
-        )
-        if not current_entry:
-            await interaction.followup.send(
-                "❌ No track information available.", ephemeral=True
-            )
-            return
-
-        is_autoplay_track = current_entry.get("autoplay", False)
-        if not is_autoplay_track:
-            await interaction.followup.send(
-                "⚠️ **Low Quality** button is only for autoplay tracks. Use **Skip** for manual queued tracks.",
-                ephemeral=True,
-            )
-            return
-
-        track_title = current_entry.get("title", "Unknown")
-        track_artist = current_entry.get("author", "Unknown")
-
-        # Get YouTube video info for banning
-        track_obj = current_entry.get("track")
-        youtube_id = getattr(track_obj, "identifier", None) if track_obj else None
-        video_title = (
-            getattr(track_obj, "title", track_title) if track_obj else track_title
-        )
-
-        # Mark as low quality and trigger Gemini-powered re-resolution
-        try:
-            # Record quality issue feedback to V2 engine
-            if (
-                hasattr(self.player, "_lastfm_autoplay")
-                and self.player._lastfm_autoplay
-                and self.player._lastfm_autoplay.is_available()
-            ):
-                # Ban the current YouTube video
-                if youtube_id and hasattr(
-                    self.player._lastfm_autoplay._engine, "_track_resolver"
-                ):
-                    resolver = self.player._lastfm_autoplay._engine._track_resolver
-                    await resolver.ban_track(
-                        artist=track_artist,
-                        title=track_title,
-                        youtube_id=youtube_id,
-                        channel_name=track_artist,
-                        video_title=video_title,
-                    )
-
-                # Clear the cache mapping
-                await self.player._lastfm_autoplay._engine._cache.delete_mapping(
-                    track_artist, track_title
-                )
-
-                # Immediately trigger Gemini-powered re-resolution
-                if hasattr(self.player._lastfm_autoplay._engine, "_track_resolver"):
-                    resolver = self.player._lastfm_autoplay._engine._track_resolver
-                    expected_duration = current_entry.get("length")
-
-                    LOG.info(
-                        f"🤖 [LowQuality] Triggering Gemini-powered re-resolution for '{track_title}' by '{track_artist}'"
-                    )
-
-                    new_track = await resolver.resolve_track_with_gemini(
-                        artist=track_artist,
-                        title=track_title,
-                        expected_duration_ms=expected_duration,
-                    )
-
-                    if new_track:
-                        LOG.info(
-                            f"✅ [LowQuality] Gemini found better match: {getattr(new_track, 'title', 'Unknown')}"
-                        )
-                    else:
-                        LOG.warning(
-                            f"⚠️ [LowQuality] Gemini failed to find alternative for '{track_title}'"
-                        )
-
-            self._feedback_votes[member.id] = "low_quality"
-
-            # Skip the track immediately
-            if vc and hasattr(vc, "stop"):
-                await vc.stop()
-                await interaction.followup.send(
-                    f"🤖 **{member.display_name}** reported low quality on **{track_title}** → using AI to find better match & skipped",
-                    ephemeral=False,
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ Unable to skip track", ephemeral=True
-                )
-        except Exception as e:
-            LOG.error(f"Failed to process low quality report: {e}", exc_info=True)
-            await interaction.followup.send(
-                "❌ Failed to process quality report", ephemeral=True
-            )
-
-    def _resolve_member(
-        self, interaction: discord.Interaction
-    ) -> Optional[discord.Member]:
-        """Resolve the interaction user to a guild member when possible."""
-        user = interaction.user
-        if isinstance(user, discord.Member):
-            return user
-        guild = interaction.guild
-        if guild:
-            return guild.get_member(user.id)
-        return None
-
-    def _current_track_key(self) -> Optional[str]:
-        entry = (
-            self.player._current_entries.get(self.guild_id, {})
-            if hasattr(self.player, "_current_entries")
-            else {}
-        )
-        identifier = entry.get("identifier")
-        if identifier:
-            return f"id::{str(identifier).lower()}"
-        uri = entry.get("uri")
-        if uri:
-            return f"uri::{str(uri).lower()}"
-        title = str(entry.get("title") or "").strip().lower()
-        author = str(entry.get("author") or "").strip().lower()
-        if title or author:
-            return f"meta::{author}::{title}"
-        track = entry.get("track")
-        track_id = getattr(track, "identifier", None) if track else None
-        if track_id:
-            return f"track::{str(track_id).lower()}"
-        return None
-
-    def _refresh_feedback_state(self) -> Optional[str]:
-        current_key = self._current_track_key()
-        if current_key != self._active_track_key:
-            self._active_track_key = current_key
-            self._feedback_votes.clear()
-        return current_key
-
-
 class NowPlayingCommands(commands.Cog):
     """Now Playing command with unified player controls."""
 
@@ -1288,12 +855,7 @@ class NowPlayingCommands(commands.Cog):
             )
 
         # Add requester as author
-        is_autoplay = current.get("autoplay", False)
-
-        if is_autoplay:
-            # Show special autoplay indicator
-            embed.set_author(name="✨ By: Autoplay")
-        elif requester_id:
+        if requester_id:
             try:
                 requester = ctx.guild.get_member(requester_id)
                 if requester:
